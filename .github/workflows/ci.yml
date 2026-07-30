@@ -1,0 +1,254 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+  merge_group:
+  workflow_dispatch:
+
+# One workflow, following the microteams convention: every part of the repository is checked in
+# parallel, and publishing hangs off the same run rather than off a second workflow that could
+# disagree with it about whether the code was any good.
+#
+#   ts / jvm / go   check each package on its own, because each is released on its own
+#   e2e             the whole testbed in a real browser over real separate lines — the job that
+#                   decides whether MultiPath works, as opposed to whether it compiles
+#   publish-*       only after all four are green
+#
+# Nothing here depends on anything outside this repository: no consumer application, no database,
+# no external service.
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  ts:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ts
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: ts/package-lock.json
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run build
+      - run: npm test
+
+  jvm:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: jvm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v5
+        with:
+          java-version: "21"
+          distribution: "temurin"
+          cache: "maven"
+          cache-dependency-path: jvm/pom.xml
+      - run: ./mvnw -B verify
+      # spotless runs as part of the build, so a formatting mistake shows up as a dirty tree rather
+      # than as a separate check that can disagree with the build.
+      - name: Check formatting was applied
+        run: |
+          if [[ -n $(git status --porcelain) ]]; then
+            git status
+            git diff
+            echo "Uncommitted changes: run './mvnw spotless:apply' in jvm/ and commit."
+            exit 1
+          fi
+
+  go:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go/go.mod
+      - run: gofmt -l . | tee /tmp/unformatted && [ ! -s /tmp/unformatted ]
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./...
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: |
+            ts/package-lock.json
+            testbed/e2e/package-lock.json
+      - uses: actions/setup-java@v5
+        with:
+          java-version: "21"
+          distribution: "temurin"
+          cache: "maven"
+          cache-dependency-path: |
+            jvm/pom.xml
+            testbed/server/pom.xml
+
+      - name: Install the spec runner
+        working-directory: testbed/e2e
+        run: npm ci
+
+      # Headless shell only: the specs drive an API on the page, so a full browser download would be
+      # minutes spent on rendering nobody looks at.
+      - name: Install the browser
+        working-directory: testbed/e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Build everything, start it, run the specs
+        run: ./testbed/run.sh --e2e
+
+      - name: Upload traces from failures
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-traces
+          path: testbed/e2e/test-results
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------------------------
+  # Publishing. Two shapes, one workflow.
+  #
+  #   a branch build  ->  a moving pointer that tracks that branch, for consumers who want to
+  #                       develop against unreleased work
+  #   a v* tag        ->  an immutable release
+  #
+  # Both run only after every check above has passed, so nothing reaches the registry that the test
+  # suite has not already had an opinion about.
+  # ---------------------------------------------------------------------------------------------
+
+  publish-branch:
+    needs: [ts, jvm, go, e2e]
+    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: ts/package-lock.json
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@micro-teams"
+      - uses: actions/setup-java@v5
+        with:
+          java-version: "21"
+          distribution: "temurin"
+          cache: "maven"
+          cache-dependency-path: jvm/pom.xml
+          server-id: github
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_PASSWORD
+
+      # A branch name can contain characters neither npm nor Maven accepts.
+      - name: Derive the branch label
+        id: label
+        run: echo "value=$(echo '${{ github.ref_name }}' | tr '/_' '--' | tr -cd '[:alnum:]-')" >> "$GITHUB_OUTPUT"
+
+      # npm refuses to replace a version that already exists, so a branch build cannot reuse one
+      # number. It gets a unique prerelease version per run, and the *dist-tag* is the moving
+      # pointer: `npm install @micro-teams/multipath@main` always resolves to the newest main build.
+      # The bump is never committed — the version in git stays the release version.
+      - name: Publish the TypeScript package
+        working-directory: ts
+        run: |
+          set -euo pipefail
+          base="$(node -p "require('./package.json').version")"
+          version="${base}-${{ steps.label.outputs.value }}.${{ github.run_number }}"
+          npm ci
+          npm run build
+          npm version "$version" --no-git-tag-version
+          npm publish --tag "${{ steps.label.outputs.value }}"
+          echo "published @micro-teams/multipath@$version (dist-tag ${{ steps.label.outputs.value }})"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Maven has a moving pointer built in: a -SNAPSHOT version is expected to be replaced, and
+      # resolvers know to re-check it. So the branch label goes in the version and the snapshot
+      # suffix does the rest — no per-run number, no accumulating garbage.
+      - name: Publish the Spring starter
+        working-directory: jvm
+        run: |
+          set -euo pipefail
+          base="$(./mvnw -q -B help:evaluate -Dexpression=project.version -DforceStdout)"
+          version="${base%-SNAPSHOT}-${{ steps.label.outputs.value }}-SNAPSHOT"
+          ./mvnw -B versions:set -DnewVersion="$version" -DgenerateBackupPoms=false
+          ./mvnw -B deploy -DskipTests
+          echo "published app.microteams.multipath:multipath-spring-boot-starter:$version"
+        env:
+          MAVEN_USERNAME: ${{ github.actor }}
+          MAVEN_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+
+      # Go needs no publishing step at all: `go get github.com/micro-teams/multipath/go@<branch>`
+      # resolves straight from the commit. Saying so here so nobody goes looking for the missing job.
+      - name: Go needs no registry
+        run: echo 'go get github.com/micro-teams/multipath/go@${{ github.ref_name }}'
+
+  publish-release:
+    needs: [ts, jvm, go, e2e]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: ts/package-lock.json
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@micro-teams"
+      - uses: actions/setup-java@v5
+        with:
+          java-version: "21"
+          distribution: "temurin"
+          cache: "maven"
+          cache-dependency-path: jvm/pom.xml
+          server-id: github
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_PASSWORD
+
+      # A tag that disagrees with the committed version would publish a release nobody asked for,
+      # and an npm version cannot be replaced once taken — so this has to come before the publish.
+      - name: Check the tag matches both committed versions
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./ts/package.json').version")"
+          pom="$(cd jvm && ./mvnw -q -B help:evaluate -Dexpression=project.version -DforceStdout)"
+          [[ "$tag" == "$pkg" ]] || { echo "tag $tag != ts/package.json $pkg" >&2; exit 1; }
+          [[ "$tag" == "$pom" ]] || { echo "tag $tag != jvm/pom.xml $pom" >&2; exit 1; }
+
+      - name: Publish the TypeScript package
+        working-directory: ts
+        run: |
+          npm ci
+          npm run build
+          npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish the Spring starter
+        working-directory: jvm
+        run: ./mvnw -B deploy -DskipTests
+        env:
+          MAVEN_USERNAME: ${{ github.actor }}
+          MAVEN_PASSWORD: ${{ secrets.GITHUB_TOKEN }}

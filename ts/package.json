@@ -1,0 +1,41 @@
+{
+  "name": "@micro-teams/multipath",
+  "version": "0.1.0",
+  "description": "Transport resilience across redundant network paths: line registry, request routing, read hedging, idempotent writes.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/micro-teams/multipath.git",
+    "directory": "ts"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "sideEffects": false,
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "oxlint",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"*.ts\"",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "oxlint": "^1.76.0",
+    "prettier": "^3.9.6",
+    "typescript": "~7.0.2",
+    "vitest": "^4.0.18"
+  }
+}

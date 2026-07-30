@@ -1,0 +1,125 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>MultiPath testbed</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body {
+    font: 14px/1.5 ui-monospace, monospace;
+    margin: 2rem;
+    max-width: 60rem;
+  }
+  h1 {
+    font-size: 1rem;
+  }
+  #log {
+    white-space: pre-wrap;
+    border: 1px solid currentColor;
+    padding: 0.75rem;
+    min-height: 12rem;
+  }
+</style>
+
+<h1>MultiPath testbed</h1>
+<p>
+  This page exists to be driven by Playwright. Everything it can do is exposed on
+  <code>window.testbed</code>; nothing here is a UI worth looking at.
+</p>
+<div id="log">idle</div>
+
+<script type="module">
+  // The built package, exactly as a consumer would import it — copied in by run.sh rather than
+  // bundled, so what runs in the browser is the published output and not a re-compilation of it.
+  import { LineManager, SENTINEL_ORIGIN, parseRegistry } from "./vendor/index.js";
+
+  const log = document.getElementById("log");
+  const attempts = [];
+  const say = (m) => {
+    log.textContent = `${m}\n${log.textContent}`.slice(0, 8000);
+  };
+
+  const manager = new LineManager({
+    onAttempt: (a) => {
+      attempts.push(a);
+      say(`${a.method} ${a.path} via ${a.lineId} -> ${a.status ?? a.error} (${Math.round(a.durationMs)}ms)`);
+    },
+  });
+
+  // Exactly what a generated OpenAPI client does: glue the sentinel basePath onto the operation
+  // path and call fetchApi. The testbed goes through the same door a real consumer must, because
+  // testing a door nobody uses proves nothing.
+  const mpFetch = manager.fetchApi();
+  const call = (path, init) => mpFetch(`${SENTINEL_ORIGIN}${path}`, init);
+
+  async function describe(response) {
+    return {
+      status: response.status,
+      line: response.headers.get("x-multipath-line"),
+      body: await response.json().catch(() => null),
+    };
+  }
+
+  /**
+   * The surface the specs drive. Kept as thin as possible: a spec should be asserting on
+   * MultiPath's behaviour, not on this page's interpretation of it.
+   */
+  window.testbed = {
+    manager,
+    attempts,
+
+    /** Point the manager at the live registry, the way a real app boots. */
+    async loadRegistry(from) {
+      const response = await fetch(`${from}/mt/lines`);
+      const registry = parseRegistry(await response.json());
+      manager.setRegistry(registry);
+      return registry;
+    },
+
+    setRegistry(registry) {
+      manager.setRegistry(parseRegistry(registry));
+    },
+
+    /** Issue a request through MultiPath and report what came back, including which line served it. */
+    async get(path) {
+      return describe(await call(path));
+    },
+
+    async post(path, body, headers = {}) {
+      return describe(
+        await call(path, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...headers },
+          body: JSON.stringify(body),
+        }),
+      );
+    },
+
+    /**
+     * Fire the same write down every line at once, as close to simultaneously as a browser can
+     * manage. This is the case the idempotency interceptor exists for, and the one that is
+     * essentially unstageable against a real deployment.
+     */
+    async postOverAllLines(path, body, headers = {}) {
+      const init = {
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify(body),
+      };
+      const responses = await Promise.all(
+        manager.lines.map((line) => fetch(manager.resolve(path, line), init)),
+      );
+      return Promise.all(responses.map(describe));
+    },
+
+    /** What URL would MultiPath emit for this path? The MP-1 no-op check reads this. */
+    resolve(path) {
+      return manager.resolve(path);
+    },
+
+    reset() {
+      attempts.length = 0;
+      log.textContent = "idle";
+    },
+  };
+
+  say("ready");
+</script>

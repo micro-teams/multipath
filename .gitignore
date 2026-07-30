@@ -1,0 +1,10 @@
+node_modules/
+dist/
+target/
+*.tsbuildinfo
+.DS_Store
+
+# Built by testbed/run.sh: the library output copied in for the page to import.
+testbed/web/vendor/
+testbed/e2e/test-results/
+testbed/e2e/playwright-report/
