@@ -36,13 +36,15 @@ const server = http.createServer((req, res) => {
   // Control endpoint on the line itself, so a spec can change this line's behaviour mid-run
   // without restarting anything. Answered here and never forwarded.
   if (req.url === "/__line") {
-    res.writeHead(200, { "content-type": "application/json", ...cors() });
-    res.end(JSON.stringify({ name: NAME, port: PORT, delayMs: DELAY_MS, seen }));
+    res.writeHead(200, { "content-type": "application/json", ...cors(req) });
+    res.end(
+      JSON.stringify({ name: NAME, port: PORT, delayMs: DELAY_MS, seen }),
+    );
     return;
   }
 
   if (req.method === "OPTIONS") {
-    res.writeHead(204, cors());
+    res.writeHead(204, cors(req));
     res.end();
     return;
   }
@@ -52,7 +54,7 @@ const server = http.createServer((req, res) => {
   if (FAIL_EVERY > 0 && seen % FAIL_EVERY === 0) {
     // 502, not a dropped connection: a client must handle the line that answers *badly*, which is
     // the more common failure and the easier one to get wrong.
-    respondLater(res, 502, { error: "line unavailable", line: NAME });
+    respondLater(req, res, 502, { error: "line unavailable", line: NAME });
     return;
   }
 
@@ -64,7 +66,11 @@ const server = http.createServer((req, res) => {
       path: req.url,
       // Tell the origin which line carried this request — that is what makes "which line served
       // it" observable from the browser.
-      headers: { ...req.headers, host: `${TARGET_HOST}:${TARGET_PORT}`, "x-multipath-line": NAME },
+      headers: {
+        ...req.headers,
+        host: `${TARGET_HOST}:${TARGET_PORT}`,
+        "x-multipath-line": NAME,
+      },
     },
     (upstreamRes) => {
       const chunks = [];
@@ -76,7 +82,7 @@ const server = http.createServer((req, res) => {
         setTimeout(() => {
           res.writeHead(upstreamRes.statusCode ?? 502, {
             ...stripHopByHop(upstreamRes.headers),
-            ...cors(),
+            ...cors(req),
             "x-multipath-line": NAME,
           });
           res.end(body);
@@ -85,30 +91,52 @@ const server = http.createServer((req, res) => {
     },
   );
 
-  upstream.on("error", (err) => respondLater(res, 502, { error: String(err), line: NAME }));
+  upstream.on("error", (err) =>
+    respondLater(req, res, 502, { error: String(err), line: NAME }),
+  );
   req.pipe(upstream);
 });
 
-function respondLater(res, status, payload) {
+function respondLater(req, res, status, payload) {
   setTimeout(() => {
-    res.writeHead(status, { "content-type": "application/json", ...cors(), "x-multipath-line": NAME });
+    res.writeHead(status, {
+      "content-type": "application/json",
+      ...cors(req),
+      "x-multipath-line": NAME,
+    });
     res.end(JSON.stringify(payload));
   }, DELAY_MS);
 }
 
-function cors() {
+/**
+ * CORS headers for a credentialed cross-origin request.
+ *
+ * A wildcard is not an option here, and the reason is easy to get wrong: `Access-Control-Allow-Origin: *`
+ * is rejected outright when the request carries credentials, and with credentials `*` in
+ * Allow-Headers is taken literally rather than as "any". So the origin and the requested headers
+ * are echoed back — which is also what a real deployment does (the microteams backend derives its
+ * allowed origin from the forwarded headers), so the testbed models production rather than a
+ * configuration nobody could actually run.
+ */
+function cors(req) {
   return {
-    "access-control-allow-origin": "*",
-    "access-control-allow-headers": "*",
+    "access-control-allow-origin": req.headers.origin ?? "*",
+    "access-control-allow-credentials": "true",
+    "access-control-allow-headers":
+      req.headers["access-control-request-headers"] ??
+      "content-type,idempotency-key",
     "access-control-allow-methods": "GET,POST,PATCH,DELETE,OPTIONS",
     "access-control-expose-headers": "x-multipath-line",
+    // The response now varies by who asked, so a shared cache must not reuse it across origins.
+    vary: "Origin",
   };
 }
 
 /** Connection-scoped headers describe the hop we just finished, not the one we are starting. */
 function stripHopByHop(headers) {
   const out = { ...headers };
-  for (const h of ["connection", "keep-alive", "transfer-encoding", "upgrade"]) delete out[h];
+  for (const h of ["connection", "keep-alive", "transfer-encoding", "upgrade"])
+    delete out[h];
   return out;
 }
 
@@ -118,5 +146,7 @@ server.listen(PORT, () => {
     FAIL_EVERY ? `fails 1/${FAIL_EVERY}` : "no failures",
     STALL ? "STALLS" : null,
   ].filter(Boolean);
-  console.log(`${NAME} :${PORT} -> ${TARGET_HOST}:${TARGET_PORT} (${traits.join(", ")})`);
+  console.log(
+    `${NAME} :${PORT} -> ${TARGET_HOST}:${TARGET_PORT} (${traits.join(", ")})`,
+  );
 });

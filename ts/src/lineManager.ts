@@ -139,9 +139,15 @@ export class LineManager {
   private async dispatchOver(line: Line, path: string, init: RequestInit): Promise<Response> {
     const url = this.resolve(path, line);
     const method = (init.method ?? "GET").toUpperCase();
-    // A line on a foreign origin is cross-origin by definition, so the cookie has to be asked for
-    // explicitly; on our own domains the default already sends it. Only widen when we must.
-    const effective: RequestInit = line.foreignOrigin ? { credentials: "include", ...init } : init;
+    // Any line with an absolute url is a different origin from the page — a different subdomain is
+    // enough, and a different port on the same host is too. `fetch` defaults to
+    // `credentials: "same-origin"`, so without this the request goes out with no cookie and the
+    // server sees an anonymous caller. It fails as "logged out on that line", which looks like an
+    // auth bug rather than a transport one.
+    //
+    // The same-origin line is left exactly as it came in, so the single-line no-op holds literally.
+    const effective: RequestInit =
+      line.url === "" ? init : { credentials: "include" as const, ...init };
 
     const started = now();
     try {
