@@ -30,9 +30,14 @@ export interface Line {
    */
   readonly weight?: number;
   /**
-   * True when the browser does not see this line under our own domain — a free proxy that cannot
-   * be CNAME'd. Such a line needs `SameSite=None` cookies and explicit CORS, so it is a fallback
-   * with reduced capability rather than a peer of the others.
+   * True when the browser does not see this line under our own registrable domain — a free proxy
+   * that cannot be CNAME'd.
+   *
+   * Note what this does *not* control: whether credentials are sent. Every line with an absolute
+   * url is cross-origin to the page, so all of them need `credentials: "include"`. This flag marks
+   * the narrower case of a line outside our own domain, which additionally needs `SameSite=None`
+   * cookies and a CORS allowance the origin cannot derive from its own forwarded headers — a
+   * fallback with reduced capability rather than a peer of the others.
    */
   readonly foreignOrigin?: boolean;
 }

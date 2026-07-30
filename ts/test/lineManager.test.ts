@@ -157,23 +157,54 @@ describe("LineManager, resolution", () => {
   });
 });
 
-describe("LineManager, foreign-origin lines", () => {
-  const foreign = parseRegistry({
-    lines: [{ id: "px-1", url: "https://free.provider.example", foreignOrigin: true }],
-  });
-
-  it("sends credentials, since the cookie is cross-origin there", async () => {
+describe("LineManager, credentials", () => {
+  // Every absolute url is a different origin from the page — a different subdomain is enough, and
+  // a different port on the same host is too. fetch defaults to credentials:"same-origin", so
+  // without asking the cookie is simply not sent and the server sees an anonymous caller. That
+  // presents as "logged out on that line", which reads as an auth bug rather than a transport one.
+  it.each([
+    ["another subdomain of ours", "https://cf.mt.example.app"],
+    ["our own host on a non-standard port", "https://mt.example.app:8443"],
+    ["someone else's domain entirely", "https://free.provider.example"],
+  ])("sends credentials to %s", async (_name, url) => {
     const { calls, fetchImpl } = recordingFetch();
-    await send(new LineManager({ registry: foreign, fetch: fetchImpl }), "/mt/probe");
+    const registry = parseRegistry({ lines: [{ id: "line", url }] });
+    await send(new LineManager({ registry, fetch: fetchImpl }), "/mt/probe");
     expect(calls[0]?.init?.credentials).toBe("include");
   });
 
-  it("lets an explicit caller override that", async () => {
+  it("leaves the same-origin line untouched, so the no-op stays literal", async () => {
     const { calls, fetchImpl } = recordingFetch();
-    await send(new LineManager({ registry: foreign, fetch: fetchImpl }), "/mt/probe", {
+    await send(new LineManager({ fetch: fetchImpl }), "/mt/probe");
+    expect(calls[0]?.init && "credentials" in calls[0].init).toBe(false);
+  });
+
+  it("lets an explicit caller override it", async () => {
+    const { calls, fetchImpl } = recordingFetch();
+    const registry = parseRegistry({ lines: [{ id: "cf", url: "https://cf.mt.example.app" }] });
+    await send(new LineManager({ registry, fetch: fetchImpl }), "/mt/probe", {
       credentials: "omit",
     });
     expect(calls[0]?.init?.credentials).toBe("omit");
+  });
+});
+
+describe("LineManager, non-standard ports", () => {
+  // A port is part of an origin but not part of a URL's path, so it only has to survive
+  // concatenation — and cookies are not port-scoped, so a line on our own host at another port
+  // still shares the session cookie.
+  it("keeps the port when resolving", () => {
+    const registry = parseRegistry({ lines: [{ id: "alt", url: "https://mt.example.app:8443" }] });
+    expect(new LineManager({ registry }).resolve("/mt/probe")).toBe(
+      "https://mt.example.app:8443/mt/probe",
+    );
+  });
+
+  it("accepts a bracketed IPv6 literal with a port", () => {
+    const registry = parseRegistry({ lines: [{ id: "v6", url: "https://[2001:db8::1]:8443" }] });
+    expect(new LineManager({ registry }).resolve("/mt/probe")).toBe(
+      "https://[2001:db8::1]:8443/mt/probe",
+    );
   });
 });
 
