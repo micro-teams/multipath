@@ -115,6 +115,15 @@
       return manager.resolve(path);
     },
 
+    /** Measure every line once and report the ranking that results. */
+    async probe() {
+      await manager.probeNow();
+      return {
+        ranked: manager.ranked().map((l) => l.id),
+        health: manager.health(),
+      };
+    },
+
     reset() {
       attempts.length = 0;
       log.textContent = "idle";
