@@ -74,6 +74,34 @@ export interface LauncherOptions {
  * A string rather than a written file: where it goes is the consumer's build's business, and a
  * library that wrote to disk would need to know about their output directory.
  */
+/*
+ * What the emitted script does, and why — kept here rather than in the document itself, because
+ * every byte of that document is on the one request that has no redundancy and no cache.
+ *
+ * Registration is fire-and-forget: the application starts whether or not the worker installs.
+ * Waiting for it would make the cache a prerequisite for starting, which is the opposite of the
+ * point.
+ *
+ * `__race` asks every line at once, with no stagger and no head start for whichever is listed
+ * first. Staggering looked frugal and was exactly backwards: a stable-but-slow line answers within
+ * any head start you give it, wins by default, and the fast line is never asked. Asking all at once
+ * also means a dead tunnel, a blocked route or a network without IPv6 costs nothing — it was asked,
+ * it did not answer, nobody waited.
+ *
+ * The winner is whichever line *finishes delivering*, not whichever answers first. A stable edge
+ * can return headers in 20ms and still take seconds to hand over a megabyte; first-byte racing
+ * would pick it every time, which is the outcome this library exists to avoid. The bottleneck is
+ * the line rather than the client's connection, so the copies do not meaningfully compete, and some
+ * duplicated data is a fair price for never being stuck on the slow one.
+ *
+ * `__import` then falls over between lines. Importing is a *second* request for the same bytes:
+ * usually served from the HTTP cache, but that is a convenience rather than a guarantee, and a line
+ * that fails one request in three can win the race and then fail the import. It did, in CI, about
+ * one run in three.
+ *
+ * The bytes are never executed from memory. A module built from a blob has the blob as its base
+ * URL, so every relative chunk import in a code-split application would resolve to nowhere.
+ */
 export function buildLauncher(options: LauncherOptions): string {
   const config = {
     appEntry: options.appEntry,
@@ -98,112 +126,45 @@ window.__multipath__ = ${JSON.stringify(config)};
 <script type="module">
 ${
   options.serviceWorker
-    ? `// Registration is fire-and-forget. The application must start whether or not the worker
-// installs — a browser with workers disabled, a private window, an install that fails — because a
-// launcher that waits for the cache to be ready has made the cache a dependency of starting, which
-// is the opposite of the point.
-if ("serviceWorker" in navigator) {
-  navigator.serviceWorker
-    .register(${JSON.stringify(options.serviceWorker)}${registrationOptions(options)})
-    .catch((error) => console.warn("multipath: service worker registration failed", error));
+    ? `if ("serviceWorker" in navigator) {
+navigator.serviceWorker.register(${JSON.stringify(options.serviceWorker)}${registrationOptions(options)}).catch(() => {});
 }
 `
     : ""
-}
-// Cold start: no cache, no worker, and nothing measured, so the registry's order is only a guess.
-// Racing the entry point over the lines is what stops a wrong guess from costing the whole visit —
-// without it, one dead line in the wrong position means the app simply never appears.
-//
-// It races to find a line that can *serve the bundle*, then imports normally from that line. The
-// bytes are not executed from memory: a module built from a blob has the blob as its base URL, so
-// every relative chunk import inside a code-split application would resolve to nowhere. Importing
-// from the winner's URL keeps module semantics exactly as the bundler intended, and the browser's
-// HTTP cache normally satisfies the second request from the first.
-const __mp = window.__multipath__;
+}const __mp = window.__multipath__;
 const __lines = (__mp.registry && __mp.registry.lines) || [];
-const __entry = ${JSON.stringify(options.appEntry)};
-const __preferred = ${JSON.stringify(options.preferredLineIds ?? [])};
-
-// Every line is asked at once, with no stagger and no head start for whatever happens to be listed
-// first. Staggering looked frugal and was exactly wrong for the case this library exists for: the
-// stable-but-slow line answers within any head start you give it, wins by default, and the fast
-// line is never even asked. A line that is dead, blocked, or unsupported by this network therefore
-// costs nothing at all — it was asked, it did not answer, and nobody waited for it.
-//
-// The winner is whichever line *finishes delivering* first, not whichever answers first. That
-// distinction is the entire point: a stable CDN edge can return headers in 20ms and still take
-// seconds to hand over a megabyte, and picking on first byte would choose it every time — the very
-// outcome this library exists to avoid. The bottleneck is the line, not the user's connection, so
-// the copies do not meaningfully compete; the cost is some extra data, which is worth paying to
-// never be stuck on the slow one.
-function __race(path) {
-  const ordered = __preferred.length
-    ? [...__lines].sort((a, b) => rank(a) - rank(b))
-    : __lines;
-  function rank(line) {
-    const at = __preferred.indexOf(line.id);
-    return at === -1 ? __preferred.length : at;
-  }
-  if (ordered.length === 0) return Promise.resolve([path]);
-  if (ordered.length === 1) return Promise.resolve([(ordered[0].url || "") + path]);
-
+const __pref = ${JSON.stringify(options.preferredLineIds ?? [])};
+const __at = (l) => (__pref.indexOf(l.id) === -1 ? __pref.length : __pref.indexOf(l.id));
+const __urls = (__pref.length ? [...__lines].sort((a, b) => __at(a) - __at(b)) : __lines).map(
+  (l) => (l.url || "") + ${JSON.stringify(options.appEntry)},
+);
+function __race() {
+  if (__urls.length < 2) return Promise.resolve(__urls.length ? __urls : [${JSON.stringify(options.appEntry)}]);
   return new Promise((resolve, reject) => {
-    let failed = 0;
-    let done = false;
-    const controllers = [];
-    ordered.forEach((line) => {
-      const url = (line.url || "") + path;
-      const controller = new AbortController();
-      controllers.push(controller);
-      fetch(url, {
-        signal: controller.signal,
-        credentials: line.url ? "include" : "same-origin",
-      })
-        .then((response) => {
-          if (!response.ok) throw new Error(String(response.status));
-          // Drain it fully before claiming victory. Finishing is the thing being raced, and the
-          // bytes land in the HTTP cache so the import below does not fetch them again.
-          return response.blob();
-        })
+    let failed = 0, done = false;
+    const cs = __urls.map(() => new AbortController());
+    __urls.forEach((url, i) => {
+      fetch(url, { signal: cs[i].signal, credentials: url.startsWith("http") ? "include" : "same-origin" })
+        .then((r) => { if (!r.ok) throw new Error(r.status); return r.blob(); })
         .then(() => {
           if (done) return;
           done = true;
-          controllers.forEach((c) => c !== controller && c.abort());
-          // Everything else, winner first: the import that follows is a second request, and a line
-          // that answered once is not promised to answer twice.
-          resolve([url].concat(ordered.filter((l) => (l.url || "") + path !== url).map((l) => (l.url || "") + path)));
+          cs.forEach((c, j) => j !== i && c.abort());
+          resolve([url].concat(__urls.filter((u) => u !== url)));
         })
-        .catch(() => {
-          if (done) return;
-          if (++failed === ordered.length) reject(new Error("no line could serve " + path));
-        });
+        .catch(() => { if (!done && ++failed === __urls.length) reject(new Error("no line")); });
     });
   });
 }
-
-// Importing is a *second* request for the same bytes. In production the first one has usually left
-// them in the HTTP cache, but that is a convenience and not a guarantee — and an intermittently
-// failing line, which is precisely the kind of cheap tunnel this library is meant to tolerate, can
-// win the race and then fail the import. So the import falls over to the next line rather than
-// treating one bad response as the end of the visit.
-function __import(urls, at) {
-  return import(urls[at]).catch((error) => {
-    if (at + 1 >= urls.length) throw error;
-    return __import(urls, at + 1);
-  });
+function __load(urls, i) {
+  return import(urls[i]).catch((e) => (i + 1 < urls.length ? __load(urls, i + 1) : Promise.reject(e)));
 }
-
-__race(__entry)
-  .then((urls) => __import(urls, 0))
+__race()
+  .then((urls) => __load(urls, 0))
   .catch((error) => {
-  // The one failure with nothing behind it: the entry point could not be loaded from any line and
-  // is not in the cache. Say so plainly rather than leaving a blank page.
-  console.error("multipath: could not start the application", error);
-  document.body.insertAdjacentHTML(
-    "beforeend",
-    '<p data-multipath-error>Could not start. Check your connection and reload.</p>',
-  );
-});
+    console.error("multipath: could not start the application", error);
+    document.body.insertAdjacentHTML("beforeend", '<p data-multipath-error>Could not start. Check your connection and reload.</p>');
+  });
 </script>
 </body>
 </html>

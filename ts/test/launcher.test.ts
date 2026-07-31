@@ -13,7 +13,7 @@ describe("buildLauncher", () => {
   it("loads the application entry point", () => {
     const html = buildLauncher({ appEntry: "/assets/main-abc123.js" });
     expect(html).toContain('"/assets/main-abc123.js"');
-    expect(html).toContain("import(urls[at])");
+    expect(html).toContain("import(urls[i])");
   });
 
   /**
@@ -36,7 +36,7 @@ describe("buildLauncher", () => {
    */
   it("asks every line simultaneously, with no stagger", () => {
     const html = buildLauncher({ appEntry: "/main.js", registry });
-    expect(html).toContain("ordered.forEach");
+    expect(html).toContain("__urls.forEach");
     expect(html).not.toContain("setTimeout");
   });
 
@@ -54,13 +54,13 @@ describe("buildLauncher", () => {
    */
   it("falls over to another line if the import itself fails", () => {
     const html = buildLauncher({ appEntry: "/main.js", registry });
-    expect(html).toContain("__import(urls, at + 1)");
+    expect(html).toContain("__load(urls, i + 1)");
   });
 
   it("races to completion, not to first byte", () => {
     const html = buildLauncher({ appEntry: "/main.js", registry });
-    expect(html).toContain("response.blob()");
-    expect(html).toContain("c !== controller && c.abort()");
+    expect(html).toContain("r.blob()");
+    expect(html).toContain("j !== i && c.abort()");
   });
 
   it("asks remembered-fastest lines first, since racing cannot tell fast from merely reachable", () => {
@@ -85,7 +85,7 @@ describe("buildLauncher", () => {
 
   it("registers the service worker when given one", () => {
     const html = buildLauncher({ appEntry: "/main.js", serviceWorker: "/sw.js" });
-    expect(html).toContain('navigator.serviceWorker\n    .register("/sw.js")');
+    expect(html).toContain('navigator.serviceWorker.register("/sw.js")');
   });
 
   /**
@@ -139,7 +139,7 @@ describe("buildLauncher", () => {
   it("does not make starting depend on the worker installing", () => {
     const html = buildLauncher({ appEntry: "/main.js", serviceWorker: "/sw.js" });
     const registration = html.indexOf(".register(");
-    const start = html.indexOf("__race(__entry)");
+    const start = html.indexOf("__race()");
     expect(registration).toBeLessThan(start);
     expect(html).toContain(".catch(");
     // No await between the two: registration is fire-and-forget.
@@ -177,11 +177,11 @@ describe("buildLauncher", () => {
       registry,
       registryUrl: "/mt/lines",
     });
-    // Raised twice as the race grew: first for racing the entry at all, then for racing every line
-    // at once with remembered ordering. Both bought the same property — a slow or dead line no
-    // longer decides the first visit — which is worth many times its size on a narrow connection.
-    // The budget stays because size erodes quietly, not because any number here is sacred.
-    expect(html.length).toBeLessThan(5500);
+    // The budget caught this growing to 5793 and forced the right fix rather than a bigger number:
+    // the explanatory comments were being shipped inside the document, on the one request that has
+    // no redundancy and no cache. They now live in the library source, where they help a reader
+    // without costing every visitor.
+    expect(html.length).toBeLessThan(3000);
   });
 
   it("is a complete document", () => {
