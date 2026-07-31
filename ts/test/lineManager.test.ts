@@ -415,3 +415,34 @@ describe("LineManager, remembering across visits", () => {
     expect(() => new LineManager({ registry, storage })).not.toThrow();
   });
 });
+
+describe("LineManager, attempt history", () => {
+  const twoLine = parseRegistry({ lines: [{ id: "cf", url: "https://cf.example" }] });
+
+  it("keeps recent attempts newest first, for the panel to show", async () => {
+    const { fetchImpl } = recordingFetch();
+    const manager = new LineManager({ registry: twoLine, fetch: fetchImpl });
+    await send(manager, "/mt/a");
+    await send(manager, "/mt/b");
+    expect(manager.recentAttempts().map((a) => a.path)).toEqual(["/mt/b", "/mt/a"]);
+  });
+
+  // A diagnostic that grows without limit is a memory leak with good intentions.
+  it("keeps the history bounded", async () => {
+    const { fetchImpl } = recordingFetch();
+    const manager = new LineManager({ registry: twoLine, fetch: fetchImpl, attemptHistory: 3 });
+    for (let i = 0; i < 10; i++) await send(manager, `/mt/${i}`);
+    expect(manager.recentAttempts()).toHaveLength(3);
+    expect(manager.recentAttempts()[0]?.path).toBe("/mt/9");
+  });
+
+  it("records failures too, since those are what the panel is opened for", async () => {
+    const manager = new LineManager({
+      registry: twoLine,
+      fetch: (() => Promise.reject(new Error("refused"))) as unknown as typeof globalThis.fetch,
+      strategy: { readTimeoutMs: 200 },
+    });
+    await expect(send(manager, "/mt/x")).rejects.toThrow();
+    expect(manager.recentAttempts()[0]?.error).toBeInstanceOf(Error);
+  });
+});

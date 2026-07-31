@@ -75,6 +75,13 @@ export interface LineManagerOptions {
   readonly storageKey?: string;
   /** Measurements older than this are ignored: last month's network says nothing about today's. */
   readonly storageMaxAgeMs?: number;
+  /**
+   * How many recent attempts to keep for the developer panel.
+   *
+   * Bounded because it is a diagnostic, and a diagnostic that grows without limit is a memory leak
+   * with good intentions.
+   */
+  readonly attemptHistory?: number;
 }
 
 /** What one request-over-one-line did. Purely observational — never load-bearing. */
@@ -108,6 +115,8 @@ export class LineManager {
   private readonly storage: Storage | undefined;
   private readonly storageKey: string;
   private readonly storageMaxAgeMs: number;
+  private readonly history: Attempt[] = [];
+  private readonly historyLimit: number;
 
   constructor(options: LineManagerOptions = {}) {
     this.registry = options.registry ?? SAME_ORIGIN_REGISTRY;
@@ -123,6 +132,7 @@ export class LineManager {
     this.storage = options.storage;
     this.storageKey = options.storageKey ?? "multipath:health";
     this.storageMaxAgeMs = options.storageMaxAgeMs ?? 7 * 24 * 60 * 60 * 1000;
+    this.historyLimit = options.attemptHistory ?? 100;
     this.restoreHealth();
     this.strategy = { ...STRATEGY_DEFAULTS, ...options.strategy };
     this.prober = new Prober(
@@ -315,7 +325,20 @@ export class LineManager {
     return { ...init, headers };
   }
 
+  /**
+   * Recent attempts, newest first.
+   *
+   * The panel's second half: health says what each line is like, this says what actually happened —
+   * which line served the last request, and how often each one wins. The two disagree more often
+   * than you would expect, and the disagreement is usually where the bug is.
+   */
+  recentAttempts(): readonly Attempt[] {
+    return this.history;
+  }
+
   private report(attempt: Attempt): void {
+    this.history.unshift(attempt);
+    if (this.history.length > this.historyLimit) this.history.length = this.historyLimit;
     // Observation must never be able to fail a request.
     try {
       this.onAttempt?.(attempt);

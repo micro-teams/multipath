@@ -21,6 +21,8 @@ export { buildLauncher, type LauncherOptions } from "./launcher.js";
 
 export { createPrecache, type PrecacheOptions } from "./serviceWorker.js";
 
+export { mountLinePanel, type PanelOptions, type PanelSource } from "./panel.js";
+
 export {
   STRATEGY_DEFAULTS,
   hedgedRead,
