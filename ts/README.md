@@ -96,11 +96,43 @@ is still a 404, asked N times. A 500 means the request arrived and the server de
 retry that is the caller's business, not the transport's. Only silence — no response at all —
 justifies another line, because only then is it unknown whether anything happened.
 
+## Starting the app without the network
+
+Two pieces make launching independent of the lines.
+
+`createPrecache` is the Service Worker runtime. Give it the manifest your build emits and a version,
+and it stores every artefact on install, serves them cache-first, and deletes old versions once the
+new one is in charge. A cache miss still goes over the lines, because the assets are on all of them.
+It never answers an API request: staleness in data is the application's business, and a transport
+layer quietly returning yesterday's data would be lying about what it is.
+
+`buildLauncher` produces one small self-contained HTML document. There is exactly one moment that
+cannot be spread across lines — a browser opening a URL knows one host — so that document is made as
+small as possible and does only three things: register the worker, carry the registry inline, and
+import the real entry point. The registry is inlined rather than fetched, because fetching it would
+put a round trip on the one path with no redundancy, and failing there would leave the app unable to
+reach any line, having never learned that the lines exist.
+
+```ts
+// your build step
+writeFileSync("dist/index.html", buildLauncher({
+  appEntry: "/assets/main-abc123.js",
+  serviceWorker: "/sw.js",
+  serviceWorkerType: "module",
+  registry,
+  registryUrl: "/mt/lines",
+}));
+```
+
+Registration is fire-and-forget: the app starts whether or not the worker installs. A launcher that
+waited for the cache would have made the cache a prerequisite for starting, which is the opposite of
+the point.
+
 ## Status
 
-MP-1 through MP-4 are implemented on the client: registry, health, probing, ranking, hedged reads,
-write failover, the generated-client adapter, and idempotency keys. Still to come: the Service
-Worker precache and launcher, the developer panel, and the request cache.
+MP-1 through MP-5 are implemented on the client: registry, health, probing, ranking, hedged reads,
+write failover, precache, launcher, the generated-client adapter, and idempotency keys. Still to
+come: the developer panel and the request cache.
 
 ## Develop
 

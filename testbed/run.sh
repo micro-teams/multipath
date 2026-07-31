@@ -61,10 +61,19 @@ cp "$ROOT"/ts/dist/*.js "$HERE/web/vendor/"
 
 # The registry the server hands out, describing the lines started below.
 registry=""
+registry_json="["
 for spec in "${LINES[@]}"; do
   IFS=: read -r id port _ _ _ <<<"$spec"
   registry+="${registry:+,}${id}=http://localhost:${port}=test=100"
+  [[ "$registry_json" != "[" ]] && registry_json+=","
+  registry_json+="{\"id\":\"$id\",\"url\":\"http://localhost:$port\",\"weight\":100}"
 done
+registry_json+="]"
+
+# The consumer's build step, standing in for whatever a real application would do.
+say "generating the launcher and the service worker"
+TESTBED_REGISTRY_JSON="$registry_json" TESTBED_BUILD_VERSION="$(date +%s 2>/dev/null || echo test)" \
+  node "$HERE/web/build-launcher.mjs"
 
 say "starting the origin (one instance) on :$SERVER_PORT"
 TESTBED_SERVER_PORT="$SERVER_PORT" TESTBED_LINES="$registry" \

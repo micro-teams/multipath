@@ -26,7 +26,7 @@ const DELAY_MS = Number(process.env.LINE_DELAY_MS ?? 0);
 /** Fail 1 request in every N (0 disables). Deterministic, not random. */
 const FAIL_EVERY = Number(process.env.LINE_FAIL_EVERY ?? 0);
 /** Accept the connection and then never answer — what a black-holed route looks like. */
-const STALL = process.env.LINE_STALL === "1";
+let stalling = process.env.LINE_STALL === "1";
 
 let seen = 0;
 
@@ -37,9 +37,17 @@ const server = http.createServer((req, res) => {
   // without restarting anything. Answered here and never forwarded.
   if (req.url === "/__line") {
     res.writeHead(200, { "content-type": "application/json", ...cors(req) });
-    res.end(
-      JSON.stringify({ name: NAME, port: PORT, delayMs: DELAY_MS, seen }),
-    );
+    res.end(JSON.stringify({ name: NAME, port: PORT, delayMs: DELAY_MS, seen, stalling }));
+    return;
+  }
+
+  // Kill or revive this line while the browser is still running. Restarting the process would also
+  // reset the browser's connection state, which would make "the line died after the app had already
+  // loaded" impossible to stage — and that is precisely the case the cache exists for.
+  if (req.url === "/__line/stall" || req.url === "/__line/revive") {
+    stalling = req.url.endsWith("/stall");
+    res.writeHead(200, { "content-type": "application/json", ...cors(req) });
+    res.end(JSON.stringify({ name: NAME, stalling }));
     return;
   }
 
@@ -51,7 +59,7 @@ const server = http.createServer((req, res) => {
 
   // Only proxied traffic is black-holed; the control endpoint above still answers, so the harness
   // can tell "this line is deliberately silent" from "this line failed to start".
-  if (STALL) return; // hold the socket open forever, answer nothing
+  if (stalling) return; // hold the socket open forever, answer nothing
 
   if (FAIL_EVERY > 0 && seen % FAIL_EVERY === 0) {
     // 502, not a dropped connection: a client must handle the line that answers *badly*, which is
@@ -146,7 +154,7 @@ server.listen(PORT, () => {
   const traits = [
     DELAY_MS ? `+${DELAY_MS}ms` : "no delay",
     FAIL_EVERY ? `fails 1/${FAIL_EVERY}` : "no failures",
-    STALL ? "STALLS" : null,
+    stalling ? "STALLS" : null,
   ].filter(Boolean);
   console.log(
     `${NAME} :${PORT} -> ${TARGET_HOST}:${TARGET_PORT} (${traits.join(", ")})`,

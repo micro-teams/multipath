@@ -56,9 +56,18 @@ interface Testbed {
   reset(): void;
 }
 
+/** What the launcher inlines for the application to read before it has fetched anything. */
+interface MultipathBootConfig {
+  appEntry: string;
+  registry: { lines: TestbedLine[] } | null;
+  registryUrl: string | null;
+}
+
 declare global {
   interface Window {
     testbed: Testbed;
+    __multipath__: MultipathBootConfig;
+    __app_started__?: boolean;
   }
 }
 
