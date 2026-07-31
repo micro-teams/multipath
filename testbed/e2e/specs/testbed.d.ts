@@ -53,6 +53,7 @@ interface Testbed {
       lastError: string | null;
     }>;
   }>;
+  showPanel(): () => void;
   reset(): void;
 }
 

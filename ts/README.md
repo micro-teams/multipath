@@ -152,11 +152,32 @@ which line is tried first.
 Only the very first HTML document cannot be raced — a browser opening a URL knows one host. That one
 request is why the launcher is kept small, and after the worker installs even it comes from cache.
 
+## Seeing what it is doing
+
+Everything here is invisible by construction — requests leave over whichever line is winning,
+duplicates are absorbed before any controller sees them. That is the point, and it is also what
+makes it hard to trust: when it works there is nothing to see, and when it misbehaves there is also
+nothing to see.
+
+```ts
+import { mountLinePanel } from "@micro-teams/multipath";
+
+const unmount = mountLinePanel(manager, document.getElementById("panel")!);
+```
+
+Put it behind a route nothing links to. It shows what each line is *like* — rank, state, measured
+latency and throughput, last error — beside what actually *happened*: which line served each recent
+request, and the share each one won. Those two disagree more often than you would expect, and the
+disagreement is usually where the bug is.
+
+Plain DOM, no framework, styles scoped to the panel. A diagnostic that drags in dependencies is one
+that gets excluded from the production build, which is exactly where it is needed.
+
 ## Status
 
 MP-1 through MP-5 are implemented on the client: registry, health, probing, ranking, hedged reads,
-write failover, precache, launcher, the generated-client adapter, and idempotency keys. Still to
-come: the developer panel and the request cache.
+write failover, precache, launcher, the developer panel, the generated-client adapter, and
+idempotency keys. Still to come: the request cache, and the Go connector catching up.
 
 ## Develop
 
