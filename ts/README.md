@@ -52,12 +52,38 @@ pressure, not a side effect.
 data behind the developer line panel, and it is strictly observational: an `onAttempt` that throws
 is swallowed, because a debugging aid must never be able to break the app it observes.
 
+## Measuring the lines
+
+Nothing is measured until you say so, because probing costs real requests and a library that starts
+making them on construction is one that surprises people:
+
+```ts
+manager.start();          // begin measuring in the background
+await manager.probeNow(); // or measure once, and wait
+manager.health();         // what is known about every line
+manager.ranked();         // lines best-first
+```
+
+Two measurements, because one is not enough and the second is not free. Round-trip time is cheap,
+so it runs constantly and drives the ranking. Throughput is not, so it runs rarely and only after
+the application has been quiet — and it matters because the problem this library exists for is a
+line that is *slow*, not one that is far: an edge can answer a probe in 20ms and still take seconds
+to deliver a bundle.
+
+A failing line backs off exponentially, so a dead route costs a request every few minutes rather
+than every few seconds. A line that is down is ranked last but never removed — if everything is
+down the caller still has to send the request somewhere, and refusing to try is worse than trying
+the least-bad option.
+
+Measurement outranks configuration: `weight` breaks ties between lines that have not been
+distinguished by measurement, and nothing more. A hand-set number goes stale; an average does not.
+
 ## Status
 
-MP-1 and the client half of MP-2 are implemented: registry, validation, selection, resolution, the
-generated-client adapter, and idempotency keys on writes.
-Probing, read hedging and write failover (MP-3 / MP-4) slot into `LineManager.select` and
-`LineManager.dispatch` without changing this API.
+MP-1, the client half of MP-2, and the first half of MP-3 are implemented: registry, health,
+probing, ranking, resolution, the generated-client adapter, and idempotency keys on writes.
+Read hedging and write failover slot into `LineManager.ranked` and `LineManager.dispatch` without
+changing this API.
 
 ## Develop
 

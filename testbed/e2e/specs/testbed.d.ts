@@ -42,6 +42,17 @@ interface Testbed {
     headers?: Record<string, string>,
   ): Promise<TestbedResult[]>;
   resolve(path: string): string;
+  probe(): Promise<{
+    ranked: string[];
+    health: Array<{
+      lineId: string;
+      state: "up" | "degraded" | "down";
+      latencyMs: number | null;
+      throughputBps: number | null;
+      consecutiveFailures: number;
+      lastError: string | null;
+    }>;
+  }>;
   reset(): void;
 }
 

@@ -20,6 +20,8 @@
  *      agent4
  */
 
+import { HealthTable, type HealthOptions, type LineHealth } from "./health.js";
+import { Prober, type ProberOptions } from "./prober.js";
 import { SAME_ORIGIN_REGISTRY, type Line, type Registry } from "./registry.js";
 
 /**
@@ -47,6 +49,10 @@ export interface LineManagerOptions {
   readonly idempotencyHeader?: string;
   /** Injected for tests; defaults to `crypto.randomUUID`. */
   readonly newKey?: () => string;
+  /** Tuning for the health table: smoothing, how many failures mean down, what counts as slow. */
+  readonly health?: HealthOptions;
+  /** Tuning for the measurement loop. Probing does not begin until `start()` is called. */
+  readonly probe?: ProberOptions;
 }
 
 /** What one request-over-one-line did. Purely observational — never load-bearing. */
@@ -74,6 +80,8 @@ export class LineManager {
   private readonly idempotentMethods: ReadonlySet<string>;
   private readonly idempotencyHeader: string;
   private readonly newKey: () => string;
+  private readonly healthTable: HealthTable;
+  private readonly prober: Prober;
 
   constructor(options: LineManagerOptions = {}) {
     this.registry = options.registry ?? SAME_ORIGIN_REGISTRY;
@@ -85,11 +93,47 @@ export class LineManager {
     );
     this.idempotencyHeader = options.idempotencyHeader ?? "Idempotency-Key";
     this.newKey = options.newKey ?? (() => crypto.randomUUID());
+    this.healthTable = new HealthTable(options.health);
+    this.prober = new Prober(
+      () => this.registry.lines,
+      this.healthTable,
+      this.fetchImpl,
+      (path, line) => this.resolve(path, line),
+      options.probe ?? {},
+    );
+  }
+
+  /**
+   * Begin measuring the lines.
+   *
+   * Separate from construction because probing costs real requests, and a library that starts
+   * making them the moment it is instantiated is one that surprises people. Until this is called
+   * the manager still works — it just ranks on configured weight, having measured nothing.
+   */
+  start(): void {
+    this.prober.start();
+  }
+
+  stop(): void {
+    this.prober.stop();
+  }
+
+  /** Probe every line now and wait for the answers. */
+  probeNow(): Promise<void> {
+    return this.prober.probeAll();
+  }
+
+  /** Everything measured about every line — the developer panel's whole data source. */
+  health(): LineHealth[] {
+    return this.registry.lines.map((line) => this.healthTable.get(line.id));
   }
 
   /** Swap the registry at runtime — a refreshed `GET /mt/lines` is the expected caller. */
   setRegistry(registry: Registry): void {
     this.registry = registry;
+    // Drop health for lines that no longer exist, so a re-added id cannot inherit the reputation of
+    // a line that happened to share its name.
+    this.healthTable.retain(registry.lines.map((line) => line.id));
   }
 
   get lines(): readonly Line[] {
@@ -97,13 +141,18 @@ export class LineManager {
   }
 
   /**
-   * The line this request should go out over.
+   * Lines in preference order, best first.
    *
-   * MP-1: the first line in the registry, full stop. MP-3 replaces the body with the EWMA ranking;
-   * every caller already goes through here, so nothing else moves.
+   * Down lines are ranked last but not dropped: if everything is down the caller still has to send
+   * the request somewhere, and refusing to try is worse than trying the least-bad option.
    */
+  ranked(): Line[] {
+    return this.healthTable.rank(this.registry.lines);
+  }
+
+  /** The line a request starts on. With hedging and failover, others may follow it. */
   select(): Line {
-    const line = this.registry.lines[0];
+    const line = this.ranked()[0];
     if (!line) throw new NoLineAvailableError();
     return line;
   }
@@ -137,6 +186,8 @@ export class LineManager {
   }
 
   private async dispatchOver(line: Line, path: string, init: RequestInit): Promise<Response> {
+    // Real traffic is what the throughput probe waits to be absent, so it has to be told.
+    this.prober.noteTraffic();
     const url = this.resolve(path, line);
     const method = (init.method ?? "GET").toUpperCase();
     // Any line with an absolute url is a different origin from the page — a different subdomain is

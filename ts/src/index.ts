@@ -13,6 +13,10 @@ export {
   type Registry,
 } from "./registry.js";
 
+export { HealthTable, type HealthOptions, type LineHealth, type LineState } from "./health.js";
+
+export { Prober, type ProberOptions } from "./prober.js";
+
 export {
   LineManager,
   NoLineAvailableError,
