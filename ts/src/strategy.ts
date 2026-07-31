@@ -67,8 +67,17 @@ export async function hedgedRead(
   if (lines.length === 0) throw new Error("no line available to serve the request");
 
   const controllers: AbortController[] = [];
-  const abortAll = () => controllers.forEach((c) => c.abort());
-  const onExternalAbort = () => abortAll();
+  // The winner must survive the cleanup below. Aborting it would cancel the very response being
+  // returned — the headers have arrived but the body is still streaming, so the caller gets an
+  // AbortError the moment it reads. Losing the race is what makes a request disposable; winning it
+  // is not.
+  let winner: AbortController | null = null;
+  const abortLosers = () => controllers.forEach((c) => c !== winner && c.abort());
+  const onExternalAbort = () => {
+    // A caller who cancels means all of them, winner included.
+    winner = null;
+    abortLosers();
+  };
   signal?.addEventListener("abort", onExternalAbort, { once: true });
 
   const failures: unknown[] = [];
@@ -99,6 +108,7 @@ export async function hedgedRead(
         attempt(line, controller.signal).then(
           (response) => {
             if (settled) return;
+            winner = controller;
             finish(() => resolve(response));
           },
           (error) => {
@@ -128,7 +138,7 @@ export async function hedgedRead(
     });
   } finally {
     signal?.removeEventListener("abort", onExternalAbort);
-    abortAll();
+    abortLosers();
   }
 }
 

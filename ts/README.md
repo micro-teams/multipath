@@ -173,11 +173,34 @@ disagreement is usually where the bug is.
 Plain DOM, no framework, styles scoped to the panel. A diagnostic that drags in dependencies is one
 that gets excluded from the production build, which is exactly where it is needed.
 
+## Last time's answer, beside this time's
+
+```ts
+const call = manager.cached(() => chatApi().listChats(args));
+paint(await call.cached);   // what the identical request returned last time, or null
+paint(await call);          // this request's real result
+```
+
+The request always goes out and the awaited value is always **this** request's result. A failure
+stays a failure; it never quietly becomes stale data wearing a success. That is the difference from
+a browser cache, which answers instead of asking — the remembered answer is offered beside the truth
+so the caller can paint with it while waiting, never in place of it.
+
+A thenable rather than a `{ cached, fresh }` pair, so call sites keep their shape: anything that
+does not want optimistic rendering ignores `cached` and behaves exactly as before.
+
+Keyed by the request — method and path, with the line's origin deliberately excluded, since the same
+resource fetched over two lines is the same resource. Nothing here decides *when* to forget: what a
+write makes stale is business knowledge, so the cache offers invalidation by request shape and
+leaves the timing to the application. Tenants are separated by an opaque `scope` string, so this
+layer never learns what a "user" is.
+
 ## Status
 
-MP-1 through MP-5 are implemented on the client: registry, health, probing, ranking, hedged reads,
-write failover, precache, launcher, the developer panel, the generated-client adapter, and
-idempotency keys. Still to come: the request cache, and the Go connector catching up.
+MP-1 through MP-6 are implemented on the client: registry, health, probing, ranking, hedged reads,
+write failover, precache, launcher, the developer panel, the request cache, the generated-client
+adapter, and idempotency keys. Still to come: the Go connector catching up, and WebSocket line
+selection.
 
 ## Develop
 

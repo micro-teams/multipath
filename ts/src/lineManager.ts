@@ -22,6 +22,7 @@
 
 import { HealthTable, type HealthOptions, type LineHealth } from "./health.js";
 import { Prober, type ProberOptions } from "./prober.js";
+import { RequestCache, type RequestCacheOptions } from "./cache.js";
 import { SAME_ORIGIN_REGISTRY, type Line, type Registry } from "./registry.js";
 import {
   STRATEGY_DEFAULTS,
@@ -82,6 +83,28 @@ export interface LineManagerOptions {
    * with good intentions.
    */
   readonly attemptHistory?: number;
+  /** Enables `cached()`. Omit and no answers are remembered. */
+  readonly cache?: RequestCacheOptions;
+}
+
+/**
+ * A call in flight, plus what the same call returned last time.
+ *
+ * A thenable rather than a pair, so a call site keeps its shape: `await` still yields this
+ * request's real result, and code that does not want optimistic rendering ignores `cached`
+ * entirely and behaves exactly as before. Returning `{ cached, fresh }` would have forced every
+ * call site to be rewritten for a feature most of them do not use.
+ */
+export interface CachedCall<T> extends Promise<T> {
+  /**
+   * What the identical request returned last time, or null.
+   *
+   * A promise rather than a plain value because the key can only be derived from the request the
+   * call actually issues, and whether the generated client awaits anything before reaching the
+   * network is its own business — a detail a codegen upgrade could change. It settles within a
+   * microtask or two, long before the network answers, so nothing visible waits on it.
+   */
+  readonly cached: Promise<T | null>;
 }
 
 /** What one request-over-one-line did. Purely observational — never load-bearing. */
@@ -115,6 +138,16 @@ export class LineManager {
   private readonly storage: Storage | undefined;
   private readonly storageKey: string;
   private readonly storageMaxAgeMs: number;
+  private readonly requestCache: RequestCache | undefined;
+  /**
+   * The call currently waiting to learn which request it made.
+   *
+   * One at a time, enforced by the queue below. Without that, two `cached()` calls started in the
+   * same tick could each be handed the other's URL — and a cache that occasionally shows one
+   * screen's data on another is worse than no cache, because it is believed.
+   */
+  private pendingCall: ((key: string | null) => void) | null = null;
+  private armQueue: Promise<void> = Promise.resolve();
   private readonly history: Attempt[] = [];
   private readonly historyLimit: number;
 
@@ -133,6 +166,7 @@ export class LineManager {
     this.storageKey = options.storageKey ?? "multipath:health";
     this.storageMaxAgeMs = options.storageMaxAgeMs ?? 7 * 24 * 60 * 60 * 1000;
     this.historyLimit = options.attemptHistory ?? 100;
+    this.requestCache = options.cache ? new RequestCache(options.cache) : undefined;
     this.restoreHealth();
     this.strategy = { ...STRATEGY_DEFAULTS, ...options.strategy };
     this.prober = new Prober(
@@ -276,6 +310,7 @@ export class LineManager {
   private async dispatchOver(line: Line, path: string, init: RequestInit): Promise<Response> {
     // Real traffic is what the throughput probe waits to be absent, so it has to be told.
     this.prober.noteTraffic();
+    this.claimPendingCall(init.method ?? "GET", path);
     const url = this.resolve(path, line);
     const method = (init.method ?? "GET").toUpperCase();
     // Any line with an absolute url is a different origin from the page — a different subdomain is
@@ -325,6 +360,71 @@ export class LineManager {
     return { ...init, headers };
   }
 
+  /** The answers remembered so far, for invalidation and scoping. Absent unless `cache` was set. */
+  get cache(): RequestCache | undefined {
+    return this.requestCache;
+  }
+
+  /**
+   * Run a call, and offer what the identical call returned last time.
+   *
+   * The request always goes out; the awaited value is always this request's result. The remembered
+   * answer is offered beside it, never in place of it — a failure stays a failure rather than
+   * quietly becoming stale data wearing a success.
+   */
+  cached<T>(call: () => Promise<T>): CachedCall<T> {
+    if (!this.requestCache) {
+      const fresh = call() as CachedCall<T>;
+      return Object.defineProperty(fresh, "cached", { value: Promise.resolve(null) });
+    }
+
+    let settleKey: (key: string | null) => void;
+    const keyKnown = new Promise<string | null>((resolve) => {
+      settleKey = resolve;
+    });
+
+    // The lock is held from arming until this call has learned which request it made — microseconds
+    // — and never for the duration of the request itself. Requests still overlap freely; only the
+    // moment of "which URL was that?" is serialised. Without it, two calls started in the same tick
+    // could each be handed the other's URL, and a cache that occasionally shows one screen's data
+    // on another is worse than no cache, because it is believed.
+    let releaseLock: () => void;
+    const lockReleased = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const acquired = this.armQueue;
+    this.armQueue = acquired.then(() => lockReleased);
+
+    const fresh = acquired
+      .then(() => {
+        this.pendingCall = (key) => {
+          this.pendingCall = null;
+          settleKey(key);
+          releaseLock();
+        };
+        return call();
+      })
+      .then(async (value) => {
+        const key = await keyKnown;
+        if (key !== null) this.requestCache!.set(key, value);
+        return value;
+      })
+      .finally(() => {
+        // A call that never reached the network — rejected first, or not a GET — must not leave the
+        // queue waiting on a claim that will never come.
+        this.pendingCall = null;
+        settleKey(null);
+        releaseLock();
+      }) as CachedCall<T>;
+
+    const cached = keyKnown.then((key) => (key === null ? null : this.requestCache!.get<T>(key)));
+    // Nobody is obliged to read it, and an unhandled rejection here would be noise about an
+    // optional convenience.
+    void cached.catch(() => null);
+
+    return Object.defineProperty(fresh, "cached", { value: cached });
+  }
+
   /**
    * Recent attempts, newest first.
    *
@@ -334,6 +434,19 @@ export class LineManager {
    */
   recentAttempts(): readonly Attempt[] {
     return this.history;
+  }
+
+  /**
+   * Tell a waiting `cached()` call which request it turned out to be.
+   *
+   * Reads only. A write's answer is not worth remembering — it is a receipt for something that has
+   * already happened, and offering it to a later identical-looking write would be the one place
+   * this could mislead rather than merely be unhelpful.
+   */
+  private claimPendingCall(method: string, path: string): void {
+    const waiting = this.pendingCall;
+    if (!waiting) return;
+    waiting(method.toUpperCase() === "GET" ? RequestCache.keyFor("GET", path) : null);
   }
 
   private report(attempt: Attempt): void {

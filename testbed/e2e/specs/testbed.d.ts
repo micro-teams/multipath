@@ -53,6 +53,10 @@ interface Testbed {
       lastError: string | null;
     }>;
   }>;
+  cachedGet(path: string): Promise<{ cached: unknown; fresh: unknown }>;
+  cachedOnly(path: string): Promise<unknown>;
+  invalidate(prefix: string): number;
+  setScope(scope: string): void;
   showPanel(): () => void;
   reset(): void;
 }
