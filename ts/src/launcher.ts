@@ -24,7 +24,13 @@
 import type { Registry } from "./registry.js";
 
 export interface LauncherOptions {
-  /** The application's real entry point — an ES module URL. */
+  /**
+   * The application's real entry point, as an origin-relative path.
+   *
+   * A path rather than a URL, because the launcher races it across the lines: naming one host here
+   * would be choosing, on the one visit where nothing is known yet, which line the whole first load
+   * depends on.
+   */
   readonly appEntry: string;
   /** Where the Service Worker lives. Omit to skip registration entirely. */
   readonly serviceWorker?: string;
@@ -38,6 +44,15 @@ export interface LauncherOptions {
   readonly registry?: Registry;
   /** URL to refresh the registry from once the app is running. */
   readonly registryUrl?: string;
+  /**
+   * How long one line gets alone before the next is tried when loading the entry point.
+   *
+   * Much longer than the 150ms used for API reads, and deliberately so: the entry point is a large
+   * payload, so starting a second copy of it is expensive in exactly the situation where bandwidth
+   * is scarce. The number only has to be short enough that a black hole does not cost the visit,
+   * and long enough that a merely slow line still wins on its own.
+   */
+  readonly bootstrapHedgeMs?: number;
   readonly title?: string;
   /** Extra markup inside the body — a splash screen, a spinner, a noscript notice. */
   readonly bodyHtml?: string;
@@ -95,9 +110,62 @@ if ("serviceWorker" in navigator) {
 }
 `
     : ""
-}import(${JSON.stringify(options.appEntry)}).catch((error) => {
-  // The one failure with nothing behind it: the entry point itself could not be loaded from any
-  // line and is not in the cache. Say so plainly rather than leaving a blank page.
+}
+// Cold start: no cache, no worker, and nothing measured, so the registry's order is only a guess.
+// Racing the entry point over the lines is what stops a wrong guess from costing the whole visit —
+// without it, one dead line in the wrong position means the app simply never appears.
+//
+// It races to find a line that can *serve the bundle*, then imports normally from that line. The
+// bytes are not executed from memory: a module built from a blob has the blob as its base URL, so
+// every relative chunk import inside a code-split application would resolve to nowhere. Importing
+// from the winner's URL keeps module semantics exactly as the bundler intended, and the browser's
+// HTTP cache normally satisfies the second request from the first.
+const __mp = window.__multipath__;
+const __lines = (__mp.registry && __mp.registry.lines) || [];
+const __entry = ${JSON.stringify(options.appEntry)};
+const __hedge = ${JSON.stringify(options.bootstrapHedgeMs ?? 1200)};
+
+function __race(path) {
+  if (__lines.length < 2) return Promise.resolve(path);
+  return new Promise((resolve, reject) => {
+    let next = 0, failed = 0, done = false;
+    const controllers = [];
+    const launch = () => {
+      if (next >= __lines.length) return;
+      const line = __lines[next++];
+      const url = (line.url || "") + path;
+      const controller = new AbortController();
+      controllers.push(controller);
+      fetch(url, {
+        signal: controller.signal,
+        credentials: line.url ? "include" : "same-origin",
+      })
+        .then((response) => {
+          if (!response.ok) throw new Error(String(response.status));
+          // Drain it, so the response completes and lands in the HTTP cache for the import below.
+          return response.blob().then(() => {
+            if (done) return;
+            done = true;
+            controllers.forEach((c) => c !== controller && c.abort());
+            resolve(url);
+          });
+        })
+        .catch(() => {
+          if (done) return;
+          if (++failed === __lines.length) reject(new Error("no line could serve " + path));
+          else launch();
+        });
+      if (next < __lines.length) setTimeout(launch, __hedge);
+    };
+    launch();
+  });
+}
+
+__race(__entry)
+  .then((url) => import(url))
+  .catch((error) => {
+  // The one failure with nothing behind it: the entry point could not be loaded from any line and
+  // is not in the cache. Say so plainly rather than leaving a blank page.
   console.error("multipath: could not start the application", error);
   document.body.insertAdjacentHTML(
     "beforeend",
@@ -110,7 +178,6 @@ if ("serviceWorker" in navigator) {
 `;
 }
 
-/** The second argument to `register`, or nothing at all when neither option was set. */
 function registrationOptions(options: LauncherOptions): string {
   const parts: string[] = [];
   if (options.scope) parts.push(`scope: ${JSON.stringify(options.scope)}`);

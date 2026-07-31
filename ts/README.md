@@ -128,6 +128,20 @@ Registration is fire-and-forget: the app starts whether or not the worker instal
 waited for the cache would have made the cache a prerequisite for starting, which is the opposite of
 the point.
 
+`appEntry` is a **path**, not a URL, because the launcher races it across the lines. The first visit
+has no cache, no worker and no measurements, so the registry's order is only a guess — naming one
+host would bet the entire first load on that guess. Lines are tried staggered, so a healthy first
+line answers alone and nothing is fetched twice, while a black hole costs `bootstrapHedgeMs` rather
+than a connection timeout.
+
+The winner is imported by URL rather than executed from the fetched bytes. A module built from a
+blob has the blob as its base URL, so every relative chunk import in a code-split application would
+resolve to nowhere; importing from the winning line keeps module semantics exactly as the bundler
+intended, and its chunks continue to come from that same line.
+
+Only the very first HTML document cannot be raced — a browser opening a URL knows one host. That one
+request is why the launcher is kept small, and after the worker installs even it comes from cache.
+
 ## Status
 
 MP-1 through MP-5 are implemented on the client: registry, health, probing, ranking, hedged reads,

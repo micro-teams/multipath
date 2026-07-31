@@ -31,7 +31,9 @@ let stalling = process.env.LINE_STALL === "1";
 let seen = 0;
 
 const server = http.createServer((req, res) => {
-  seen += 1;
+  // Control endpoints are answered below without counting: `seen` means "traffic this line
+  // carried", and a spec that asks how much a line carried must not change the answer by asking.
+  // (It did, once — every measurement counted itself, so the delta was never zero.)
 
   // Control endpoint on the line itself, so a spec can change this line's behaviour mid-run
   // without restarting anything. Answered here and never forwarded.
@@ -56,6 +58,8 @@ const server = http.createServer((req, res) => {
     res.end();
     return;
   }
+
+  seen += 1;
 
   // Only proxied traffic is black-holed; the control endpoint above still answers, so the harness
   // can tell "this line is deliberately silent" from "this line failed to start".

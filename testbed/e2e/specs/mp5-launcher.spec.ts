@@ -33,6 +33,26 @@ async function reviveAll(request: import("@playwright/test").APIRequestContext) 
   for (const port of LINE_PORTS) await setStalling(request, port, port === 9004);
 }
 
+/** How many requests a line has seen, so a spec can tell "asked" from "not asked". */
+async function lineHits(
+  request: import("@playwright/test").APIRequestContext,
+  port: number,
+): Promise<number> {
+  return (await (await request.get(`http://localhost:${port}/__line`)).json()).seen as number;
+}
+
+/** A genuinely cold start: no worker, no cache, nothing measured. */
+async function clearClientState(page: Page, context: import("@playwright/test").BrowserContext) {
+  await context.clearCookies();
+  await page.goto("/launcher.html");
+  await page.evaluate(async () => {
+    for (const registration of await navigator.serviceWorker.getRegistrations()) {
+      await registration.unregister();
+    }
+    for (const key of await caches.keys()) await caches.delete(key);
+  });
+}
+
 /** Wait for the worker to be in charge, since a hot cache is the precondition for every check. */
 async function waitForWorker(page: Page) {
   await page.waitForFunction(() => navigator.serviceWorker.controller !== null, null, {
@@ -60,16 +80,56 @@ test.describe("MP-5: the launcher starts the application", () => {
     await page.goto("/launcher.html");
     const config = await page.evaluate(() => window.__multipath__);
     expect(config.registry?.lines.length).toBeGreaterThan(0);
-    // Absolute, on a line: a cold start has no worker yet, so the first load of the bundle has to
-    // name a host. Everything after that comes from the cache and the host stops mattering.
-    expect(config.appEntry).toContain("/app/main.js");
-    expect(config.appEntry.startsWith("http://")).toBe(true);
+    // A path, not a URL: naming a host here would bet the whole first visit on one line.
+    expect(config.appEntry).toBe("/app/main.js");
   });
 
   test("installs a service worker that takes charge", async ({ page }) => {
     await page.goto("/launcher.html");
     await waitForWorker(page);
     expect(await page.evaluate(() => navigator.serviceWorker.controller !== null)).toBe(true);
+  });
+});
+
+test.describe("MP-5: a cold start survives a dead line", () => {
+  /**
+   * The hardest moment in the whole system: no cache, no worker, and nothing measured, so the
+   * registry's order is only a guess. Before the entry was raced, one dead line in the wrong
+   * position meant the application never appeared at all — the import simply hung.
+   */
+  test("the app starts even though the first line is a black hole", async ({
+    page,
+    request,
+    context,
+  }) => {
+    await reviveAll(request);
+    await clearClientState(page, context);
+    await setStalling(request, 9001, true);
+
+    const started = Date.now();
+    await page.goto("/launcher.html");
+    await expect(page.locator("[data-app-ready]")).toBeVisible({ timeout: 15_000 });
+
+    // It had to notice and move on, not wait out a connection timeout.
+    expect(Date.now() - started).toBeLessThan(10_000);
+    await reviveAll(request);
+  });
+
+  test("a healthy first line is not raced, so nothing is fetched twice", async ({
+    page,
+    request,
+    context,
+  }) => {
+    await reviveAll(request);
+    await clearClientState(page, context);
+
+    const before = await lineHits(request, 9002);
+    await page.goto("/launcher.html");
+    await expect(page.locator("[data-app-ready]")).toBeVisible({ timeout: 15_000 });
+    const after = await lineHits(request, 9002);
+
+    // The second line is only consulted when the first has had its head start and not answered.
+    expect(after - before).toBe(0);
   });
 });
 

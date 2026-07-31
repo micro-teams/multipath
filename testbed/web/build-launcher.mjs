@@ -24,21 +24,14 @@ const registry = {
 };
 
 // The "application" is served by the origin, so it reaches the browser over the lines exactly as a
-// real build artefact would.
-//
-// The manifest entry is the origin-relative path — that is the key the cache is filled under. The
-// launcher, though, has to import an absolute URL on a line, because on a *cold* start no worker
-// exists yet to route a relative one. That asymmetry is the honest shape of the problem: the very
-// first load of the bundle has to name a host, and only afterwards does the cache make the host
-// irrelevant.
+// real build artefact would. A path, not a URL: the launcher races it across the lines rather than
+// betting the whole first visit on whichever line happens to be listed first.
 const APP_PATH = "/app/main.js";
-const firstLine = registry.lines[0];
-const APP_ENTRY = firstLine ? firstLine.url + APP_PATH : APP_PATH;
 
 await writeFile(
   path.join(HERE, "launcher.html"),
   buildLauncher({
-    appEntry: APP_ENTRY,
+    appEntry: APP_PATH,
     serviceWorker: "/sw.js",
     // The worker below imports the library, so it has to be registered as a module.
     serviceWorkerType: "module",

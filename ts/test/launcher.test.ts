@@ -12,7 +12,37 @@ const registry = parseRegistry({
 describe("buildLauncher", () => {
   it("loads the application entry point", () => {
     const html = buildLauncher({ appEntry: "/assets/main-abc123.js" });
-    expect(html).toContain('import("/assets/main-abc123.js")');
+    expect(html).toContain('"/assets/main-abc123.js"');
+    expect(html).toContain("import(url)");
+  });
+
+  /**
+   * The first visit has no cache, no worker and nothing measured, so the registry's order is only a
+   * guess. Racing the entry across the lines is what stops a wrong guess from costing the whole
+   * visit — before this, one dead line in the wrong position meant the app simply never appeared.
+   */
+  it("races the entry point across the lines", () => {
+    const html = buildLauncher({ appEntry: "/main.js", registry });
+    expect(html).toContain("__race");
+    expect(html).toContain("AbortController");
+  });
+
+  it("does not race when there is only one line to race", () => {
+    const single = { lines: [{ id: "only", url: "" }] };
+    const html = buildLauncher({ appEntry: "/main.js", registry: single });
+    // The guard is in the emitted code; a single line resolves straight to the path.
+    expect(html).toContain("__lines.length < 2");
+  });
+
+  /**
+   * The bytes are fetched but never executed from memory. A module built from a blob has the blob
+   * as its base URL, so every relative chunk import inside a code-split application would resolve
+   * to nowhere. Importing from the winner's URL keeps module semantics as the bundler intended.
+   */
+  it("imports from the winning line rather than executing fetched bytes", () => {
+    const html = buildLauncher({ appEntry: "/main.js", registry });
+    expect(html).not.toContain("createObjectURL");
+    expect(html).not.toContain("new Function");
   });
 
   it("registers the service worker when given one", () => {
@@ -71,7 +101,7 @@ describe("buildLauncher", () => {
   it("does not make starting depend on the worker installing", () => {
     const html = buildLauncher({ appEntry: "/main.js", serviceWorker: "/sw.js" });
     const registration = html.indexOf(".register(");
-    const start = html.indexOf('import("/main.js")');
+    const start = html.indexOf("__race(__entry)");
     expect(registration).toBeLessThan(start);
     expect(html).toContain(".catch(");
     // No await between the two: registration is fire-and-forget.
@@ -109,7 +139,11 @@ describe("buildLauncher", () => {
       registry,
       registryUrl: "/mt/lines",
     });
-    expect(html.length).toBeLessThan(3000);
+    // Raised from 3000 when the entry race landed: about 1.4KB bought the property that a dead
+    // line in the wrong position no longer costs the entire first visit, which is worth several
+    // times its size. The budget stays because size is what erodes quietly, not because this
+    // particular number is sacred.
+    expect(html.length).toBeLessThan(4500);
   });
 
   it("is a complete document", () => {
