@@ -71,7 +71,9 @@ test.describe("MP-1: routing over real lines", () => {
   test("loads the registry the server serves and routes by it", async ({ page }) => {
     await open(page);
     const registry = await page.evaluate((base) => window.testbed.loadRegistry(base), LINES.fast);
-    expect(registry.lines.map((l) => l.id)).toEqual(["fast", "slow", "flaky"]);
+    // The topology run.sh starts. Pinned deliberately: a spec that accepted any registry would
+    // stop noticing if the harness quietly stopped serving one.
+    expect(registry.lines.map((l) => l.id)).toEqual(["fast", "slow", "flaky", "stalled"]);
     expect((await page.evaluate(() => window.testbed.get("/mt/probe"))).line).toBe("fast");
   });
 });

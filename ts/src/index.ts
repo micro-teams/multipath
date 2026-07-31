@@ -18,6 +18,14 @@ export { HealthTable, type HealthOptions, type LineHealth, type LineState } from
 export { Prober, type ProberOptions } from "./prober.js";
 
 export {
+  STRATEGY_DEFAULTS,
+  hedgedRead,
+  writeWithFailover,
+  type Attemptor,
+  type StrategyOptions,
+} from "./strategy.js";
+
+export {
   LineManager,
   NoLineAvailableError,
   SENTINEL_ORIGIN,
