@@ -23,6 +23,13 @@
 import { HealthTable, type HealthOptions, type LineHealth } from "./health.js";
 import { Prober, type ProberOptions } from "./prober.js";
 import { SAME_ORIGIN_REGISTRY, type Line, type Registry } from "./registry.js";
+import {
+  STRATEGY_DEFAULTS,
+  hedgedRead,
+  writeWithFailover,
+  type Attemptor,
+  type StrategyOptions,
+} from "./strategy.js";
 
 /**
  * The origin the OpenAPI-generated client is configured with. It is never contacted: the generated
@@ -53,6 +60,8 @@ export interface LineManagerOptions {
   readonly health?: HealthOptions;
   /** Tuning for the measurement loop. Probing does not begin until `start()` is called. */
   readonly probe?: ProberOptions;
+  /** Hedge delay and timeouts. */
+  readonly strategy?: StrategyOptions;
 }
 
 /** What one request-over-one-line did. Purely observational — never load-bearing. */
@@ -82,6 +91,7 @@ export class LineManager {
   private readonly newKey: () => string;
   private readonly healthTable: HealthTable;
   private readonly prober: Prober;
+  private readonly strategy: Required<StrategyOptions>;
 
   constructor(options: LineManagerOptions = {}) {
     this.registry = options.registry ?? SAME_ORIGIN_REGISTRY;
@@ -94,6 +104,7 @@ export class LineManager {
     this.idempotencyHeader = options.idempotencyHeader ?? "Idempotency-Key";
     this.newKey = options.newKey ?? (() => crypto.randomUUID());
     this.healthTable = new HealthTable(options.health);
+    this.strategy = { ...STRATEGY_DEFAULTS, ...options.strategy };
     this.prober = new Prober(
       () => this.registry.lines,
       this.healthTable,
@@ -181,10 +192,21 @@ export class LineManager {
    * that needs a line therefore has to be in the contract first.
    */
   private async dispatch(path: string, init: RequestInit = {}): Promise<Response> {
-    const line = this.select();
-    return this.dispatchOver(line, path, init);
+    const lines = this.ranked();
+    if (lines.length === 0) throw new NoLineAvailableError();
+
+    const method = (init.method ?? "GET").toUpperCase();
+    const attempt: Attemptor = (line, signal) =>
+      this.dispatchOver(line, path, withSignal(init, signal));
+
+    // The split is the strategy: a read may be asked of several lines because two copies of an
+    // answer are one answer; a write may not, because two writes are two writes.
+    return this.idempotentMethods.has(method)
+      ? writeWithFailover(lines, attempt, this.strategy, init.signal ?? undefined)
+      : hedgedRead(lines, attempt, this.strategy, init.signal ?? undefined);
   }
 
+  /** One request, one line. Everything above decides which lines and how many. */
   private async dispatchOver(line: Line, path: string, init: RequestInit): Promise<Response> {
     // Real traffic is what the throughput probe waits to be absent, so it has to be told.
     this.prober.noteTraffic();
@@ -310,6 +332,16 @@ async function requestInitFrom(request: Request, override?: RequestInit): Promis
     if (body.byteLength > 0) base.body = body;
   }
   return { ...base, ...override };
+}
+
+/**
+ * Attach the strategy's abort signal without discarding the caller's own init.
+ *
+ * A hedge has to be able to cancel the losers, and a write attempt has to be able to time out; both
+ * need a signal of their own. The caller's signal is honoured separately, at the strategy level.
+ */
+function withSignal(init: RequestInit, signal: AbortSignal): RequestInit {
+  return { ...init, signal };
 }
 
 function now(): number {

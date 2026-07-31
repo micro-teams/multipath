@@ -78,12 +78,29 @@ the least-bad option.
 Measurement outranks configuration: `weight` breaks ties between lines that have not been
 distinguished by measurement, and nothing more. A hand-set number goes stale; an average does not.
 
+## Reads and writes are treated oppositely
+
+A read can be repeated freely, because two copies of an answer are one answer. So it is **hedged**:
+the best line is asked first, and if it has not answered within `hedgeAfterMs` (150ms by default)
+the rest are asked too and the first response wins. On a healthy line that budget is never spent
+and no second request is ever sent — which is what makes hedging affordable, where always fanning
+out would multiply every request by the number of lines to buy an improvement that only exists on
+the slow tail.
+
+A write cannot be repeated freely, so it is **never raced**. It goes to one line; only a transport
+failure moves it to the next, carrying the same idempotency key so the server recognises the second
+arrival as the same attempt.
+
+In both cases an error *status* is an answer, not a routing failure. A 404 hedged across every line
+is still a 404, asked N times. A 500 means the request arrived and the server decided; whether to
+retry that is the caller's business, not the transport's. Only silence — no response at all —
+justifies another line, because only then is it unknown whether anything happened.
+
 ## Status
 
-MP-1, the client half of MP-2, and the first half of MP-3 are implemented: registry, health,
-probing, ranking, resolution, the generated-client adapter, and idempotency keys on writes.
-Read hedging and write failover slot into `LineManager.ranked` and `LineManager.dispatch` without
-changing this API.
+MP-1 through MP-4 are implemented on the client: registry, health, probing, ranking, hedged reads,
+write failover, the generated-client adapter, and idempotency keys. Still to come: the Service
+Worker precache and launcher, the developer panel, and the request cache.
 
 ## Develop
 

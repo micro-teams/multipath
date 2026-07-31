@@ -39,13 +39,23 @@ describe("LineManager, default (same-origin, single line)", () => {
     expect(new LineManager().resolve("/mt/chat/threads")).toBe("/mt/chat/threads");
   });
 
-  it("passes a read's init through untouched — the same object, not a copy", async () => {
+  /**
+   * The no-op guarantee, stated precisely.
+   *
+   * Everything the caller set is passed through, and the URL is the bare path. What is added is an
+   * abort signal, because since hedging landed every request carries one — a hedge has to be able
+   * to cancel its losers, and a read now has an overall timeout instead of hanging forever. With a
+   * single line nothing ever aborts it short of that timeout.
+   */
+  it("passes a read's init through, adding only the signal it needs to cancel with", async () => {
     const { calls, fetchImpl } = recordingFetch();
     const init: RequestInit = { headers: { Accept: "application/json" } };
     await send(new LineManager({ fetch: fetchImpl }), "/mt/chat/threads", init);
     expect(calls).toHaveLength(1);
     expect(calls[0]?.url).toBe("/mt/chat/threads");
-    expect(calls[0]?.init).toBe(init);
+    expect(calls[0]?.init?.headers).toBe(init.headers);
+    expect(calls[0]?.init?.signal).toBeInstanceOf(AbortSignal);
+    expect(Object.keys(calls[0]!.init!).sort()).toEqual(["headers", "signal"]);
   });
 
   it("does not add credentials to a same-origin line", async () => {

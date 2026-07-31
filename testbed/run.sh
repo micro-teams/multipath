@@ -25,6 +25,9 @@ LINES=(
   "fast:9001:0:0"
   "slow:9002:400:0"
   "flaky:9003:0:3"
+  # Accepts the connection and never answers — what a black-holed route looks like from a browser,
+  # and the case hedging and failover exist for.
+  "stalled:9004:0:0:stall"
 )
 
 RUN_E2E=0
@@ -59,7 +62,7 @@ cp "$ROOT"/ts/dist/*.js "$HERE/web/vendor/"
 # The registry the server hands out, describing the lines started below.
 registry=""
 for spec in "${LINES[@]}"; do
-  IFS=: read -r id port _ _ <<<"$spec"
+  IFS=: read -r id port _ _ _ <<<"$spec"
   registry+="${registry:+,}${id}=http://localhost:${port}=test=100"
 done
 
@@ -70,9 +73,10 @@ pids+=($!)
 
 say "starting the lines"
 for spec in "${LINES[@]}"; do
-  IFS=: read -r id port delay fail <<<"$spec"
+  IFS=: read -r id port delay fail stall <<<"$spec"
   LINE_NAME="$id" LINE_PORT="$port" LINE_TARGET_PORT="$SERVER_PORT" \
     LINE_DELAY_MS="$delay" LINE_FAIL_EVERY="$fail" \
+    LINE_STALL="$([[ "$stall" == "stall" ]] && echo 1 || echo 0)" \
     node "$HERE/lines/line.js" &
   pids+=($!)
 done
@@ -96,8 +100,9 @@ wait_for() {
 }
 wait_for "http://localhost:$SERVER_PORT/mt/probe" "origin"
 for spec in "${LINES[@]}"; do
-  IFS=: read -r id port _ _ <<<"$spec"
+  IFS=: read -r id port _ _ _ <<<"$spec"
   # The flaky line fails one request in three by design, so retry rather than trust one probe.
+  # The stalled line still answers its own control endpoint; only proxied traffic is black-holed.
   wait_for "http://localhost:$port/__line" "line $id"
 done
 wait_for "http://localhost:$WEB_PORT/" "page"

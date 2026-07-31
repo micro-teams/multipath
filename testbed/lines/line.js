@@ -49,6 +49,8 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Only proxied traffic is black-holed; the control endpoint above still answers, so the harness
+  // can tell "this line is deliberately silent" from "this line failed to start".
   if (STALL) return; // hold the socket open forever, answer nothing
 
   if (FAIL_EVERY > 0 && seen % FAIL_EVERY === 0) {
