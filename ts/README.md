@@ -96,11 +96,67 @@ is still a 404, asked N times. A 500 means the request arrived and the server de
 retry that is the caller's business, not the transport's. Only silence — no response at all —
 justifies another line, because only then is it unknown whether anything happened.
 
+## Starting the app without the network
+
+Two pieces make launching independent of the lines.
+
+`createPrecache` is the Service Worker runtime. Give it the manifest your build emits and a version,
+and it stores every artefact on install, serves them cache-first, and deletes old versions once the
+new one is in charge. A cache miss still goes over the lines, because the assets are on all of them.
+It never answers an API request: staleness in data is the application's business, and a transport
+layer quietly returning yesterday's data would be lying about what it is.
+
+`buildLauncher` produces one small self-contained HTML document. There is exactly one moment that
+cannot be spread across lines — a browser opening a URL knows one host — so that document is made as
+small as possible and does only three things: register the worker, carry the registry inline, and
+import the real entry point. The registry is inlined rather than fetched, because fetching it would
+put a round trip on the one path with no redundancy, and failing there would leave the app unable to
+reach any line, having never learned that the lines exist.
+
+```ts
+// your build step
+writeFileSync("dist/index.html", buildLauncher({
+  appEntry: "/assets/main-abc123.js",
+  serviceWorker: "/sw.js",
+  serviceWorkerType: "module",
+  registry,
+  registryUrl: "/mt/lines",
+}));
+```
+
+Registration is fire-and-forget: the app starts whether or not the worker installs. A launcher that
+waited for the cache would have made the cache a prerequisite for starting, which is the opposite of
+the point.
+
+`appEntry` is a **path**, not a URL, because the launcher races it across the lines. Every line is
+asked at once, with no stagger and no head start for whichever is listed first — a dead, blocked or
+unsupported line therefore costs nothing at all, because nobody was waiting on it.
+
+The winner is whichever line **finishes delivering**, not whichever answers first. That distinction
+is the whole point: a stable edge can return headers in 20ms and still take seconds to hand over a
+megabyte, and picking on first byte would choose it every time — the exact outcome this library
+exists to avoid. The losers are aborted the moment somebody finishes. The cost is some duplicated
+data; the bottleneck is the line rather than the client's connection, so the copies do not
+meaningfully compete for it.
+
+The winner is imported by URL rather than executed from the fetched bytes. A module built from a
+blob has the blob as its base URL, so every relative chunk import in a code-split application would
+resolve to nowhere; importing from the winning line keeps module semantics exactly as the bundler
+intended, and its chunks continue to come from that same line.
+
+`LineManager` can persist what it measures (`storage`), so the *second* visit onward starts from
+measurements rather than from the registry's fixed order. Racing settles the entry point on its own;
+persistence matters for everything after it, which is hedged rather than raced and so does care
+which line is tried first.
+
+Only the very first HTML document cannot be raced — a browser opening a URL knows one host. That one
+request is why the launcher is kept small, and after the worker installs even it comes from cache.
+
 ## Status
 
-MP-1 through MP-4 are implemented on the client: registry, health, probing, ranking, hedged reads,
-write failover, the generated-client adapter, and idempotency keys. Still to come: the Service
-Worker precache and launcher, the developer panel, and the request cache.
+MP-1 through MP-5 are implemented on the client: registry, health, probing, ranking, hedged reads,
+write failover, precache, launcher, the generated-client adapter, and idempotency keys. Still to
+come: the developer panel and the request cache.
 
 ## Develop
 

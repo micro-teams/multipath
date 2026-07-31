@@ -17,6 +17,10 @@ export { HealthTable, type HealthOptions, type LineHealth, type LineState } from
 
 export { Prober, type ProberOptions } from "./prober.js";
 
+export { buildLauncher, type LauncherOptions } from "./launcher.js";
+
+export { createPrecache, type PrecacheOptions } from "./serviceWorker.js";
+
 export {
   STRATEGY_DEFAULTS,
   hedgedRead,

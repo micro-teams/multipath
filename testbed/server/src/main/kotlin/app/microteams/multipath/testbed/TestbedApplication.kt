@@ -117,6 +117,19 @@ class TestbedController {
         return ResponseEntity.ok(ProbeDTO(System.currentTimeMillis()))
     }
 
+    /**
+     * The application bundle, served by the origin so that it reaches the browser over the lines
+     * exactly as a real build artefact would — which is what makes the precache test meaningful.
+     */
+    @GetMapping("/app/main.js", produces = ["text/javascript"])
+    fun appBundle(): String =
+        """
+        // The whole "application": enough to prove it started and to say where it came from.
+        window.__app_started__ = true;
+        document.body.insertAdjacentHTML("beforeend", '<p data-app-ready>application started</p>');
+        """
+            .trimIndent()
+
     /** Wipes the counters between specs. */
     @PostMapping("/mt/reset")
     fun reset(): Map<String, String> {

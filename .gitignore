@@ -4,7 +4,11 @@ target/
 *.tsbuildinfo
 .DS_Store
 
-# Built by testbed/run.sh: the library output copied in for the page to import.
+# Built by testbed/run.sh: the library output copied in for the page to import, and the launcher
+# and worker generated from it. Generated rather than committed, so the specs always run against
+# what the library produces now instead of a snapshot of what it produced once.
 testbed/web/vendor/
+testbed/web/launcher.html
+testbed/web/sw.js
 testbed/e2e/test-results/
 testbed/e2e/playwright-report/

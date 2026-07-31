@@ -136,6 +136,39 @@ export class HealthTable {
     });
   }
 
+  /** Measurements worth carrying to the next visit. */
+  export_(): PersistedHealth[] {
+    return this.all()
+      .filter((h) => h.latencyMs !== null || h.throughputBps !== null)
+      .map((h) => ({
+        lineId: h.lineId,
+        latencyMs: h.latencyMs,
+        throughputBps: h.throughputBps,
+        at: h.lastProbedAt ?? 0,
+      }));
+  }
+
+  /**
+   * Seed from a previous visit.
+   *
+   * Seeded as measurements rather than as certainties: the next probe blends into them normally, so
+   * a line that has genuinely changed is corrected within a few samples rather than being trusted
+   * indefinitely.
+   */
+  import_(entries: readonly PersistedHealth[], maxAgeMs: number, now: number): void {
+    for (const entry of entries) {
+      // Stale enough and it is worse than no information: the network the user was on last month
+      // says nothing about the one they are on now.
+      if (entry.at > 0 && now - entry.at > maxAgeMs) continue;
+      this.entries.set(entry.lineId, {
+        ...this.get(entry.lineId),
+        latencyMs: entry.latencyMs,
+        throughputBps: entry.throughputBps,
+        lastProbedAt: entry.at,
+      });
+    }
+  }
+
   recordThroughput(lineId: string, bytesPerSecond: number): void {
     const previous = this.get(lineId);
     this.entries.set(lineId, {
@@ -207,6 +240,21 @@ export class HealthTable {
     if (previous === null) return sample;
     return previous * (1 - this.smoothing) + sample * this.smoothing;
   }
+}
+
+/**
+ * What is worth remembering between visits.
+ *
+ * Only the measurements, never the states: "down" is a fact about a moment, and a line that was
+ * unreachable on a train yesterday must not start today demoted. Latency and throughput age more
+ * gracefully — a line that was fast last week is a better guess than the registry's fixed order,
+ * which is the alternative.
+ */
+export interface PersistedHealth {
+  readonly lineId: string;
+  readonly latencyMs: number | null;
+  readonly throughputBps: number | null;
+  readonly at: number;
 }
 
 function stateRank(state: LineState): number {
