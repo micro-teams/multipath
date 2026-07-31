@@ -43,6 +43,7 @@
   };
 
   const manager = new LineManager({
+    cache: {},
     onAttempt: (a) => {
       attempts.push(a);
       say(`${a.method} ${a.path} via ${a.lineId} -> ${a.status ?? a.error} (${Math.round(a.durationMs)}ms)`);
@@ -54,6 +55,20 @@
   // testing a door nobody uses proves nothing.
   const mpFetch = manager.fetchApi();
   const call = (path, init) => mpFetch(`${SENTINEL_ORIGIN}${path}`, init);
+
+  /** A generated-client-shaped read: build the url, await, then go through fetchApi. */
+  async function call_(path) {
+    await Promise.resolve();
+    const response = await mpFetch(`${SENTINEL_ORIGIN}${path}`);
+    return response.json();
+  }
+
+  /** A generated-client-shaped read: build the url, await, then go through fetchApi. */
+  async function contractCall(path) {
+    await Promise.resolve();
+    const response = await mpFetch(`${SENTINEL_ORIGIN}${path}`);
+    return response.json();
+  }
 
   async function describe(response) {
     return {
@@ -136,6 +151,35 @@
      * with a slow connection can open this and see which line is being used and why, without
      * reading any code or trusting a test report.
      */
+    /**
+     * A read through the cache, reporting both halves.
+     *
+     * Shaped exactly as an application would use it: await the call for the truth, read `.cached`
+     * for something to paint while waiting.
+     */
+    async cachedGet(path) {
+      const call = manager.cached(() => contractCall(path));
+      const cached = await call.cached;
+      const fresh = await call;
+      return { cached, fresh };
+    },
+
+    /** Only the optimistic half, so a spec can prove it arrives before the network does. */
+    async cachedOnly(path) {
+      const call = manager.cached(() => contractCall(path));
+      const cached = await call.cached;
+      call.catch(() => {});
+      return cached;
+    },
+
+    invalidate(prefix) {
+      return manager.cache.invalidate(prefix);
+    },
+
+    setScope(scope) {
+      manager.cache.setScope(scope);
+    },
+
     showPanel() {
       const host = document.createElement("div");
       host.id = "panel";

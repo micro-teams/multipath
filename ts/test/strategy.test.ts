@@ -60,6 +60,17 @@ describe("hedgedRead", () => {
     expect(aborted).toContain("c");
   });
 
+  /**
+   * The winner must survive the cleanup. Aborting it cancels the very response being returned:
+   * headers have arrived but the body is still streaming, so the caller gets an AbortError the
+   * moment it reads. Losing the race is what makes a request disposable; winning it is not.
+   */
+  it("does not abort the line that won", async () => {
+    const { aborted, attempt } = attemptor({ a: answers("a"), b: never, c: never });
+    await hedgedRead(lines, attempt, READ);
+    expect(aborted).not.toContain("a");
+  });
+
   it("does not wait out the hedge delay when the first line fails immediately", async () => {
     const { asked, attempt } = attemptor({
       a: failsWith("refused"),

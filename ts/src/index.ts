@@ -23,6 +23,8 @@ export { createPrecache, type PrecacheOptions } from "./serviceWorker.js";
 
 export { mountLinePanel, type PanelOptions, type PanelSource } from "./panel.js";
 
+export { RequestCache, type RequestCacheOptions } from "./cache.js";
+
 export {
   STRATEGY_DEFAULTS,
   hedgedRead,
@@ -36,5 +38,6 @@ export {
   NoLineAvailableError,
   SENTINEL_ORIGIN,
   type Attempt,
+  type CachedCall,
   type LineManagerOptions,
 } from "./lineManager.js";
