@@ -18,9 +18,16 @@ import { buildLauncher } from "../../ts/dist/launcher.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
-/** The lines run.sh starts, as the launcher will carry them inline. */
+/**
+ * The lines run.sh starts, as the launcher will carry them inline.
+ *
+ * Deliberately ordered slow-first. If the launcher gave the first-listed line any head start at
+ * all, the slow one would win every time and the specs would still pass — which is exactly the
+ * failure this ordering exists to make visible.
+ */
+const all = JSON.parse(process.env.TESTBED_REGISTRY_JSON ?? "[]");
 const registry = {
-  lines: JSON.parse(process.env.TESTBED_REGISTRY_JSON ?? "[]"),
+  lines: [...all].sort((a, b) => (a.id === "slow" ? -1 : b.id === "slow" ? 1 : 0)),
 };
 
 // The "application" is served by the origin, so it reaches the browser over the lines exactly as a

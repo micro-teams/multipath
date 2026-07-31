@@ -218,12 +218,18 @@ describe("createPrecache, handling requests", () => {
     expect(await built.precache.handle(get("/somebody-elses.js"))).toBeNull();
   });
 
-  it("fetches a precached asset that is missing from the cache", async () => {
+  /**
+   * On a miss the worker gets out of the way rather than fetching over the lines itself.
+   *
+   * It used to do the latter, and it was worse than redundant: the client already races the lines,
+   * so every parallel attempt became its own sequential re-race inside the worker and the two
+   * schemes fought each other into intermittent timeouts. The worker owns the cache; choosing a
+   * line belongs to whoever already knows what has been measured and asked.
+   */
+  it("declines a precached asset that is missing from the cache, rather than re-routing it", async () => {
     const { precache, requested } = build();
-    // Never installed, so the cache is empty but the manifest still claims the file.
-    const response = await precache.handle(get("/index.js"));
-    expect(response?.status).toBe(200);
-    expect(requested).toContain("/index.js");
+    expect(await precache.handle(get("/index.js"))).toBeNull();
+    expect(requested).toHaveLength(0);
   });
 });
 

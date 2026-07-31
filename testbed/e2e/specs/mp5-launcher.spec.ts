@@ -115,7 +115,14 @@ test.describe("MP-5: a cold start survives a dead line", () => {
     await reviveAll(request);
   });
 
-  test("a healthy first line is not raced, so nothing is fetched twice", async ({
+  /**
+   * The case the whole library exists for: a line that is stable and slow against one that is fast.
+   *
+   * The launcher's registry lists the slow line first on purpose. Any head start for the first-listed
+   * line — even a small one — and the slow line answers within it, wins by default, and the fast line
+   * is never asked. So the bundle must arrive over the fast line despite being listed last.
+   */
+  test("the fast line wins even though the slow one is listed first", async ({
     page,
     request,
     context,
@@ -123,13 +130,32 @@ test.describe("MP-5: a cold start survives a dead line", () => {
     await reviveAll(request);
     await clearClientState(page, context);
 
-    const before = await lineHits(request, 9002);
+    const fastBefore = await lineHits(request, 9001);
     await page.goto("/launcher.html");
     await expect(page.locator("[data-app-ready]")).toBeVisible({ timeout: 15_000 });
-    const after = await lineHits(request, 9002);
 
-    // The second line is only consulted when the first has had its head start and not answered.
-    expect(after - before).toBe(0);
+    // The fast line was asked and served it, rather than being skipped because it was listed last.
+    expect((await lineHits(request, 9001)) - fastBefore).toBeGreaterThan(0);
+  });
+
+  test("every line is asked at once, so a dead one costs no delay", async ({
+    page,
+    request,
+    context,
+  }) => {
+    await reviveAll(request);
+    await clearClientState(page, context);
+    // Both the black hole and a line this "network" cannot use.
+    await setStalling(request, 9002, true);
+
+    const started = Date.now();
+    await page.goto("/launcher.html");
+    await expect(page.locator("[data-app-ready]")).toBeVisible({ timeout: 15_000 });
+
+    // Nothing waited on the dead lines: they were asked at the same instant as everyone else and
+    // simply did not answer.
+    expect(Date.now() - started).toBeLessThan(6000);
+    await reviveAll(request);
   });
 });
 

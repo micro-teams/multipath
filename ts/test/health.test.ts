@@ -177,3 +177,62 @@ describe("HealthTable, registry changes", () => {
     expect(health.get("gone").latencyMs).toBeNull();
   });
 });
+
+describe("HealthTable, remembering between visits", () => {
+  it("exports only lines it has actually measured", () => {
+    const health = new HealthTable();
+    health.recordSuccess("cf", 20, 1000);
+    expect(health.export_().map((e) => e.lineId)).toEqual(["cf"]);
+  });
+
+  it("restores measurements so a cold start does not begin from a guess", () => {
+    const health = new HealthTable();
+    health.import_(
+      [{ lineId: "ipv6", latencyMs: 15, throughputBps: null, at: 1000 }],
+      10_000,
+      1500,
+    );
+    expect(health.get("ipv6").latencyMs).toBe(15);
+    expect(ids(health.rank(lines))[0]).toBe("ipv6");
+  });
+
+  /**
+   * Seeded as measurements, not certainties: the next probe blends into them normally, so a line
+   * that has genuinely changed is corrected within a few samples.
+   */
+  it("lets a new probe correct what was remembered", () => {
+    const health = new HealthTable({ smoothing: 1 });
+    health.import_([{ lineId: "cf", latencyMs: 10, throughputBps: null, at: 1000 }], 10_000, 1000);
+    health.recordSuccess("cf", 900, 2000);
+    expect(health.get("cf").latencyMs).toBe(900);
+  });
+
+  // The network the user was on last month says nothing about the one they are on now.
+  it("ignores measurements that have gone stale", () => {
+    const health = new HealthTable();
+    health.import_([{ lineId: "cf", latencyMs: 10, throughputBps: null, at: 1000 }], 500, 9999);
+    expect(health.get("cf").latencyMs).toBeNull();
+  });
+
+  /**
+   * State is never carried over. "Down" is a fact about a moment — a line that was unreachable on a
+   * train yesterday must not begin today already demoted.
+   */
+  it("never restores a line as down", () => {
+    const health = new HealthTable();
+    for (let i = 0; i < 5; i++) health.recordFailure("cf", new Error("no"), i);
+    const restored = new HealthTable();
+    restored.import_(health.export_(), 10_000, 1);
+    expect(restored.get("cf").state).toBe("up");
+  });
+
+  it("round-trips through JSON, which is how it will actually be stored", () => {
+    const health = new HealthTable();
+    health.recordSuccess("cf", 42, 1000);
+    health.recordThroughput("cf", 5000);
+    const restored = new HealthTable();
+    restored.import_(JSON.parse(JSON.stringify(health.export_())), 10_000, 1000);
+    expect(restored.get("cf").latencyMs).toBe(42);
+    expect(restored.get("cf").throughputBps).toBe(5000);
+  });
+});

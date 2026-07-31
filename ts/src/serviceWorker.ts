@@ -70,6 +70,7 @@ export function createPrecache(options: PrecacheOptions) {
   const networkOnly = options.networkOnly ?? DEFAULTS.networkOnly;
   const fetchImpl = options.fetch ?? globalThis.fetch;
   const cacheStorage = options.caches ?? globalThis.caches;
+  // Used for the install only: there is no caller to defer to at that point.
   const lines = options.registry?.lines ?? [];
 
   return {
@@ -128,27 +129,23 @@ export function createPrecache(options: PrecacheOptions) {
       // stops mattering for starting the app.
       if (cached) return cached;
 
-      // A miss during a partial outage is recoverable, because the assets are on every line.
-      // Falling back only to the origin this page came from would throw that away.
-      if (isPrecached(url, options.manifest)) {
-        return fetchOverLines(url.pathname + url.search, lines, fetchImpl);
-      }
+      // On a miss, get out of the way.
+      //
+      // An earlier version tried each line in turn here. It was worse than redundant: the client
+      // already races the lines, so every parallel attempt it made turned into its own sequential
+      // re-race inside the worker, and the two schemes fought each other into intermittent
+      // timeouts. The worker owns the cache; choosing lines belongs to the caller, which knows
+      // what it has already measured and what it has already asked.
       return null;
     },
   };
 }
 
-/** Did the manifest claim this URL? Compared by path, since the manifest is origin-relative. */
-function isPrecached(url: URL, manifest: readonly string[]): boolean {
-  return manifest.some((entry) => entry === url.pathname || entry === url.pathname + url.search);
-}
-
 /**
- * Try each line in turn until one answers.
+ * Try each line in turn until one answers. Used only by the install.
  *
- * Sequential rather than raced: this runs during install, where finishing matters and finishing
- * quickly does not, and racing N lines for every artefact of a large build would mean N times the
- * bytes for a saving nobody is waiting on.
+ * Sequential rather than raced, and only here: the install has no caller to defer to, and it is the
+ * one moment where finishing matters and finishing quickly does not.
  */
 async function fetchOverLines(
   path: string,

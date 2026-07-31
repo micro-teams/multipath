@@ -13,7 +13,7 @@ describe("buildLauncher", () => {
   it("loads the application entry point", () => {
     const html = buildLauncher({ appEntry: "/assets/main-abc123.js" });
     expect(html).toContain('"/assets/main-abc123.js"');
-    expect(html).toContain("import(url)");
+    expect(html).toContain("import(winner.url)");
   });
 
   /**
@@ -27,11 +27,39 @@ describe("buildLauncher", () => {
     expect(html).toContain("AbortController");
   });
 
-  it("does not race when there is only one line to race", () => {
-    const single = { lines: [{ id: "only", url: "" }] };
-    const html = buildLauncher({ appEntry: "/main.js", registry: single });
-    // The guard is in the emitted code; a single line resolves straight to the path.
-    expect(html).toContain("__lines.length < 2");
+  /**
+   * Every line is asked at once, with no head start for whichever is listed first.
+   *
+   * Staggering looked frugal and was exactly wrong for the case this exists for: a stable-but-slow
+   * line answers inside any head start you give it, wins by default, and the genuinely fast line is
+   * never even asked.
+   */
+  it("asks every line simultaneously, with no stagger", () => {
+    const html = buildLauncher({ appEntry: "/main.js", registry });
+    expect(html).toContain("ordered.forEach");
+    expect(html).not.toContain("setTimeout");
+  });
+
+  /**
+   * The winner is whichever line finishes delivering, not whichever answers first.
+   *
+   * That distinction is the whole point: a stable edge can return headers in 20ms and still take
+   * seconds to hand over a megabyte. Racing on first byte would pick it every time — precisely the
+   * outcome this library exists to avoid.
+   */
+  it("races to completion, not to first byte", () => {
+    const html = buildLauncher({ appEntry: "/main.js", registry });
+    expect(html).toContain("response.blob()");
+    expect(html).toContain("c !== controller && c.abort()");
+  });
+
+  it("asks remembered-fastest lines first, since racing cannot tell fast from merely reachable", () => {
+    const html = buildLauncher({
+      appEntry: "/main.js",
+      registry,
+      preferredLineIds: ["ipv6", "cf"],
+    });
+    expect(html).toContain('["ipv6","cf"]');
   });
 
   /**
@@ -139,11 +167,11 @@ describe("buildLauncher", () => {
       registry,
       registryUrl: "/mt/lines",
     });
-    // Raised from 3000 when the entry race landed: about 1.4KB bought the property that a dead
-    // line in the wrong position no longer costs the entire first visit, which is worth several
-    // times its size. The budget stays because size is what erodes quietly, not because this
-    // particular number is sacred.
-    expect(html.length).toBeLessThan(4500);
+    // Raised twice as the race grew: first for racing the entry at all, then for racing every line
+    // at once with remembered ordering. Both bought the same property — a slow or dead line no
+    // longer decides the first visit — which is worth many times its size on a narrow connection.
+    // The budget stays because size erodes quietly, not because any number here is sacred.
+    expect(html.length).toBeLessThan(5500);
   });
 
   it("is a complete document", () => {

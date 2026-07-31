@@ -62,6 +62,19 @@ export interface LineManagerOptions {
   readonly probe?: ProberOptions;
   /** Hedge delay and timeouts. */
   readonly strategy?: StrategyOptions;
+  /**
+   * Where to keep measurements between visits. Omit and nothing is persisted.
+   *
+   * Worth doing because the alternative for a cold start is the registry's fixed order, which is a
+   * guess that never improves. With it, the second visit onward begins from what was actually
+   * measured — which is the only way to tell a stable-but-slow line from a fast one, since both
+   * answer a probe promptly.
+   */
+  readonly storage?: Storage;
+  /** Key under which measurements are kept. */
+  readonly storageKey?: string;
+  /** Measurements older than this are ignored: last month's network says nothing about today's. */
+  readonly storageMaxAgeMs?: number;
 }
 
 /** What one request-over-one-line did. Purely observational — never load-bearing. */
@@ -92,6 +105,9 @@ export class LineManager {
   private readonly healthTable: HealthTable;
   private readonly prober: Prober;
   private readonly strategy: Required<StrategyOptions>;
+  private readonly storage: Storage | undefined;
+  private readonly storageKey: string;
+  private readonly storageMaxAgeMs: number;
 
   constructor(options: LineManagerOptions = {}) {
     this.registry = options.registry ?? SAME_ORIGIN_REGISTRY;
@@ -104,6 +120,10 @@ export class LineManager {
     this.idempotencyHeader = options.idempotencyHeader ?? "Idempotency-Key";
     this.newKey = options.newKey ?? (() => crypto.randomUUID());
     this.healthTable = new HealthTable(options.health);
+    this.storage = options.storage;
+    this.storageKey = options.storageKey ?? "multipath:health";
+    this.storageMaxAgeMs = options.storageMaxAgeMs ?? 7 * 24 * 60 * 60 * 1000;
+    this.restoreHealth();
     this.strategy = { ...STRATEGY_DEFAULTS, ...options.strategy };
     this.prober = new Prober(
       () => this.registry.lines,
@@ -130,13 +150,49 @@ export class LineManager {
   }
 
   /** Probe every line now and wait for the answers. */
-  probeNow(): Promise<void> {
-    return this.prober.probeAll();
+  async probeNow(): Promise<void> {
+    await this.prober.probeAll();
+    // Saved as measurements arrive rather than on unload: a page can be closed, backgrounded or
+    // discarded at any moment, and an unload handler is the least reliable place to do work.
+    this.saveHealth();
   }
 
   /** Everything measured about every line — the developer panel's whole data source. */
   health(): LineHealth[] {
     return this.registry.lines.map((line) => this.healthTable.get(line.id));
+  }
+
+  /**
+   * Line ids in remembered preference order, for a launcher to use on the next cold start.
+   *
+   * The launcher races every line regardless; this only decides who is asked first among lines that
+   * are all reachable, which is the part racing cannot settle.
+   */
+  preferredLineIds(): string[] {
+    return this.ranked().map((line) => line.id);
+  }
+
+  /** Keep what has been measured, so the next visit does not start from a guess. */
+  saveHealth(): void {
+    if (!this.storage) return;
+    try {
+      this.storage.setItem(this.storageKey, JSON.stringify(this.healthTable.export_()));
+    } catch {
+      // A full or unavailable store is not worth failing a request over.
+    }
+  }
+
+  private restoreHealth(): void {
+    if (!this.storage) return;
+    try {
+      const raw = this.storage.getItem(this.storageKey);
+      if (!raw) return;
+      const parsed: unknown = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return;
+      this.healthTable.import_(parsed, this.storageMaxAgeMs, Date.now());
+    } catch {
+      // Corrupt or foreign data: start from nothing rather than from something misread.
+    }
   }
 
   /** Swap the registry at runtime — a refreshed `GET /mt/lines` is the expected caller. */

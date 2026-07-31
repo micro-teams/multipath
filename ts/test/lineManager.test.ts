@@ -346,3 +346,72 @@ describe("LineManager.fetchApi (the only outbound door)", () => {
     expect(calls[0]?.url).toBe("https://cf.mt.example.app/");
   });
 });
+
+describe("LineManager, remembering across visits", () => {
+  /** A localStorage good enough to be inspected and to be made to fail. */
+  function fakeStorage(failing = false): Storage {
+    const map = new Map<string, string>();
+    return {
+      getItem: (k) => map.get(k) ?? null,
+      setItem: (k, v) => {
+        if (failing) throw new Error("quota exceeded");
+        map.set(k, v);
+      },
+      removeItem: (k) => void map.delete(k),
+      clear: () => map.clear(),
+      key: (i) => [...map.keys()][i] ?? null,
+      get length() {
+        return map.size;
+      },
+    } as Storage;
+  }
+
+  const registry = parseRegistry({
+    lines: [
+      { id: "cf", url: "https://cf.example" },
+      { id: "ipv6", url: "https://ipv6.example" },
+    ],
+  });
+
+  it("starts the next visit from what was measured, not from registry order", async () => {
+    const storage = fakeStorage();
+    const { fetchImpl } = recordingFetch();
+
+    const first = new LineManager({ registry, fetch: fetchImpl, storage });
+    // ipv6 is listed second but measures far faster.
+    first.health(); // touch, so the table exists
+    (
+      first as unknown as {
+        healthTable: { recordSuccess: (a: string, b: number, c: number) => void };
+      }
+    ).healthTable.recordSuccess("ipv6", 10, Date.now());
+    (
+      first as unknown as {
+        healthTable: { recordSuccess: (a: string, b: number, c: number) => void };
+      }
+    ).healthTable.recordSuccess("cf", 400, Date.now());
+    first.saveHealth();
+
+    const second = new LineManager({ registry, fetch: fetchImpl, storage });
+    // Without persistence this would be "cf", purely because it is listed first.
+    expect(second.preferredLineIds()[0]).toBe("ipv6");
+  });
+
+  it("works perfectly well with no storage at all", () => {
+    const manager = new LineManager({ registry });
+    expect(() => manager.saveHealth()).not.toThrow();
+    expect(manager.preferredLineIds()).toEqual(["cf", "ipv6"]);
+  });
+
+  // A full or disabled store is not worth failing a request over.
+  it("survives a storage that throws", () => {
+    const manager = new LineManager({ registry, storage: fakeStorage(true) });
+    expect(() => manager.saveHealth()).not.toThrow();
+  });
+
+  it("ignores corrupt stored data rather than starting from something misread", () => {
+    const storage = fakeStorage();
+    storage.setItem("multipath:health", "{not json");
+    expect(() => new LineManager({ registry, storage })).not.toThrow();
+  });
+});

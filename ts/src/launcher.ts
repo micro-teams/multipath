@@ -45,14 +45,13 @@ export interface LauncherOptions {
   /** URL to refresh the registry from once the app is running. */
   readonly registryUrl?: string;
   /**
-   * How long one line gets alone before the next is tried when loading the entry point.
+   * Lines remembered as fastest from previous visits, best first.
    *
-   * Much longer than the 150ms used for API reads, and deliberately so: the entry point is a large
-   * payload, so starting a second copy of it is expensive in exactly the situation where bandwidth
-   * is scarce. The number only has to be short enough that a black hole does not cost the visit,
-   * and long enough that a merely slow line still wins on its own.
+   * The race decides the entry point on its own, so this is not needed for correctness. It matters
+   * for everything *after* the entry point: the application inherits this order for its own
+   * requests, which are hedged rather than raced and therefore do care which line is tried first.
    */
-  readonly bootstrapHedgeMs?: number;
+  readonly preferredLineIds?: readonly string[];
   readonly title?: string;
   /** Extra markup inside the body — a splash screen, a spinner, a noscript notice. */
   readonly bodyHtml?: string;
@@ -123,16 +122,36 @@ if ("serviceWorker" in navigator) {
 const __mp = window.__multipath__;
 const __lines = (__mp.registry && __mp.registry.lines) || [];
 const __entry = ${JSON.stringify(options.appEntry)};
-const __hedge = ${JSON.stringify(options.bootstrapHedgeMs ?? 1200)};
+const __preferred = ${JSON.stringify(options.preferredLineIds ?? [])};
 
+// Every line is asked at once, with no stagger and no head start for whatever happens to be listed
+// first. Staggering looked frugal and was exactly wrong for the case this library exists for: the
+// stable-but-slow line answers within any head start you give it, wins by default, and the fast
+// line is never even asked. A line that is dead, blocked, or unsupported by this network therefore
+// costs nothing at all — it was asked, it did not answer, and nobody waited for it.
+//
+// The winner is whichever line *finishes delivering* first, not whichever answers first. That
+// distinction is the entire point: a stable CDN edge can return headers in 20ms and still take
+// seconds to hand over a megabyte, and picking on first byte would choose it every time — the very
+// outcome this library exists to avoid. The bottleneck is the line, not the user's connection, so
+// the copies do not meaningfully compete; the cost is some extra data, which is worth paying to
+// never be stuck on the slow one.
 function __race(path) {
-  if (__lines.length < 2) return Promise.resolve(path);
+  const ordered = __preferred.length
+    ? [...__lines].sort((a, b) => rank(a) - rank(b))
+    : __lines;
+  function rank(line) {
+    const at = __preferred.indexOf(line.id);
+    return at === -1 ? __preferred.length : at;
+  }
+  if (ordered.length === 0) return Promise.resolve({ url: path });
+  if (ordered.length === 1) return Promise.resolve({ url: (ordered[0].url || "") + path });
+
   return new Promise((resolve, reject) => {
-    let next = 0, failed = 0, done = false;
+    let failed = 0;
+    let done = false;
     const controllers = [];
-    const launch = () => {
-      if (next >= __lines.length) return;
-      const line = __lines[next++];
+    ordered.forEach((line) => {
       const url = (line.url || "") + path;
       const controller = new AbortController();
       controllers.push(controller);
@@ -142,27 +161,26 @@ function __race(path) {
       })
         .then((response) => {
           if (!response.ok) throw new Error(String(response.status));
-          // Drain it, so the response completes and lands in the HTTP cache for the import below.
-          return response.blob().then(() => {
-            if (done) return;
-            done = true;
-            controllers.forEach((c) => c !== controller && c.abort());
-            resolve(url);
-          });
+          // Drain it fully before claiming victory. Finishing is the thing being raced, and the
+          // bytes land in the HTTP cache so the import below does not fetch them again.
+          return response.blob();
+        })
+        .then(() => {
+          if (done) return;
+          done = true;
+          controllers.forEach((c) => c !== controller && c.abort());
+          resolve({ url });
         })
         .catch(() => {
           if (done) return;
-          if (++failed === __lines.length) reject(new Error("no line could serve " + path));
-          else launch();
+          if (++failed === ordered.length) reject(new Error("no line could serve " + path));
         });
-      if (next < __lines.length) setTimeout(launch, __hedge);
-    };
-    launch();
+    });
   });
 }
 
 __race(__entry)
-  .then((url) => import(url))
+  .then((winner) => import(winner.url))
   .catch((error) => {
   // The one failure with nothing behind it: the entry point could not be loaded from any line and
   // is not in the cache. Say so plainly rather than leaving a blank page.
