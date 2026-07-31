@@ -16,7 +16,31 @@
  *      agent4
  */
 
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type TestInfo } from "@playwright/test";
+
+/**
+ * Record what the page saw, and print it only when something fails.
+ *
+ * These specs coordinate a browser, a worker and four proxies, so a failure that says nothing but
+ * "element not found" is close to undiagnosable — especially in CI, where the run cannot be
+ * repeated by hand.
+ */
+const activity = new Map<string, string[]>();
+
+test.beforeEach(({ page }, testInfo) => {
+  const log: string[] = [];
+  activity.set(testInfo.testId, log);
+  page.on("console", (m) => log.push(`console.${m.type()} ${m.text()}`));
+  page.on("pageerror", (e) => log.push(`pageerror ${e.message}`));
+  page.on("requestfailed", (r) => log.push(`requestfailed ${r.url()} ${r.failure()?.errorText}`));
+  page.on("response", (r) => log.push(`response ${r.status()} ${r.url()}`));
+});
+
+test.afterEach(({}, testInfo: TestInfo) => {
+  if (testInfo.status === testInfo.expectedStatus) return;
+  const log = activity.get(testInfo.testId) ?? [];
+  console.log(`\n--- page activity for "${testInfo.title}" ---\n${log.join("\n")}\n---`);
+});
 
 const LINE_PORTS = [9001, 9002, 9003, 9004];
 

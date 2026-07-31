@@ -13,7 +13,7 @@ describe("buildLauncher", () => {
   it("loads the application entry point", () => {
     const html = buildLauncher({ appEntry: "/assets/main-abc123.js" });
     expect(html).toContain('"/assets/main-abc123.js"');
-    expect(html).toContain("import(winner.url)");
+    expect(html).toContain("import(urls[at])");
   });
 
   /**
@@ -47,6 +47,16 @@ describe("buildLauncher", () => {
    * seconds to hand over a megabyte. Racing on first byte would pick it every time — precisely the
    * outcome this library exists to avoid.
    */
+  /**
+   * Importing is a second request for the same bytes, and a line that answered once is not promised
+   * to answer twice — an intermittently failing tunnel, exactly the kind this library exists to
+   * tolerate, can win the race and then fail the import.
+   */
+  it("falls over to another line if the import itself fails", () => {
+    const html = buildLauncher({ appEntry: "/main.js", registry });
+    expect(html).toContain("__import(urls, at + 1)");
+  });
+
   it("races to completion, not to first byte", () => {
     const html = buildLauncher({ appEntry: "/main.js", registry });
     expect(html).toContain("response.blob()");

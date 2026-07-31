@@ -144,8 +144,8 @@ function __race(path) {
     const at = __preferred.indexOf(line.id);
     return at === -1 ? __preferred.length : at;
   }
-  if (ordered.length === 0) return Promise.resolve({ url: path });
-  if (ordered.length === 1) return Promise.resolve({ url: (ordered[0].url || "") + path });
+  if (ordered.length === 0) return Promise.resolve([path]);
+  if (ordered.length === 1) return Promise.resolve([(ordered[0].url || "") + path]);
 
   return new Promise((resolve, reject) => {
     let failed = 0;
@@ -169,7 +169,9 @@ function __race(path) {
           if (done) return;
           done = true;
           controllers.forEach((c) => c !== controller && c.abort());
-          resolve({ url });
+          // Everything else, winner first: the import that follows is a second request, and a line
+          // that answered once is not promised to answer twice.
+          resolve([url].concat(ordered.filter((l) => (l.url || "") + path !== url).map((l) => (l.url || "") + path)));
         })
         .catch(() => {
           if (done) return;
@@ -179,8 +181,20 @@ function __race(path) {
   });
 }
 
+// Importing is a *second* request for the same bytes. In production the first one has usually left
+// them in the HTTP cache, but that is a convenience and not a guarantee — and an intermittently
+// failing line, which is precisely the kind of cheap tunnel this library is meant to tolerate, can
+// win the race and then fail the import. So the import falls over to the next line rather than
+// treating one bad response as the end of the visit.
+function __import(urls, at) {
+  return import(urls[at]).catch((error) => {
+    if (at + 1 >= urls.length) throw error;
+    return __import(urls, at + 1);
+  });
+}
+
 __race(__entry)
-  .then((winner) => import(winner.url))
+  .then((urls) => __import(urls, 0))
   .catch((error) => {
   // The one failure with nothing behind it: the entry point could not be loaded from any line and
   // is not in the cache. Say so plainly rather than leaving a blank page.
