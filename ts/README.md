@@ -195,12 +195,34 @@ write makes stale is business knowledge, so the cache offers invalidation by req
 leaves the timing to the application. Tenants are separated by an opaque `scope` string, so this
 layer never learns what a "user" is.
 
+## Streams
+
+A stream cannot be raced: two connections are two conversations, each with its own state. So the
+most that is possible is pick the best line, and when it breaks, pick again.
+
+```ts
+const stream = connectOverLines({
+  lines: () => manager.ranked(),
+  path: "/mt/ws",
+  createSocket: (url) => new WebSocket(url),
+});
+```
+
+The part that is easy to miss is that **HTTP health says almost nothing about whether a line can
+carry a stream**. A cheap reverse proxy serves requests perfectly and refuses the Upgrade; a
+middlebox allows the handshake and then severs anything long-lived. So a line's ability to hold a
+stream is remembered separately from its latency, and a line that fails at it is skipped for streams
+while remaining perfectly good for requests.
+
+A connection has to survive `stableAfterMs` before it counts as working. Without that, a line that
+accepts the handshake and drops it immediately looks like a success every time and the client
+reconnects in a tight loop forever.
+
 ## Status
 
-MP-1 through MP-6 are implemented on the client: registry, health, probing, ranking, hedged reads,
-write failover, precache, launcher, the developer panel, the request cache, the generated-client
-adapter, and idempotency keys. Still to come: the Go connector catching up, and WebSocket line
-selection.
+Everything designed for the client is implemented: registry, health, probing, ranking, hedged reads,
+write failover, precache, launcher, the developer panel, the request cache, stream line selection,
+the generated-client adapter, and idempotency keys. The Go package mirrors it.
 
 ## Develop
 
