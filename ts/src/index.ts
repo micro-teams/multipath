@@ -26,6 +26,13 @@ export { mountLinePanel, type PanelOptions, type PanelSource } from "./panel.js"
 export { RequestCache, type RequestCacheOptions } from "./cache.js";
 
 export {
+  connectOverLines,
+  type SocketConnection,
+  type SocketLike,
+  type SocketOptions,
+} from "./socket.js";
+
+export {
   STRATEGY_DEFAULTS,
   hedgedRead,
   writeWithFailover,
