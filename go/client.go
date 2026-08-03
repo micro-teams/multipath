@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -38,6 +39,12 @@ type Options struct {
 	Health           HealthOptions
 	// IdempotencyHeader must match the server filter's.
 	IdempotencyHeader string
+	// BaseURL is what a same-origin line (url "") means to this client.
+	//
+	// The browser has an origin already; a connector does not, so the registry entry that reads
+	// "same origin as the caller" has to be told what that is. Left empty, RoundTrip infers it from
+	// the request it is given, which is what makes the transport drop-in.
+	BaseURL string
 	// Now is injected in tests.
 	Now func() time.Time
 }
@@ -122,6 +129,15 @@ var ErrNoLine = errors.New("multipath: no line available to serve the request")
 // out would multiply every request by the number of lines to buy an improvement that only exists on
 // the slow tail.
 func (c *Client) Get(ctx context.Context, path string) (*http.Response, error) {
+	return c.hedgedRead(ctx, http.MethodGet, path, nil, "")
+}
+
+func (c *Client) hedgedRead(
+	ctx context.Context,
+	method, path string,
+	header http.Header,
+	base string,
+) (*http.Response, error) {
 	lines := c.Ranked()
 	if len(lines) == 0 {
 		return nil, ErrNoLine
@@ -135,7 +151,7 @@ func (c *Client) Get(ctx context.Context, path string) (*http.Response, error) {
 
 	launch := func(line Line) {
 		go func() {
-			response, err := c.send(ctx, line, http.MethodGet, path, nil, nil)
+			response, err := c.send(ctx, line, method, path, nil, header, base)
 			results <- outcome{response, err}
 		}()
 	}
@@ -193,6 +209,20 @@ func (c *Client) Write(
 	body []byte,
 	idempotencyKey string,
 ) (*http.Response, error) {
+	header := http.Header{}
+	if idempotencyKey != "" {
+		header.Set(c.opts.IdempotencyHeader, idempotencyKey)
+	}
+	return c.writeWithFailover(ctx, method, path, body, header, "")
+}
+
+func (c *Client) writeWithFailover(
+	ctx context.Context,
+	method, path string,
+	body []byte,
+	header http.Header,
+	base string,
+) (*http.Response, error) {
 	lines := c.Ranked()
 	if len(lines) == 0 {
 		return nil, ErrNoLine
@@ -201,15 +231,10 @@ func (c *Client) Write(
 		lines = lines[:c.opts.MaxWriteAttempts]
 	}
 
-	headers := http.Header{}
-	if idempotencyKey != "" {
-		headers.Set(c.opts.IdempotencyHeader, idempotencyKey)
-	}
-
 	var lastErr error
 	for _, line := range lines {
 		attemptCtx, cancel := context.WithTimeout(ctx, c.opts.WriteTimeout)
-		response, err := c.send(attemptCtx, line, method, path, body, headers)
+		response, err := c.send(attemptCtx, line, method, path, body, header, base)
 		if err == nil {
 			// The response body outlives the attempt context, so the cancel must not fire yet;
 			// closing the body is the caller's job, as with any http.Response.
@@ -235,7 +260,7 @@ func (c *Client) Probe(ctx context.Context, probePath string) {
 		go func(line Line) {
 			defer wg.Done()
 			started := c.opts.Now()
-			response, err := c.send(ctx, line, http.MethodGet, probePath, nil, nil)
+			response, err := c.send(ctx, line, http.MethodGet, probePath, nil, nil, "")
 			if err != nil {
 				c.health.RecordFailure(line.ID, err, c.opts.Now())
 				return
@@ -264,9 +289,10 @@ func (c *Client) send(
 	line Line,
 	method, path string,
 	body []byte,
-	headers http.Header,
+	header http.Header,
+	base string,
 ) (*http.Response, error) {
-	url, err := line.Resolve(path)
+	url, err := c.resolve(line, path, base)
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +305,7 @@ func (c *Client) send(
 	if err != nil {
 		return nil, err
 	}
-	for key, values := range headers {
+	for key, values := range header {
 		for _, value := range values {
 			request.Header.Add(key, value)
 		}
@@ -293,6 +319,31 @@ func (c *Client) send(
 	}
 	c.health.RecordSuccess(line.ID, c.opts.Now().Sub(started), c.opts.Now())
 	return response, nil
+}
+
+// resolve turns a path into the URL for one line, filling in what "same origin" means here.
+//
+// base is the origin the caller was already talking to, when there is one — RoundTrip has it from
+// the request, Get and Write fall back to Options.BaseURL. Without either, a same-origin line
+// yields a bare path, which net/http cannot send. Saying so plainly beats "unsupported protocol
+// scheme """ from three frames down.
+func (c *Client) resolve(line Line, path, base string) (string, error) {
+	url, err := line.Resolve(path)
+	if err != nil {
+		return "", err
+	}
+	if line.URL != "" {
+		return url, nil
+	}
+	if base == "" {
+		base = c.opts.BaseURL
+	}
+	if base == "" {
+		return "", fmt.Errorf(
+			"multipath: line %q is same-origin but no base URL is configured (set Options.BaseURL)",
+			line.ID)
+	}
+	return strings.TrimRight(base, "/") + url, nil
 }
 
 // outcome is one line's answer to a hedged read.

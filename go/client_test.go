@@ -374,11 +374,11 @@ func TestGetLeavesNothingBehindWhenTheFirstLineWins(t *testing.T) {
 
 	// Idle transport goroutines come and go, so allow a little slack — a leak of one per read shows
 	// up as twenty, not as three.
-	settle(t, before+5, 2*time.Second)
+	settleGoroutines(t, before+5, 2*time.Second)
 }
 
-// settle waits for the goroutine count to come back under limit, failing if it never does.
-func settle(t *testing.T, limit int, within time.Duration) {
+// settleGoroutines waits for the goroutine count to come back under limit, failing if it never does.
+func settleGoroutines(t *testing.T, limit int, within time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(within)
 	for {
