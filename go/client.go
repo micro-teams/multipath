@@ -157,7 +157,11 @@ func (c *Client) Get(ctx context.Context, path string) (*http.Response, error) {
 			if result.err == nil {
 				// Cancelling here also cancels the losers, whose bodies are closed by send.
 				// The winner's body is already ours: it was read from a request that completed.
-				go drainRemaining(results, len(lines)-1)
+				//
+				// launched-1, not len(lines)-1: the whole point of hedging is that on a healthy
+				// line the others are never asked, so counting lines rather than requests leaves
+				// this goroutine waiting for answers nobody is going to send.
+				go drainRemaining(results, launched-1)
 				cancel()
 				return result.response, nil
 			}
