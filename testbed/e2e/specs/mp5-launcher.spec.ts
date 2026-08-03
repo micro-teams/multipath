@@ -18,6 +18,8 @@
 
 import { expect, test, type Page, type TestInfo } from "@playwright/test";
 
+import { LINE_PORTS, reviveAll, setStalling } from "./lines.js";
+
 /**
  * Record what the page saw, and print it only when something fails.
  *
@@ -41,21 +43,6 @@ test.afterEach(({}, testInfo: TestInfo) => {
   const log = activity.get(testInfo.testId) ?? [];
   console.log(`\n--- page activity for "${testInfo.title}" ---\n${log.join("\n")}\n---`);
 });
-
-const LINE_PORTS = [9001, 9002, 9003, 9004];
-
-/** Black-hole or revive a line while the browser keeps running. */
-async function setStalling(
-  request: import("@playwright/test").APIRequestContext,
-  port: number,
-  stalling: boolean,
-) {
-  await request.get(`http://localhost:${port}/__line/${stalling ? "stall" : "revive"}`);
-}
-
-async function reviveAll(request: import("@playwright/test").APIRequestContext) {
-  for (const port of LINE_PORTS) await setStalling(request, port, port === 9004);
-}
 
 /** How many requests a line has seen, so a spec can tell "asked" from "not asked". */
 async function lineHits(
@@ -85,6 +72,16 @@ async function waitForWorker(page: Page) {
 }
 
 test.describe.configure({ mode: "serial" });
+
+// Impairments are process state on the line proxies, so they outlive the test that staged them.
+// Reviving at the end of a test body only runs when the test got that far: one genuine failure
+// used to leave 9002 black-holed, and the next spec — the panel one, which reads that line's
+// measured latency — then failed too, reporting a fault in something that was working. A run where
+// the second failure is a consequence of the first is a run that has to be read backwards to be
+// believed, which is most of the cost of a flaky suite.
+test.afterEach(async ({ request }) => {
+  await reviveAll(request);
+});
 
 test.describe("MP-5: the launcher starts the application", () => {
   test.beforeEach(async ({ request }) => {

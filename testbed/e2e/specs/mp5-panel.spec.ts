@@ -12,6 +12,8 @@
 
 import { expect, test, type Page } from "@playwright/test";
 
+import { reviveAll } from "./lines.js";
+
 const LINES = {
   fast: "http://localhost:9001",
   slow: "http://localhost:9002",
@@ -27,6 +29,13 @@ async function open(page: Page, ids: Array<keyof typeof LINES>) {
   );
   await page.evaluate(() => window.testbed.showPanel());
 }
+
+// These specs read what was measured over the real proxies, so they need the topology intact. Said
+// here rather than assumed: a spec that silently depends on another file's clean-up reports its
+// neighbour's failure as its own.
+test.beforeEach(async ({ request }) => {
+  await reviveAll(request);
+});
 
 test.describe("MP-5: the panel answers the questions it exists for", () => {
   test("which line is being used, and where the others rank", async ({ page }) => {
