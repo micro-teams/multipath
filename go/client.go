@@ -62,6 +62,9 @@ type Client struct {
 	registry Registry
 	health   *HealthTable
 	opts     Options
+	// onTraffic is how the prober learns the application is busy, so it can keep an expensive
+	// throughput measurement out of the way of real requests. Nil until a prober is built.
+	onTraffic func()
 }
 
 // New builds a client. Nothing is measured until Probe is called: a library that starts making
@@ -86,6 +89,22 @@ func New(opts Options) *Client {
 		opts.Now = time.Now
 	}
 	return &Client{registry: opts.Registry, health: NewHealthTable(opts.Health), opts: opts}
+}
+
+// setTrafficObserver registers the prober's activity hook.
+func (c *Client) setTrafficObserver(observe func()) {
+	c.mu.Lock()
+	c.onTraffic = observe
+	c.mu.Unlock()
+}
+
+func (c *Client) notifyTraffic() {
+	c.mu.RLock()
+	observe := c.onTraffic
+	c.mu.RUnlock()
+	if observe != nil {
+		observe()
+	}
 }
 
 // SetRegistry swaps the lines at runtime, forgetting health for lines that have gone.
@@ -142,6 +161,7 @@ func (c *Client) hedgedRead(
 	if len(lines) == 0 {
 		return nil, ErrNoLine
 	}
+	c.notifyTraffic()
 
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -227,6 +247,7 @@ func (c *Client) writeWithFailover(
 	if len(lines) == 0 {
 		return nil, ErrNoLine
 	}
+	c.notifyTraffic()
 	if len(lines) > c.opts.MaxWriteAttempts {
 		lines = lines[:c.opts.MaxWriteAttempts]
 	}
@@ -259,8 +280,7 @@ func (c *Client) Probe(ctx context.Context, probePath string) {
 		wg.Add(1)
 		go func(line Line) {
 			defer wg.Done()
-			started := c.opts.Now()
-			response, err := c.send(ctx, line, http.MethodGet, probePath, nil, nil, "")
+			response, latency, err := c.sendRaw(ctx, line, http.MethodGet, probePath, nil, nil, "")
 			if err != nil {
 				c.health.RecordFailure(line.ID, err, c.opts.Now())
 				return
@@ -277,24 +297,28 @@ func (c *Client) Probe(ctx context.Context, probePath string) {
 				)
 				return
 			}
-			c.health.RecordSuccess(line.ID, c.opts.Now().Sub(started), c.opts.Now())
+			c.health.RecordSuccess(line.ID, latency, c.opts.Now())
 		}(line)
 	}
 	wg.Wait()
 	c.health.ReconcileDegraded()
 }
 
-func (c *Client) send(
+// sendRaw issues one request over one line and reports how long it took, recording nothing.
+//
+// A probe wants this: it decides for itself what the answer means, since a 500 is a perfectly
+// prompt reply and a probe that recorded it as a success would leave a broken line ranked first.
+func (c *Client) sendRaw(
 	ctx context.Context,
 	line Line,
 	method, path string,
 	body []byte,
 	header http.Header,
 	base string,
-) (*http.Response, error) {
+) (*http.Response, time.Duration, error) {
 	url, err := c.resolve(line, path, base)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	var reader io.Reader
@@ -303,7 +327,7 @@ func (c *Client) send(
 	}
 	request, err := http.NewRequestWithContext(ctx, method, url, reader)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	for key, values := range header {
 		for _, value := range values {
@@ -314,10 +338,27 @@ func (c *Client) send(
 	started := c.opts.Now()
 	response, err := c.opts.HTTP.Do(request)
 	if err != nil {
+		return nil, 0, err
+	}
+	return response, c.opts.Now().Sub(started), nil
+}
+
+// send is sendRaw plus what it says about the line. Every real request is a free measurement, which
+// is why the ranking stays current between probes.
+func (c *Client) send(
+	ctx context.Context,
+	line Line,
+	method, path string,
+	body []byte,
+	header http.Header,
+	base string,
+) (*http.Response, error) {
+	response, latency, err := c.sendRaw(ctx, line, method, path, body, header, base)
+	if err != nil {
 		c.health.RecordFailure(line.ID, err, c.opts.Now())
 		return nil, err
 	}
-	c.health.RecordSuccess(line.ID, c.opts.Now().Sub(started), c.opts.Now())
+	c.health.RecordSuccess(line.ID, latency, c.opts.Now())
 	return response, nil
 }
 
