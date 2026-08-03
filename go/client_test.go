@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -343,5 +344,51 @@ func TestSetRegistryForgetsDepartedLines(t *testing.T) {
 	client.SetRegistry(Registry{Lines: []Line{alive}})
 	if client.Health().Get("gone").Measured {
 		t.Error("expected the departed line to be forgotten")
+	}
+}
+
+// The winner is usually the only line asked — that is what makes hedging affordable — so the
+// clean-up has to be sized by what was actually sent. Counting lines instead of requests leaves a
+// goroutine blocked forever on answers that were never going to arrive: harmless in a page that
+// gets reloaded, fatal in a connector that runs for weeks.
+func TestGetLeavesNothingBehindWhenTheFirstLineWins(t *testing.T) {
+	fast := line(t, "fast", answers("fast", 0))
+	client := New(Options{
+		Registry: Registry{Lines: []Line{
+			fast,
+			{ID: "b", URL: "http://127.0.0.1:1"},
+			{ID: "c", URL: "http://127.0.0.1:1"},
+		}},
+		// Long enough that the hedge never fires: only the first line is ever asked.
+		HedgeAfter: time.Hour,
+	})
+
+	before := runtime.NumGoroutine()
+	for i := 0; i < 20; i++ {
+		response, err := client.Get(context.Background(), "/x")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		_ = read(t, response)
+	}
+
+	// Idle transport goroutines come and go, so allow a little slack — a leak of one per read shows
+	// up as twenty, not as three.
+	settle(t, before+5, 2*time.Second)
+}
+
+// settle waits for the goroutine count to come back under limit, failing if it never does.
+func settle(t *testing.T, limit int, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		count := runtime.NumGoroutine()
+		if count <= limit {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("still %d goroutines after %v, expected at most %d", count, within, limit)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
