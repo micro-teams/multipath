@@ -78,6 +78,13 @@ export interface LauncherOptions {
  * What the emitted script does, and why — kept here rather than in the document itself, because
  * every byte of that document is on the one request that has no redundancy and no cache.
  *
+ * The race sends no credentials, and that is not a detail. A build artefact has no session behind
+ * it, so there is nothing for a cookie to do here — but asking for one costs a great deal: CORS
+ * forbids `Access-Control-Allow-Origin: *` on a credentialed request, so every consumer would have
+ * had to echo each line's origin back from its static file server, with `Allow-Credentials: true`,
+ * to serve files that are identical for everybody. It was found by pointing a real browser at two
+ * lines behind a plain `*` — the testbed's own proxies echo the origin, so they never showed it.
+ *
  * Registration is fire-and-forget: the application starts whether or not the worker installs.
  * Waiting for it would make the cache a prerequisite for starting, which is the opposite of the
  * point.
@@ -144,7 +151,7 @@ function __race() {
     let failed = 0, done = false;
     const cs = __urls.map(() => new AbortController());
     __urls.forEach((url, i) => {
-      fetch(url, { signal: cs[i].signal, credentials: url.startsWith("http") ? "include" : "same-origin" })
+      fetch(url, { signal: cs[i].signal, credentials: "omit" })
         .then((r) => { if (!r.ok) throw new Error(r.status); return r.blob(); })
         .then(() => {
           if (done) return;

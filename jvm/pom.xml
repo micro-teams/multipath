@@ -9,7 +9,7 @@
     </parent>
     <groupId>app.microteams.multipath</groupId>
     <artifactId>multipath-spring-boot-starter</artifactId>
-    <version>0.1.1</version>
+    <version>0.1.2</version>
     <name>multipath-spring-boot-starter</name>
     <description>Idempotent de-duplication of writes that arrive more than once over redundant network paths.</description>
     <url>https://github.com/micro-teams/multipath</url>

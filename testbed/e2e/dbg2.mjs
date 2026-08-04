@@ -1,0 +1,10 @@
+import { chromium } from "@playwright/test";
+const browser = await chromium.launch();
+const ctx = await browser.newContext();
+const p = await ctx.newPage();
+const reqs = [];
+p.on("request", r => reqs.push(r.method() + " " + r.url()));
+p.on("requestfailed", r => reqs.push("FAILED " + r.url() + " " + r.failure()?.errorText));
+await p.goto("http://127.0.0.1:8931/", { waitUntil: "networkidle" });
+console.log(reqs.join("\n"));
+await browser.close();

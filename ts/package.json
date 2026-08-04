@@ -1,6 +1,6 @@
 {
   "name": "@micro-teams/multipath",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Transport resilience across redundant network paths: line registry, request routing, read hedging, idempotent writes.",
   "license": "MIT",
   "repository": {
