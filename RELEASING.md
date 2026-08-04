@@ -41,6 +41,11 @@ committed versions, and publishes:
 | `jvm/` | GitHub Packages (Maven) | `app.microteams.multipath:multipath-spring-boot-starter` |
 | `go/` | nowhere | `go get github.com/micro-teams/multipath/go@vX.Y.Z` — the tag *is* the release |
 
+The Go module lives in `go/`, so Go requires its tag to carry that prefix: **`go/vX.Y.Z`**, alongside
+the plain `vX.Y.Z` the publish workflow keys on. Without it `go get …/go@vX.Y.Z` reports "module
+found, but does not contain package", which reads like a broken module path rather than a missing
+tag. Cutting 0.1.1 hit exactly this.
+
 ### Cutting a release
 
 ```sh
@@ -50,6 +55,8 @@ committed versions, and publishes:
 #    testbed/server/pom.xml   ->  the multipath-spring-boot-starter dependency
 # 2. commit, then
 git tag v0.2.0 && git push origin v0.2.0
+# 3. and the Go module's own tag, which Go resolves by subdirectory prefix
+git tag go/v0.2.0 && git push origin go/v0.2.0
 ```
 
 The testbed one is easy to forget and the reason it must not be: `run.sh` installs `jvm/` into the
