@@ -191,3 +191,25 @@ describe("buildLauncher", () => {
     expect(html.trimEnd().endsWith("</html>")).toBe(true);
   });
 });
+
+// Found with a real browser in front of two lines, behind the `Access-Control-Allow-Origin: *` that
+// any sane static file server sets: CORS refuses a credentialed cross-origin request against a
+// wildcard, so the race failed and the application started only when the origin it was already on
+// happened to win. A build artefact has no session behind it, so the credentials bought nothing and
+// cost every consumer an origin-echoing CORS policy on their static files.
+describe("the race and credentials", () => {
+  it("asks for build artefacts without credentials", () => {
+    const html = buildLauncher({
+      appEntry: "/app.js",
+      registry: {
+        lines: [
+          { id: "a", url: "https://a.example" },
+          { id: "b", url: "https://b.example" },
+        ],
+      },
+    });
+
+    expect(html).toContain('credentials: "omit"');
+    expect(html).not.toContain('"include"');
+  });
+});
