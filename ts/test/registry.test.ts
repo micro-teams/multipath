@@ -58,3 +58,42 @@ describe("parseRegistry", () => {
     expect(() => parseRegistry(input)).toThrow(InvalidRegistryError);
   });
 });
+
+// Reported from production: the backend serves `"transport": null` for a line whose label was not
+// configured, the registry was rejected whole, and the client fell back to its single built-in
+// line — with no error anywhere. It stayed invisible for as long as the deployment had one line,
+// because the fallback and the truth were the same thing.
+describe("a null on an optional field means absent", () => {
+  it("accepts the document a JSON serializer actually produces", () => {
+    const registry = parseRegistry({
+      lines: [
+        { id: "origin", url: "", transport: null, weight: null, foreignOrigin: null },
+        {
+          id: "direct",
+          url: "https://direct.mt.example.app",
+          transport: "direct",
+          weight: 90,
+          foreignOrigin: null,
+        },
+      ],
+    });
+
+    expect(registry.lines.map((line) => line.id)).toEqual(["origin", "direct"]);
+    expect(registry.lines[0].transport).toBeUndefined();
+    expect(registry.lines[0].weight).toBeUndefined();
+    expect(registry.lines[1].transport).toBe("direct");
+    expect(registry.lines[1].weight).toBe(90);
+  });
+
+  // The converse: a null where a value is required is a real fault, not an absence.
+  it("still refuses a null id or url", () => {
+    expect(() => parseRegistry({ lines: [{ id: null, url: "" }] })).toThrow(InvalidRegistryError);
+    expect(() => parseRegistry({ lines: [{ id: "a", url: null }] })).toThrow(InvalidRegistryError);
+  });
+
+  it("still refuses a wrong type on an optional field", () => {
+    expect(() => parseRegistry({ lines: [{ id: "a", url: "", weight: "heavy" }] })).toThrow(
+      InvalidRegistryError,
+    );
+  });
+});
