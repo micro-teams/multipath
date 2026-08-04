@@ -80,7 +80,18 @@ export function parseRegistry(input: unknown): Registry {
     if (typeof raw !== "object" || raw === null) {
       throw new InvalidRegistryError(`line ${i} is not an object`);
     }
-    const { id, url, transport, weight, foreignOrigin } = raw as Record<string, unknown>;
+    const record = raw as Record<string, unknown>;
+    const { id, url } = record;
+    // A JSON `null` on an optional field means "no value" — it is how most serializers spell an
+    // absent field, Jackson included, so a document produced by a perfectly ordinary server arrives
+    // full of them. Rejecting it made this parser strict about something that carries no
+    // information, and the whole cost landed on the consumer: the registry was thrown out, the
+    // client silently kept its single built-in line, and the deployment looked correct while
+    // multi-line had simply never switched on. A required field is different — a null id or url is
+    // a real fault and is still refused below.
+    const transport = record.transport ?? undefined;
+    const weight = record.weight ?? undefined;
+    const foreignOrigin = record.foreignOrigin ?? undefined;
     if (typeof id !== "string" || id === "") {
       throw new InvalidRegistryError(`line ${i} has no id`);
     }

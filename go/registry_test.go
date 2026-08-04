@@ -81,3 +81,26 @@ func TestResolve(t *testing.T) {
 		t.Error("expected an empty path to be rejected")
 	}
 }
+
+// The same document the TypeScript parser had to be taught to accept: a server serialising an
+// unset optional field as JSON null. encoding/json already treats null as "leave the zero value",
+// so this is parity insurance rather than a fix — and parity is the whole contract between these
+// two parsers, so it is worth a test that fails if someone ever hand-rolls this decoding.
+func TestParseRegistryTreatsNullOptionalFieldsAsAbsent(t *testing.T) {
+	registry, err := ParseRegistry([]byte(`{"lines":[
+		{"id":"origin","url":"","transport":null,"weight":null,"foreignOrigin":null},
+		{"id":"direct","url":"https://direct.mt.example.app","transport":"direct","weight":90,"foreignOrigin":null}
+	]}`))
+	if err != nil {
+		t.Fatalf("a null optional field was rejected: %v", err)
+	}
+	if len(registry.Lines) != 2 {
+		t.Fatalf("expected 2 lines, got %+v", registry.Lines)
+	}
+	if registry.Lines[0].Transport != "" || registry.Lines[0].Weight != 0 {
+		t.Errorf("null did not read as absent: %+v", registry.Lines[0])
+	}
+	if registry.Lines[1].Weight != 90 {
+		t.Errorf("a real value was lost: %+v", registry.Lines[1])
+	}
+}
