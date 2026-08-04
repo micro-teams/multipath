@@ -44,12 +44,18 @@ committed versions, and publishes:
 ### Cutting a release
 
 ```sh
-# 1. bump both versions to the same number
-#    ts/package.json  ->  "version": "0.2.0"
-#    jvm/pom.xml      ->  <version>0.2.0</version>
+# 1. bump all three to the same number
+#    ts/package.json          ->  "version": "0.2.0"
+#    jvm/pom.xml              ->  <version>0.2.0</version>
+#    testbed/server/pom.xml   ->  the multipath-spring-boot-starter dependency
 # 2. commit, then
 git tag v0.2.0 && git push origin v0.2.0
 ```
+
+The testbed one is easy to forget and the reason it must not be: `run.sh` installs `jvm/` into the
+local repository and the testbed server resolves it from there, so a stale number there means the
+browser suite either tests the previous starter or, if that version was never installed, fails to
+resolve. Cutting 0.1.1 tripped exactly this.
 
 A tag that disagrees with either committed version fails the job rather than publishing a surprise:
 npm versions cannot be replaced once taken, so the check has to come before the publish.

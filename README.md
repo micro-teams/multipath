@@ -58,9 +58,16 @@ Each subdirectory builds, tests and versions independently; see its own README.
 
 ## Status
 
-Under construction, staged MP-1 … MP-5. MP-1 (registry + endpoint-aware client, single line, zero
-behaviour change) is in progress. First consumer:
-[MicroTeams](https://github.com/micro-teams/micro-teams).
+**0.1.1**, and in production: MicroTeams runs on it, over a single line today and a second one being
+brought up. Everything the design specifies for the client and the connector is implemented —
+registry, health and ranking, probing, hedged reads, write failover, stream line selection, the
+Spring idempotency filter, the service worker and launcher, the request cache, and the developer
+panel.
+
+0.x means the interfaces may still move. What has been shaken out by a real consumer is worth
+saying plainly: a JSON `null` on an optional registry field is treated as absent (0.1.1) — before
+that, a registry produced by an ordinary serializer was rejected whole and the client silently fell
+back to one line.
 
 ## License
 

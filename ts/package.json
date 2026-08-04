@@ -1,6 +1,6 @@
 {
   "name": "@micro-teams/multipath",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Transport resilience across redundant network paths: line registry, request routing, read hedging, idempotent writes.",
   "license": "MIT",
   "repository": {
@@ -17,7 +17,9 @@
       "default": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "sideEffects": false,
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
