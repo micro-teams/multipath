@@ -25,7 +25,13 @@
         <dependency>
             <groupId>app.microteams.multipath</groupId>
             <artifactId>multipath-spring-boot-starter</artifactId>
-            <version>0.1.0</version>
+            <!--
+                The version under test, and the third place in this repository that carries it.
+                run.sh installs jvm/ into the local repository first, so this must match
+                jvm/pom.xml or the testbed silently tests a stale starter — or, as happened when
+                0.1.1 was cut, does not resolve at all. Listed in RELEASING.md for that reason.
+            -->
+            <version>0.1.1</version>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
