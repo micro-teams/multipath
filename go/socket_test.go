@@ -287,3 +287,89 @@ func TestStreamURL(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+// The policy on its own, for a consumer that already owns its reconnect loop — a transport that has
+// to speak a handshake and decide what a drop means has a loop belonging to that protocol, and
+// reimplementing the line policy beside it would duplicate exactly the judgement calls this file
+// exists to hold.
+
+func selectorLines(ids ...string) func() []Line {
+	lines := make([]Line, 0, len(ids))
+	for _, id := range ids {
+		lines = append(lines, Line{ID: id, URL: "https://" + id + ".example"})
+	}
+	return func() []Line { return lines }
+}
+
+func TestSelectorPrefersTheFirstUnpenalisedLine(t *testing.T) {
+	selector := NewStreamSelector(selectorLines("a", "b"), 5*time.Second, time.Minute, nil)
+
+	line, ok := selector.Next()
+	if !ok || line.ID != "a" {
+		t.Fatalf("expected the first line, got %+v (%v)", line, ok)
+	}
+
+	// Dropped before it was stable: this line cannot hold a stream right now.
+	selector.Closed(line, time.Second)
+
+	if next, _ := selector.Next(); next.ID != "b" {
+		t.Errorf("a line that could not hold a stream was chosen again: %+v", next)
+	}
+}
+
+// The distinction the whole policy turns on: a connection that lasted and then dropped is an
+// ordinary disconnection. Held against the line, every line would eventually be penalised for the
+// network being a network.
+func TestSelectorDoesNotPenaliseAConnectionThatLasted(t *testing.T) {
+	selector := NewStreamSelector(selectorLines("a", "b"), 5*time.Second, time.Minute, nil)
+
+	line, _ := selector.Next()
+	selector.Closed(line, time.Hour)
+
+	if next, _ := selector.Next(); next.ID != "a" {
+		t.Errorf("an ordinary disconnection cost the line its place: %+v", next)
+	}
+	if len(selector.Penalties()) != 0 {
+		t.Errorf("nothing should have been penalised: %v", selector.Penalties())
+	}
+}
+
+func TestSelectorStillReturnsALineWhenEveryLineIsPenalised(t *testing.T) {
+	selector := NewStreamSelector(selectorLines("a", "b"), 5*time.Second, time.Minute, nil)
+
+	first, _ := selector.Next()
+	selector.Closed(first, 0)
+	second, _ := selector.Next()
+	selector.Closed(second, 0)
+
+	// A client with no connection is worse than one on a flaky connection, and the penalties may
+	// all be stale by now anyway.
+	if _, ok := selector.Next(); !ok {
+		t.Error("refused to choose any line, leaving the consumer with no connection at all")
+	}
+}
+
+func TestSelectorReportsWhatIsCarryingTheStream(t *testing.T) {
+	selector := NewStreamSelector(selectorLines("a", "b"), 5*time.Second, time.Minute, nil)
+
+	if selector.Current() != nil {
+		t.Error("nothing is connected yet")
+	}
+	line, _ := selector.Next()
+	selector.Opened(line)
+	if current := selector.Current(); current == nil || current.ID != "a" {
+		t.Errorf("expected to be told which line is carrying it, got %+v", current)
+	}
+	selector.Closed(line, time.Hour)
+	if selector.Current() != nil {
+		t.Error("still reporting a line after the connection ended")
+	}
+}
+
+func TestSelectorWaitsWhenThereAreNoLinesYet(t *testing.T) {
+	selector := NewStreamSelector(func() []Line { return nil }, 0, 0, nil)
+
+	if _, ok := selector.Next(); ok {
+		t.Error("a registry that has not arrived is not a line to dial")
+	}
+}
