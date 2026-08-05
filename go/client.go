@@ -163,20 +163,40 @@ func (c *Client) hedgedRead(
 	}
 	c.notifyTraffic()
 
-	ctx, cancel := context.WithCancel(ctx)
+	// One cancel per attempt, not one for the race.
+	//
+	// A shared context looks tidier and quietly breaks the winner: net/http returns a response as
+	// soon as the headers arrive, and the body is still streaming when the caller gets it — so
+	// cancelling the context that carried the winning request kills the body the caller is about to
+	// read. Small responses often survive it, because the transport has already buffered them,
+	// which is what made this look intermittent rather than broken. Losing the race is what makes a
+	// request disposable; winning it is not.
+	//
+	// The TypeScript side learned this and wrote it down; this side had the same bug anyway.
+	cancels := make([]context.CancelFunc, len(lines))
+	cancelLosers := func(winner int) {
+		for i, cancel := range cancels {
+			if i != winner && cancel != nil {
+				cancel()
+			}
+		}
+	}
+	cancelAll := func() { cancelLosers(-1) }
 
 	// Buffered for every line: a loser that finishes after the winner must be able to report and
 	// exit rather than blocking forever on a channel nobody is reading.
 	results := make(chan outcome, len(lines))
 
-	launch := func(line Line) {
+	launch := func(index int, line Line) {
+		attemptCtx, cancel := context.WithCancel(ctx)
+		cancels[index] = cancel
 		go func() {
-			response, err := c.send(ctx, line, method, path, nil, header, base)
-			results <- outcome{response, err}
+			response, err := c.send(attemptCtx, line, method, path, nil, header, base)
+			results <- outcome{response, err, index}
 		}()
 	}
 
-	launch(lines[0])
+	launch(0, lines[0])
 	launched := 1
 	hedge := time.NewTimer(c.opts.HedgeAfter)
 	defer hedge.Stop()
@@ -187,34 +207,35 @@ func (c *Client) hedgedRead(
 		select {
 		case <-hedge.C:
 			for ; launched < len(lines); launched++ {
-				launch(lines[launched])
+				launch(launched, lines[launched])
 			}
 		case result := <-results:
 			if result.err == nil {
-				// Cancelling here also cancels the losers, whose bodies are closed by send.
-				// The winner's body is already ours: it was read from a request that completed.
-				//
 				// launched-1, not len(lines)-1: the whole point of hedging is that on a healthy
 				// line the others are never asked, so counting lines rather than requests leaves
 				// this goroutine waiting for answers nobody is going to send.
 				go drainRemaining(results, launched-1)
-				cancel()
+				cancelLosers(result.index)
+				// The winner outlives this function: its body is still streaming, and the caller
+				// closes it. Tie its cancellation to the context the caller gave us instead, so
+				// nothing leaks when they are done or give up.
+				context.AfterFunc(ctx, cancels[result.index])
 				return result.response, nil
 			}
 			lastErr = result.err
 			failures++
 			if failures == len(lines) {
-				cancel()
+				cancelAll()
 				return nil, lastErr
 			}
 			// A line that fails immediately should not leave the request waiting out the hedge
 			// delay for company it will never get.
 			if launched < len(lines) {
-				launch(lines[launched])
+				launch(launched, lines[launched])
 				launched++
 			}
 		case <-ctx.Done():
-			cancel()
+			cancelAll()
 			return nil, ctx.Err()
 		}
 	}
@@ -387,10 +408,12 @@ func (c *Client) resolve(line Line, path, base string) (string, error) {
 	return strings.TrimRight(base, "/") + url, nil
 }
 
-// outcome is one line's answer to a hedged read.
+// outcome is one line's answer to a hedged read, and which attempt it was — the index is what lets
+// the winner keep its own context while every other attempt is cancelled.
 type outcome struct {
 	response *http.Response
 	err      error
+	index    int
 }
 
 // drainRemaining closes the bodies of losers that arrive after the winner, so a cancelled response

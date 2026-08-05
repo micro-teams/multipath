@@ -6,7 +6,7 @@ lines, race reads, replay a failed write over the next line under the same idemp
 No package registry is involved — Go does not need one. Consume it by repository path and tag:
 
 ```sh
-go get github.com/micro-teams/multipath/go@v0.1.3
+go get github.com/micro-teams/multipath/go@v0.1.4
 ```
 
 ## Use

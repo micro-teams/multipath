@@ -4,6 +4,7 @@
 package multipath
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -390,5 +391,76 @@ func settleGoroutines(t *testing.T, limit int, within time.Duration) {
 			t.Fatalf("still %d goroutines after %v, expected at most %d", count, within, limit)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The winner's body is not disposable.
+//
+// net/http returns a response when the headers arrive; the body is still streaming when the caller
+// receives it. Cancelling the context that carried the winning request therefore kills the body the
+// caller is about to read — and small responses often survive it, because the transport has already
+// buffered them, which is what made this present as an intermittent "context canceled" rather than
+// as something obviously broken. It cost a production connector its CLI applet: 15KB, large enough
+// to still be arriving.
+//
+// The body here is deliberately too large to be buffered before the read, and is written in two
+// parts so the headers are long gone by the time the caller asks for it.
+func TestTheWinnersBodySurvivesTheRace(t *testing.T) {
+	payload := bytes.Repeat([]byte("x"), 1<<20)
+	winner := line(t, "winner", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		time.Sleep(50 * time.Millisecond)
+		_, _ = w.Write(payload)
+	})
+	slow := line(t, "slow", answers("slow", 5*time.Second))
+
+	client := New(Options{
+		Registry:   Registry{Lines: []Line{winner, slow}},
+		HedgeAfter: 10 * time.Millisecond,
+	})
+
+	response, err := client.Get(context.Background(), "/x")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("the winner's body was killed by the race's own clean-up: %v", err)
+	}
+	if len(body) != len(payload) {
+		t.Errorf("read %d bytes of %d", len(body), len(payload))
+	}
+}
+
+// And the same through the transport, which is how every real consumer reaches it.
+func TestTheWinnersBodySurvivesThroughTheRoundTripper(t *testing.T) {
+	payload := bytes.Repeat([]byte("y"), 1<<20)
+	fast := line(t, "fast", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		time.Sleep(50 * time.Millisecond)
+		_, _ = w.Write(payload)
+	})
+
+	client := New(Options{Registry: Registry{Lines: []Line{fast}}})
+	response, err := (&http.Client{Transport: client.RoundTripper()}).Get(fast.URL + "/x")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("reading the body failed: %v", err)
+	}
+	if len(body) != len(payload) {
+		t.Errorf("read %d bytes of %d", len(body), len(payload))
 	}
 }
