@@ -59,13 +59,124 @@ const (
 	defaultPenalty = 60 * time.Second
 )
 
-// Stream keeps a connection up, over whichever line can hold one.
-type Stream[Conn any] struct {
-	opts StreamOptions[Conn]
+// StreamSelector is the line policy on its own, for a consumer that already owns its reconnect loop.
+//
+// Some do, and they are not doing anything wrong: a transport that has to speak a handshake, send
+// heartbeats and decide what a drop means has a loop whose shape belongs to that protocol. What it
+// still needs is this — which line to dial next, and somewhere to say how the last attempt went —
+// and reimplementing it there would duplicate the judgement calls that are the whole content of
+// this file: that a connection must last before it counts, that an ordinary disconnection is not
+// the line's fault, and that a client with no connection is worse than one on a flaky line.
+//
+// Stream is this plus a loop.
+type StreamSelector struct {
+	lines   func() []Line
+	stable  time.Duration
+	penalty time.Duration
+	now     func() time.Time
 
 	mu        sync.RWMutex
 	current   *Line
 	penalties map[string]time.Time
+}
+
+// NewStreamSelector builds the policy. Zero values take the same defaults as Stream.
+func NewStreamSelector(lines func() []Line, stableAfter, penalty time.Duration, now func() time.Time) *StreamSelector {
+	if stableAfter == 0 {
+		stableAfter = defaultStableAfter
+	}
+	if penalty == 0 {
+		penalty = defaultPenalty
+	}
+	if now == nil {
+		now = time.Now
+	}
+	return &StreamSelector{
+		lines:     lines,
+		stable:    stableAfter,
+		penalty:   penalty,
+		now:       now,
+		penalties: map[string]time.Time{},
+	}
+}
+
+// Next returns the line to dial, and false when there is nothing to dial yet.
+func (s *StreamSelector) Next() (Line, bool) { return s.pick() }
+
+// Opened records that a connection to line is now up.
+func (s *StreamSelector) Opened(line Line) {
+	s.mu.Lock()
+	s.current = &line
+	s.mu.Unlock()
+}
+
+// Closed records how an attempt ended, and is where a line earns a penalty.
+//
+// held is how long the connection lasted — zero if it never opened. A connection that did not last
+// is evidence about this line's ability to carry a stream, which is a different question from
+// whether it answers requests quickly. One that lasted and then dropped is an ordinary
+// disconnection and is not held against it, or every line would slowly be penalised for the network
+// being a network.
+func (s *StreamSelector) Closed(line Line, held time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.current = nil
+	if held < s.stable {
+		s.penalties[line.ID] = s.now().Add(s.penalty)
+	}
+}
+
+// Current reports which line is carrying the stream, or nil between attempts.
+func (s *StreamSelector) Current() *Line {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.current
+}
+
+// Penalties reports lines recently unable to hold a stream, and until when.
+func (s *StreamSelector) Penalties() map[string]time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]time.Time, len(s.penalties))
+	for id, until := range s.penalties {
+		out[id] = until
+	}
+	return out
+}
+
+// pick returns the best line not currently serving a penalty.
+//
+// If every line is penalised the least-recently-penalised is used anyway: a client with no
+// connection is worse than one on a flaky connection, and the penalties may all be stale.
+func (s *StreamSelector) pick() (Line, bool) {
+	candidates := s.lines()
+	if len(candidates) == 0 {
+		return Line{}, false
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	at := s.now()
+	for _, candidate := range candidates {
+		if until, penalised := s.penalties[candidate.ID]; !penalised || !until.After(at) {
+			return candidate, true
+		}
+	}
+
+	best := candidates[0]
+	for _, candidate := range candidates[1:] {
+		if s.penalties[candidate.ID].Before(s.penalties[best.ID]) {
+			best = candidate
+		}
+	}
+	return best, true
+}
+
+// Stream keeps a connection up, over whichever line can hold one.
+type Stream[Conn any] struct {
+	opts     StreamOptions[Conn]
+	selector *StreamSelector
 }
 
 // NewStream prepares a stream. Nothing is dialled until Run is called.
@@ -85,26 +196,20 @@ func NewStream[Conn any](opts StreamOptions[Conn]) *Stream[Conn] {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	return &Stream[Conn]{opts: opts, penalties: map[string]time.Time{}}
+	return &Stream[Conn]{
+		opts:     opts,
+		selector: NewStreamSelector(opts.Lines, opts.StableAfter, opts.Penalty, opts.Now),
+	}
 }
 
 // Current reports which line is carrying the stream, or nil between attempts.
-func (s *Stream[Conn]) Current() *Line {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.current
-}
+func (s *Stream[Conn]) Current() *Line { return s.selector.Current() }
 
 // Penalties reports lines recently unable to hold a stream, and until when.
-func (s *Stream[Conn]) Penalties() map[string]time.Time {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make(map[string]time.Time, len(s.penalties))
-	for id, until := range s.penalties {
-		out[id] = until
-	}
-	return out
-}
+func (s *Stream[Conn]) Penalties() map[string]time.Time { return s.selector.Penalties() }
+
+// Selector exposes the policy, for a caller that wants to read it.
+func (s *Stream[Conn]) Selector() *StreamSelector { return s.selector }
 
 // Run keeps the stream connected until the context is cancelled.
 //
@@ -119,7 +224,7 @@ func (s *Stream[Conn]) Run(ctx context.Context) error {
 			return ctx.Err()
 		}
 
-		line, ok := s.pick()
+		line, ok := s.selector.Next()
 		if !ok {
 			// Nothing to dial yet — a registry that has not loaded. Keep waiting rather than giving
 			// up permanently, since it can arrive at any moment.
@@ -136,9 +241,6 @@ func (s *Stream[Conn]) Run(ctx context.Context) error {
 		}
 
 		if held < s.opts.StableAfter {
-			// Never became stable: evidence about this line's ability to carry a stream, which is a
-			// different question from whether it answers requests quickly.
-			s.penalise(line)
 			failures++
 		} else {
 			// It worked for a while. An ordinary disconnection, so reconnect promptly.
@@ -158,58 +260,20 @@ func (s *Stream[Conn]) serveOnce(ctx context.Context, line Line) (time.Duration,
 
 	conn, err := s.opts.Dial(ctx, StreamURL(line, s.opts.Path))
 	if err != nil {
+		s.selector.Closed(line, 0)
 		return 0, err
 	}
 
-	s.mu.Lock()
-	s.current = &line
-	s.mu.Unlock()
+	s.selector.Opened(line)
 	if s.opts.OnOpen != nil {
 		s.opts.OnOpen(line)
 	}
 
 	err = s.opts.Serve(ctx, conn)
 
-	s.mu.Lock()
-	s.current = nil
-	s.mu.Unlock()
-
-	return s.opts.Now().Sub(started), err
-}
-
-// pick returns the best line not currently serving a penalty.
-//
-// If every line is penalised the least-recently-penalised is used anyway: a client with no
-// connection is worse than one on a flaky connection, and the penalties may all be stale.
-func (s *Stream[Conn]) pick() (Line, bool) {
-	candidates := s.opts.Lines()
-	if len(candidates) == 0 {
-		return Line{}, false
-	}
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	at := s.opts.Now()
-	for _, candidate := range candidates {
-		if until, penalised := s.penalties[candidate.ID]; !penalised || !until.After(at) {
-			return candidate, true
-		}
-	}
-
-	best := candidates[0]
-	for _, candidate := range candidates[1:] {
-		if s.penalties[candidate.ID].Before(s.penalties[best.ID]) {
-			best = candidate
-		}
-	}
-	return best, true
-}
-
-func (s *Stream[Conn]) penalise(line Line) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.penalties[line.ID] = s.opts.Now().Add(s.opts.Penalty)
+	held := s.opts.Now().Sub(started)
+	s.selector.Closed(line, held)
+	return held, err
 }
 
 // wait sleeps before the next attempt, or returns as soon as the caller gives up.
