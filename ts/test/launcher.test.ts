@@ -212,4 +212,67 @@ describe("the race and credentials", () => {
     expect(html).toContain('credentials: "omit"');
     expect(html).not.toContain('"include"');
   });
+
+  /**
+   * A stub entry point wins the race in milliseconds and then the application spends seconds
+   * fetching what it actually runs on. Naming those files here puts them on the line that just
+   * proved itself fastest, and makes them the bytes the percentage is a percentage of.
+   */
+  it("warms the named artefacts on the winning line", () => {
+    const html = buildLauncher({
+      appEntry: "/flutter_bootstrap.js",
+      preload: ["/main.dart.js"],
+      registry,
+    });
+    expect(html).toContain('["/main.dart.js"]');
+    expect(html).toContain("__warm(__base(urls[0]))");
+  });
+
+  /**
+   * The progress machinery is not emitted at all for a launcher that preloads nothing. Every byte
+   * of this document rides the one request with no redundancy and no cache, so a feature nobody
+   * asked for must not be paid for by everybody.
+   */
+  it("ships no progress code when nothing was named to preload", () => {
+    const html = buildLauncher({ appEntry: "/main.js", registry });
+    expect(html).not.toContain("data-multipath-progress");
+    expect(html).not.toContain("getReader");
+    expect(html).toContain("function __warm()");
+  });
+
+  /**
+   * Streamed, not awaited whole: a response consumed with .blob() reports nothing until it is
+   * finished, which is precisely when a progress report has stopped being useful.
+   */
+  it("counts bytes as they arrive rather than when a file finishes", () => {
+    const html = buildLauncher({ appEntry: "/main.js", preload: ["/big.js"] });
+    expect(html).toContain("getReader()");
+    expect(html).toContain("reader.read()");
+  });
+
+  /**
+   * 100% and then a wait reads as a hang. The last percent belongs to the moment the application's
+   * module has actually been imported and there is something to look at.
+   */
+  it("holds the last percent back until the app has been imported", () => {
+    const html = buildLauncher({ appEntry: "/main.js", preload: ["/big.js"] });
+    expect(html).toContain("Math.min(99");
+    expect(html).toMatch(/__load\(urls, 0\)\)\)\s*\n\s*\.then\(\(\) => __say\(100\)\)/);
+  });
+
+  /** Two ways to read it, because a splash screen may be markup or may be a canvas. */
+  it("reports progress to the document and to a listener", () => {
+    const html = buildLauncher({ appEntry: "/main.js", preload: ["/big.js"] });
+    expect(html).toContain("[data-multipath-progress]");
+    expect(html).toContain('CustomEvent("multipath:progress"');
+  });
+
+  /**
+   * A file served without Content-Length must not move the bar rather than making it lie: the
+   * total it would have contributed is unknown, so its bytes are counted and its size is not.
+   */
+  it("only counts a file in the total when its length was given", () => {
+    const html = buildLauncher({ appEntry: "/main.js", preload: ["/big.js"] });
+    expect(html).toContain("if (length > 0) __want += length");
+  });
 });

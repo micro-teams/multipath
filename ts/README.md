@@ -144,6 +144,34 @@ blob has the blob as its base URL, so every relative chunk import in a code-spli
 resolve to nowhere; importing from the winning line keeps module semantics exactly as the bundler
 intended, and its chunks continue to come from that same line.
 
+### Preloading, and a percentage that means something
+
+Modern entry points are stubs. They win the race in milliseconds, and then the application spends
+seconds fetching the megabytes it actually runs on — an engine, a wasm module, the rest of a chunked
+bundle. `preload` names those files:
+
+```ts
+buildLauncher({
+  appEntry: "/flutter_bootstrap.js",
+  preload: ["/main.dart.js"],
+  // …
+});
+```
+
+They are fetched on the line that has just proved itself fastest, all at once, so they are warm in
+the HTTP cache by the time the application asks for them. And their bytes are what the progress
+report is a percentage **of**, which is the only way a percentage can mean anything: a percentage of
+the stub alone would reach 100 and then sit there while the real download happened.
+
+Progress is readable two ways — the launcher sets the text of every `[data-multipath-progress]`
+element, and dispatches `multipath:progress` on `window` with `{ percent, loaded, total }` — because
+a splash screen may be markup or may be a canvas. It stops at 99 until the application's module has
+actually been imported: a bar that reaches 100% and then waits is read as a hang.
+
+A file served without `Content-Length` contributes its bytes to what has arrived but nothing to the
+total, so it does not move the bar rather than making it lie. And a launcher that preloads nothing
+does not ship any of this code at all.
+
 `LineManager` can persist what it measures (`storage`), so the *second* visit onward starts from
 measurements rather than from the registry's fixed order. Racing settles the entry point on its own;
 persistence matters for everything after it, which is hedged rather than raced and so does care
