@@ -52,7 +52,28 @@ export interface LauncherOptions {
    * requests, which are hedged rather than raced and therefore do care which line is tried first.
    */
   readonly preferredLineIds?: readonly string[];
+  /**
+   * Artefacts to fetch on the winning line before the entry point is imported, largest first.
+   *
+   * The entry point of a modern build is often a stub: it is small, it wins the race in
+   * milliseconds, and then the application spends seconds fetching the megabytes it actually runs
+   * on — a Flutter engine, a wasm module, a chunked bundle. Naming those here does two things at
+   * once. They arrive on the line that just proved itself fastest, warm in the HTTP cache by the
+   * time the application asks; and their bytes are what the progress report is a percentage OF,
+   * which is the only way a percentage can mean anything. A percentage of the stub alone would go
+   * 0 to 100 and then sit there while the real download happened.
+   */
+  readonly preload?: readonly string[];
   readonly title?: string;
+  /**
+   * Extra markup inside the head.
+   *
+   * Chiefly for `<base>`, which has to be in the head and has to be right: a framework that
+   * resolves its own assets against the document's base URL loads them from the wrong place on
+   * every deep link without it — the app opens at "/" and nowhere else, which is the one failure a
+   * launcher must not introduce.
+   */
+  readonly headHtml?: string;
   /** Extra markup inside the body — a splash screen, a spinner, a noscript notice. */
   readonly bodyHtml?: string;
   /** Scope for the Service Worker registration. */
@@ -106,6 +127,21 @@ export interface LauncherOptions {
  * that fails one request in three can win the race and then fail the import. It did, in CI, about
  * one run in three.
  *
+ * The preloaded files are asked for all at once, on the one line that has already proved itself, so
+ * the total is known early and the bar moves smoothly rather than in one jump per file. Each is
+ * streamed rather than consumed with `.blob()`, which reports nothing until it is finished — which
+ * is the moment a progress report stops being useful.
+ *
+ * Progress is reported over the PRELOADED bytes, not the entry point's, and is deliberately
+ * capped below 100 until the application's module has actually been imported. A bar that reaches
+ * 100% and then waits is read as a hang; the last percent is worth keeping for the moment there is
+ * something on screen.
+ *
+ * Content-Length is trusted where it is given and the file is skipped in the total where it is not
+ * — a compressed response reports the compressed length, which is the number of bytes actually
+ * coming down the line, and is exactly right for this. Where it is absent (chunked, or a proxy that
+ * strips it) that file simply does not move the bar rather than the bar becoming a lie.
+ *
  * The bytes are never executed from memory. A module built from a blob has the blob as its base
  * URL, so every relative chunk import in a code-split application would resolve to nowhere.
  */
@@ -122,6 +158,7 @@ export function buildLauncher(options: LauncherOptions): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(options.title ?? "Loading")}</title>
+${options.headHtml ?? ""}
 </head>
 <body>
 ${options.bodyHtml ?? ""}
@@ -138,15 +175,17 @@ navigator.serviceWorker.register(${JSON.stringify(options.serviceWorker)}${regis
 }
 `
     : ""
-}const __mp = window.__multipath__;
+}const __entry = ${JSON.stringify(options.appEntry)};
+const __mp = window.__multipath__;
 const __lines = (__mp.registry && __mp.registry.lines) || [];
 const __pref = ${JSON.stringify(options.preferredLineIds ?? [])};
 const __at = (l) => (__pref.indexOf(l.id) === -1 ? __pref.length : __pref.indexOf(l.id));
 const __urls = (__pref.length ? [...__lines].sort((a, b) => __at(a) - __at(b)) : __lines).map(
-  (l) => (l.url || "") + ${JSON.stringify(options.appEntry)},
+  (l) => (l.url || "") + __entry,
 );
+const __base = (url) => url.slice(0, url.length - __entry.length);
 function __race() {
-  if (__urls.length < 2) return Promise.resolve(__urls.length ? __urls : [${JSON.stringify(options.appEntry)}]);
+  if (__urls.length < 2) return Promise.resolve(__urls.length ? __urls : [__entry]);
   return new Promise((resolve, reject) => {
     let failed = 0, done = false;
     const cs = __urls.map(() => new AbortController());
@@ -163,11 +202,43 @@ function __race() {
     });
   });
 }
+${
+  (options.preload ?? []).length
+    ? `const __pre = ${JSON.stringify(options.preload)};
+let __got = 0, __want = 0;
+function __say(p) {
+  document.querySelectorAll("[data-multipath-progress]").forEach((e) => { e.textContent = p + "%"; });
+  window.dispatchEvent(new CustomEvent("multipath:progress", { detail: { percent: p, loaded: __got, total: __want } }));
+}
+function __drain(r) {
+  const length = Number(r.headers.get("content-length"));
+  if (length > 0) __want += length;
+  if (!r.body || !r.body.getReader) return r.blob().then(() => {});
+  const reader = r.body.getReader();
+  return (function pump() {
+    return reader.read().then((c) => {
+      if (c.done) return;
+      __got += c.value.length;
+      if (__want > 0) __say(Math.min(99, Math.floor((__got / __want) * 100)));
+      return pump();
+    });
+  })();
+}
+function __warm(base) {
+  if (!__pre.length) return Promise.resolve();
+  __say(0);
+  return Promise.all(
+    __pre.map((p) => fetch(base + p, { credentials: "omit" }).then((r) => (r.ok ? __drain(r) : 0)).catch(() => {})),
+  ).then(() => {});
+}`
+    : "function __warm() { return Promise.resolve(); }\nfunction __say() {}\n"
+}
 function __load(urls, i) {
   return import(urls[i]).catch((e) => (i + 1 < urls.length ? __load(urls, i + 1) : Promise.reject(e)));
 }
 __race()
-  .then((urls) => __load(urls, 0))
+  .then((urls) => __warm(__base(urls[0])).then(() => __load(urls, 0)))
+  .then(() => __say(100))
   .catch((error) => {
     console.error("multipath: could not start the application", error);
     document.body.insertAdjacentHTML("beforeend", '<p data-multipath-error>Could not start. Check your connection and reload.</p>');
