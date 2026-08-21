@@ -122,6 +122,19 @@ if [[ $RUN_E2E == 1 ]]; then
     TESTBED_SERVER_URL="http://localhost:$SERVER_PORT" \
     npm --prefix "$HERE/e2e" test
   say "specs passed"
+
+  # The Dart client, over the same lines. Skipped rather than failed when there is no SDK: this
+  # repository's other three packages must stay runnable on a machine that has no Dart, and a
+  # testbed people cannot run locally is a testbed that stops being trusted.
+  if command -v dart >/dev/null 2>&1; then
+    say "running the Dart end-to-end assertions"
+    (cd "$HERE/dart" && dart pub get >/dev/null)
+    TESTBED_SERVER_URL="http://localhost:$SERVER_PORT" \
+      dart run "$HERE/dart/bin/e2e.dart"
+    say "Dart assertions passed"
+  else
+    say "no dart on PATH — skipping the Dart end-to-end assertions"
+  fi
 else
   say "testbed up — page at http://localhost:$WEB_PORT (ctrl-c to stop)"
   wait
