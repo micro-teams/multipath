@@ -13,6 +13,7 @@ speak one shared vocabulary:
 | [`ts/`](./ts) | **Line manager** — probing, latency EWMA, read hedging, failover, idempotency keys. Takes over the app's outbound requests. | npm (GitHub Packages) |
 | [`jvm/`](./jvm) | **Idempotency interceptor** — a Spring Boot starter that absorbs duplicate writes *before* they reach a controller. | Maven (GitHub Packages) |
 | [`go/`](./go) | Same line management for connectors / CLIs. | `go get` the repo path + tag |
+| [`dart/`](./dart) | Same line management for Flutter clients and Dart tools. No transport: the consumer supplies the attempt. | git dependency on the repo path + tag |
 
 ## The one assumption everything rests on
 
@@ -52,6 +53,7 @@ instance means moving that layer to shared storage — see [`jvm/README.md`](./j
 ts/     TypeScript line manager        (vitest)
 jvm/    Kotlin Spring Boot starter     (Maven, spotless/ktfmt, MockMvc tests — no database)
 go/     Go line manager                (go test)
+dart/   Dart line manager              (dart test)
 ```
 
 Each subdirectory builds, tests and versions independently; see its own README.
@@ -59,7 +61,10 @@ Each subdirectory builds, tests and versions independently; see its own README.
 ## Status
 
 **0.1.1**, and in production: MicroTeams runs on it, over a single line today and a second one being
-brought up. Everything the design specifies for the client and the connector is implemented —
+brought up. The Dart package is new and is not yet wired into a consumer — it has the registry,
+health and ranking, both strategies and the stream selector, and deliberately not the launcher or
+the service worker, which are browser-specific (see [`dart/README.md`](./dart/README.md)).
+Everything the design specifies for the client and the connector is implemented —
 registry, health and ranking, probing, hedged reads, write failover, stream line selection, the
 Spring idempotency filter, the service worker and launcher, the request cache, and the developer
 panel.

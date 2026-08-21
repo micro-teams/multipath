@@ -1,0 +1,110 @@
+# MultiPath — Dart line manager
+
+The registry, what is known about each line, and the two strategies that follow from treating reads
+and writes oppositely. For Flutter clients and Dart command-line tools.
+
+**No dependencies, and no transport.** This package does not send anything. You supply the attempt;
+it decides which line to send over, when to send again, and what to learn from the result. That is
+what lets one package serve a Flutter app on Dio, a CLI on `package:http`, and a test on a function
+that returns a canned answer — and it is why there is no `dio` in the pubspec.
+
+```yaml
+dependencies:
+  multipath:
+    git:
+      url: https://github.com/micro-teams/multipath.git
+      path: dart
+      ref: dart-v0.1.1
+```
+
+## Use
+
+```dart
+final manager = LineManager(
+  registry: parseRegistry(await fetchLineRegistry()),
+);
+
+// A read: hedged across the ranked lines, first answer wins.
+final response = await manager.read((line, {required cancelled}) async {
+  return send(line.resolve('/mt/chat'), cancelToken: cancelToken(cancelled));
+});
+
+// A write: one line at a time, one key for the whole logical write.
+final key = newIdempotencyKey();
+await manager.write((line, {required cancelled}) async {
+  return send(
+    line.resolve('/mt/chat/1/messages'),
+    headers: {idempotencyHeader: key},
+    body: body,
+  );
+});
+```
+
+With a single same-origin line — `{"lines":[{"id":"origin","url":""}]}` — `line.resolve(path)`
+returns the path unchanged, so adoption changes nothing observable. That is the intended way in:
+route everything through the manager first while the routing decision is still trivial, then add
+lines to the registry once the plumbing is proven. Doing it the other way round introduces the
+plumbing and the risk on the same day.
+
+## The one thing to get right
+
+**Only silence justifies another line.** An error *status* is an answer: a 404 hedged across every
+line is still a 404 asked N times, and a 500 means the request arrived and the server decided.
+
+This package routes on whether your attempt **completed or threw**, so an HTTP layer that converts
+non-2xx into a thrown exception will get those retried across every line — including writes, which
+is the one place it actually costs something. Return the response for any status you received, and
+throw only when nothing came back.
+
+## Streams
+
+A stream cannot be raced: two connections are two conversations, each with its own state. So the
+most that is possible is pick the best line, and when it breaks, pick again — [`StreamSelector`].
+
+It keeps its own memory, separate from latency, because HTTP health says almost nothing about
+whether a line can carry a stream: a cheap reverse proxy will serve requests perfectly and refuse
+the Upgrade, and a middlebox will allow the handshake and then sever anything long-lived. A line
+that fails at holding a stream is skipped for streams and stays perfectly good for requests.
+
+There is no reconnect loop here, on purpose. Consumers that need this already own one — a transport
+that speaks a handshake, sends heartbeats and decides what a drop means has a loop whose shape
+belongs to that protocol. What it needs from us is which line to dial next.
+
+## What is deliberately not here
+
+**The launcher and the service worker.** Those are `ts/`'s, and they are browser-specific: racing
+the entry *document* across lines is a problem only a page has. Worth stating for Flutter
+specifically — a native build is installed, so it has no entry-document problem at all and needs
+lines only for requests and streams. Flutter **web** does have one, but its entry is
+`flutter_bootstrap.js` plus the engine, which is not a single module that can be swapped the way a
+bundler's entry chunk can.
+
+**A prober loop.** `LineManager.probe` measures every line once, which is what a short-lived process
+needs; a long-lived one schedules that itself. The loop in `go/prober.go` exists because a connector
+runs for weeks, and it carries policy — backoff, throughput measured only while the app is quiet —
+that a Flutter app has no equivalent situation for yet. It belongs here when something needs it, not
+before.
+
+**A developer panel.** `ts/`'s `mountLinePanel` draws DOM. `onAttempt` gives you the same data;
+drawing it is the consumer's business.
+
+## Kept in step with the others
+
+Everything here mirrors `ts/` and `go/` down to the defaults, because every client has to mean the
+same thing by "a line" — an app that ranked lines differently from the connector would make "which
+line is slow" a question with two answers. The tests are written against the same cases for the same
+reason: a rule tightened in one parser and not the others is a disagreement that surfaces only in
+production, on whichever client happens to be strictest.
+
+One thing this implementation needs that the others get for free: `List.sort` in Dart is **not
+stable**, so `HealthTable.rank` uses its own merge sort. Without it, two lines that no measurement
+distinguishes swap places between calls — which looks like traffic moving for no reason.
+
+## Develop
+
+```sh
+dart pub get
+dart format .
+dart analyze --fatal-infos
+dart test
+```

@@ -87,6 +87,23 @@ jobs:
       # the kind of bug that gets blamed on the network for weeks.
       - run: go test -race ./...
 
+  dart:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dart
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - run: dart pub get
+      - run: dart format --output=none --set-exit-if-changed .
+      # Fatal on infos too: this package has no dependencies and nothing to hide behind, so a lint
+      # it is willing to print is one it should be willing to fail on.
+      - run: dart analyze --fatal-infos
+      - run: dart test
+
   e2e:
     runs-on: ubuntu-latest
     steps:
@@ -141,7 +158,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------
 
   publish-branch:
-    needs: [ts, jvm, go, e2e]
+    needs: [ts, jvm, go, dart, e2e]
     if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -204,11 +221,14 @@ jobs:
 
       # Go needs no publishing step at all: `go get github.com/micro-teams/multipath/go@<branch>`
       # resolves straight from the commit. Saying so here so nobody goes looking for the missing job.
+      - name: Dart needs no registry
+        run: echo "pub.dev is not used; the package is consumed by git path or ref."
+
       - name: Go needs no registry
         run: echo 'go get github.com/micro-teams/multipath/go@${{ github.ref_name }}'
 
   publish-release:
-    needs: [ts, jvm, go, e2e]
+    needs: [ts, jvm, go, dart, e2e]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
