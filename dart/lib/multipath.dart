@@ -8,6 +8,7 @@
 /// See `README.md` for how to wire it, and what deliberately is NOT here.
 library;
 
+export 'src/cache.dart' show CacheStore, RequestCache;
 export 'src/health.dart' show HealthOptions, HealthTable, LineHealth, LineState;
 export 'src/idempotency.dart' show idempotencyHeader, newIdempotencyKey;
 export 'src/line_manager.dart' show AttemptReport, LineManager;

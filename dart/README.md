@@ -56,6 +56,35 @@ non-2xx into a thrown exception will get those retried across every line — inc
 is the one place it actually costs something. Return the response for any status you received, and
 throw only when nothing came back.
 
+## The cache is offered alongside the answer, never in place of it
+
+`RequestCache` stores what an identical request returned last time, keyed by method and path with
+the origin stripped — the same resource over two lines is the same resource, and keying by full URL
+would give every line its own cache and lose most hits the moment a second line existed.
+
+The boundary is the whole design: **the request always goes out**, and what you await is always
+this request's result. A failure is a failure; it never quietly becomes stale data wearing a
+success. What the cache is for is painting something while you wait.
+
+```dart
+final key = RequestCache.keyFor('GET', '/mt/chat');
+final previous = cache.get<List<Object?>>(key);   // paint this now, if you like
+final fresh = await manager.read(...);            // and this is the answer
+cache.set(key, fresh);
+```
+
+Nothing here decides *when* to forget. What a write makes stale is business knowledge; this layer
+knows only that two requests looked identical. It offers `invalidate(prefix)` and leaves the timing
+to the application.
+
+`setScope` is how one account never paints another's data. The marker is opaque — this layer must
+not learn what a "user" is — and changing it DROPS the old entries rather than hiding them.
+
+One addition over the TypeScript version: an optional `CacheStore`, so a client that is killed and
+reopened constantly can paint before the network answers. It is an interface, not an
+implementation: a Flutter app backs it with shared_preferences, a CLI with a file, a test with
+nothing at all.
+
 ## Streams
 
 A stream cannot be raced: two connections are two conversations, each with its own state. So the
