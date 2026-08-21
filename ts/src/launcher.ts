@@ -65,6 +65,15 @@ export interface LauncherOptions {
    */
   readonly preload?: readonly string[];
   readonly title?: string;
+  /**
+   * Extra markup inside the head.
+   *
+   * Chiefly for `<base>`, which has to be in the head and has to be right: a framework that
+   * resolves its own assets against the document's base URL loads them from the wrong place on
+   * every deep link without it — the app opens at "/" and nowhere else, which is the one failure a
+   * launcher must not introduce.
+   */
+  readonly headHtml?: string;
   /** Extra markup inside the body — a splash screen, a spinner, a noscript notice. */
   readonly bodyHtml?: string;
   /** Scope for the Service Worker registration. */
@@ -149,6 +158,7 @@ export function buildLauncher(options: LauncherOptions): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(options.title ?? "Loading")}</title>
+${options.headHtml ?? ""}
 </head>
 <body>
 ${options.bodyHtml ?? ""}

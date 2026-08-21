@@ -275,4 +275,17 @@ describe("the race and credentials", () => {
     const html = buildLauncher({ appEntry: "/main.js", preload: ["/big.js"] });
     expect(html).toContain("if (length > 0) __want += length");
   });
+
+  /**
+   * `<base>` is only honoured in the head, and a framework that resolves its assets against the
+   * document's base URL loads them from the wrong place on every deep link without it.
+   */
+  it("puts extra head markup in the head", () => {
+    const html = buildLauncher({
+      appEntry: "/main.js",
+      headHtml: '<base href="/">',
+    });
+    const head = html.slice(html.indexOf("<head>"), html.indexOf("</head>"));
+    expect(head).toContain('<base href="/">');
+  });
 });
