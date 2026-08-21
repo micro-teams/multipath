@@ -134,6 +134,13 @@ jobs:
         working-directory: testbed/e2e
         run: npx playwright install --with-deps chromium
 
+      # The Dart leg of the testbed runs from run.sh, so the SDK has to be here. Required in CI
+      # even though run.sh skips it locally when absent: "skipped" is a courtesy to a developer's
+      # machine, not an acceptable outcome for a gate.
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
       - name: Build everything, start it, run the specs
         run: ./testbed/run.sh --e2e
 

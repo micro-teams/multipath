@@ -28,6 +28,7 @@ the testbed would be lying if it did anything else.
 | `lines/` | A dependency-free Node proxy, one process per line, with configurable added latency, failure rate and hard stalls. This is what makes adverse timing reproducible. |
 | `web/` | A static page that drives the built `ts/` package in a real browser. |
 | `e2e/` | Playwright specs: the assertions that actually decide whether MultiPath works. |
+| `dart/` | The same questions asked of the Dart client, over real sockets rather than a browser. |
 
 ## Run it locally
 
@@ -36,6 +37,22 @@ npm --prefix testbed/e2e install
 testbed/run.sh          # builds everything, starts server + lines + web, waits for health
 testbed/run.sh --e2e    # …and then runs the Playwright specs against it
 ```
+
+## Two clients, one deployment
+
+`e2e/` drives `ts/` in a real browser; `testbed/dart/bin/e2e.dart` drives `dart/` as a plain
+program. They run against the *same* lines and the same origin, which is the point: the two
+packages are meant to mean the same thing by "a line", and the cheapest way for that to stop being
+true is for each to be tested only against its own fixtures.
+
+The Dart leg is a program rather than a test file because it asserts against a deployment that has
+to be up — a test that silently passes when nothing is listening is worse than no test. It also
+proves one thing no unit suite on either side can: that the Dart client's idempotency header and
+the JVM filter's agree, since the write is counted at the origin.
+
+`run.sh --e2e` runs both. Without a `dart` on PATH it says so and skips that leg, because the other
+three packages must stay runnable on a machine with no Dart SDK; CI installs one, so there the leg
+is a gate rather than a courtesy.
 
 ## The counting write is the whole trick
 
