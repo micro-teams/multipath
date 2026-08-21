@@ -240,6 +240,120 @@ describe("createPrecache, versioning", () => {
     // A user mid-session must never end up with half of one build and half of another.
     expect(a.cacheName).not.toBe(b.cacheName);
   });
+
+  /*
+   * A Service Worker is only replaced when its own bytes change, so a deploy that ships new files
+   * beside an unchanged worker is invisible: no update, no activate, no eviction, and every visitor
+   * keeps getting the build this worker cached. The files are new, the site is up, the app is old.
+   * These are the tests for the worker not trusting itself.
+   */
+  describe("checking itself against the server", () => {
+    function precacheAskingFor(deployed: unknown, version = "v1") {
+      const { api, store } = fakeCaches();
+      store.set("multipath-precache-v1", new Map());
+      const fetchImpl = vi.fn(
+        async () =>
+          new Response(JSON.stringify(deployed), {
+            headers: { "content-type": "application/json" },
+          }),
+      );
+      const precache = createPrecache({
+        manifest: ["/main.js"],
+        version,
+        versionUrl: "/build.json",
+        checkEveryMs: 0,
+        fetch: fetchImpl as unknown as typeof globalThis.fetch,
+        caches: api,
+      });
+      return { precache, store, fetchImpl };
+    }
+
+    it("throws its cache away when the server has a different build", async () => {
+      const { precache, store } = precacheAskingFor({ version: "v2" });
+
+      expect(await precache.reconcile()).toBe(true);
+      expect([...store.keys()]).toEqual([]);
+    });
+
+    it("keeps everything when the server has the build it holds", async () => {
+      const { precache, store } = precacheAskingFor({ version: "v1" });
+
+      expect(await precache.reconcile()).toBe(false);
+      expect([...store.keys()]).toEqual(["multipath-precache-v1"]);
+    });
+
+    it("takes a bare string as readily as an object", async () => {
+      // The stamp is a consumer's build step's business; insisting on one shape would be this
+      // library having an opinion about somebody else's file format.
+      const { precache } = precacheAskingFor("v2");
+      expect(await precache.reconcile()).toBe(true);
+    });
+
+    /** Never from a cache: an answer about what is deployed must not be an answer about the past. */
+    it("asks without caching", async () => {
+      const { precache, fetchImpl } = precacheAskingFor({ version: "v1" });
+      await precache.reconcile();
+
+      expect(fetchImpl).toHaveBeenCalledWith("/build.json", { cache: "no-store" });
+    });
+
+    it("does nothing at all when no stamp was configured", async () => {
+      const { api } = fakeCaches();
+      const fetchImpl = vi.fn();
+      const precache = createPrecache({
+        manifest: ["/main.js"],
+        version: "v1",
+        fetch: fetchImpl as unknown as typeof globalThis.fetch,
+        caches: api,
+      });
+
+      expect(await precache.reconcile()).toBe(false);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("asks at most once per interval, however often it is called", async () => {
+      // Consumers are told to call this on every navigation. That must be cheap.
+      const { precache, fetchImpl } = precacheAskingFor({ version: "v1" });
+      const at = 1_000_000;
+      const throttled = createPrecache({
+        manifest: [],
+        version: "v1",
+        versionUrl: "/build.json",
+        checkEveryMs: 60_000,
+        fetch: fetchImpl as unknown as typeof globalThis.fetch,
+        caches: fakeCaches().api,
+      });
+
+      await throttled.reconcile(at);
+      await throttled.reconcile(at + 1_000);
+      await throttled.reconcile(at + 59_000);
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+
+      await throttled.reconcile(at + 61_000);
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      expect(precache).toBeDefined();
+    });
+
+    it("does nothing when it cannot ask", async () => {
+      // Offline, or a deployment older than this feature. Neither is evidence that what we hold is
+      // wrong, and acting on no evidence would empty the cache of every offline user.
+      const { api, store } = fakeCaches();
+      store.set("multipath-precache-v1", new Map());
+      const precache = createPrecache({
+        manifest: [],
+        version: "v1",
+        versionUrl: "/build.json",
+        checkEveryMs: 0,
+        fetch: (async () => {
+          throw new Error("offline");
+        }) as unknown as typeof globalThis.fetch,
+        caches: api,
+      });
+
+      expect(await precache.reconcile()).toBe(false);
+      expect([...store.keys()]).toEqual(["multipath-precache-v1"]);
+    });
+  });
 });
 
 vi.setConfig({ testTimeout: 10_000 });

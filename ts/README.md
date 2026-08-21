@@ -180,6 +180,43 @@ which line is tried first.
 Only the very first HTML document cannot be raced — a browser opening a URL knows one host. That one
 request is why the launcher is kept small, and after the worker installs even it comes from cache.
 
+### A worker that does not trust itself
+
+A Service Worker is only replaced when its **own bytes** change. So a deploy that ships new
+application files beside an unchanged `sw.js` is invisible: no update, no `activate`, no eviction,
+and every visitor keeps being served the build that worker cached. Nothing about it looks wrong from
+outside — the files are new, the site is up, the app is old. It is the kind of failure that costs a
+day, because the first hypothesis is never "the deployment is internally inconsistent".
+
+Give the precache a place to ask:
+
+```ts
+const precache = createPrecache({
+  manifest,
+  version,
+  versionUrl: "/build.json", // served WITHOUT caching
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(precache.activate().then(() => precache.reconcile()));
+});
+self.addEventListener("fetch", (event) => {
+  if (event.request.mode === "navigate") event.waitUntil(precache.reconcile());
+  // …
+});
+```
+
+`reconcile()` fetches that URL with `cache: "no-store"`, accepts either a bare version string or
+`{ "version": "…" }`, and — if the answer is not the version this worker was built with — deletes
+every cache it owns and returns `true`, so the consumer can call `registration.update()` and tell
+its clients to reload. It is throttled (`checkEveryMs`, a minute by default) so putting it on every
+navigation costs nothing.
+
+Blunt on purpose: being stale is precisely the state in which a cache is worth nothing. And silent
+on failure — offline, a 404 from an older deployment, an unexpected body — because none of those are
+evidence that what you hold is wrong, and emptying an offline user's cache on no evidence is worse
+than being a build behind.
+
 ## Seeing what it is doing
 
 Everything here is invisible by construction — requests leave over whichever line is winning,
