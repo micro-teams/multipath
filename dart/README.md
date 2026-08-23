@@ -108,14 +108,37 @@ lines only for requests and streams. Flutter **web** does have one, but its entr
 `flutter_bootstrap.js` plus the engine, which is not a single module that can be swapped the way a
 bundler's entry chunk can.
 
-**A prober loop.** `LineManager.probe` measures every line once, which is what a short-lived process
-needs; a long-lived one schedules that itself. The loop in `go/prober.go` exists because a connector
-runs for weeks, and it carries policy — backoff, throughput measured only while the app is quiet —
-that a Flutter app has no equivalent situation for yet. It belongs here when something needs it, not
-before.
+**A developer panel.** `ts/`'s `mountLinePanel` draws DOM. `onAttempt` and `recentAttempts` give
+you the same data; drawing it is the consumer's business.
 
-**A developer panel.** `ts/`'s `mountLinePanel` draws DOM. `onAttempt` gives you the same data;
-drawing it is the consumer's business.
+## Measuring, and remembering
+
+`start()` begins the probe loop and `stop()` ends it — nothing is measured until you ask, because a
+library that starts making network requests the moment it is constructed is one that surprises
+people. `probeNow()` measures every line and waits, which is what a refresh button wants.
+
+Give it a `storage` and the ranking survives the visit:
+
+```dart
+final manager = LineManager(
+  registry: parseRegistry(await fetchLineRegistry()),
+  send: probeSender(origin: origin),
+  storage: PrefsHealthStore(await SharedPreferences.getInstance()),
+);
+await manager.restoreHealth();   // optional: without it, start() seeds in the background
+manager.start();
+```
+
+Worth doing because the alternative for a cold start is the registry's fixed order, which is a guess
+that never improves — and it is the only way to tell a stable-but-slow line from a fast one, since
+both answer a probe promptly. Only the measurements are kept, never the states: a line that was
+unreachable on a train yesterday must not start today demoted. Anything older than `storageMaxAge`
+(a week) is ignored, because last month's network says nothing about today's. The record is
+milliseconds-on-the-wire, the same shape `ts/` writes, so the two clients can read each other's.
+
+`preferredLineIds` is that memory in the form a launcher wants: the launcher races every line
+regardless, and this only decides who is asked first among lines that are all reachable — which is
+the part racing cannot settle.
 
 ## Kept in step with the others
 

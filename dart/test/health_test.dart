@@ -10,6 +10,7 @@ final _at = DateTime.utc(2026, 1, 1);
 Duration ms(int n) => Duration(milliseconds: n);
 
 void main() {
+  group('persistence', _persistence);
   test('a line nobody has measured is up, not down', () {
     final table = HealthTable();
     expect(table['never-seen'].state, LineState.up);
@@ -150,5 +151,60 @@ void main() {
     table.recordSuccess('gone', ms(10), _at);
     table.retain(['stays']);
     expect(table['gone'].measured, isFalse);
+  });
+}
+
+// Persistence: what survives a visit, and what deliberately does not.
+void _persistence() {
+  test('carries measurements to the next visit, but never a verdict', () {
+    final at = DateTime.utc(2026, 8, 23, 12);
+    final table = HealthTable();
+    table.recordSuccess('a', const Duration(milliseconds: 40), at);
+    table.recordThroughput('a', 500000);
+    for (var i = 0; i < 3; i++) {
+      table.recordFailure('b', StateError('train tunnel'), at);
+    }
+    expect(table['b'].state, LineState.down);
+
+    final next = HealthTable();
+    next.import(
+      PersistedHealth.decode(PersistedHealth.encode(table.export())),
+      const Duration(days: 7),
+      at.add(const Duration(hours: 1)),
+    );
+
+    expect(next['a'].latency, const Duration(milliseconds: 40));
+    expect(next['a'].throughputBps, 500000);
+    expect(next['b'].state, LineState.up,
+        reason: 'a line unreachable on a train yesterday starts today level');
+  });
+
+  test('ignores measurements old enough to be about a different network', () {
+    final table = HealthTable();
+    table.recordSuccess(
+        'a', const Duration(milliseconds: 5), DateTime.utc(2026, 7));
+    final next = HealthTable();
+    next.import(
+        table.export(), const Duration(days: 7), DateTime.utc(2026, 8, 23));
+    expect(next['a'].measured, isFalse);
+  });
+
+  test('a corrupt or foreign store costs nothing', () {
+    final table = HealthTable();
+    expect(PersistedHealth.decode('not json'), isEmpty);
+    expect(PersistedHealth.decode('{"lines":[]}'), isEmpty);
+    expect(
+        PersistedHealth.decode('[{"lineId":42},{"lineId":"a","latencyMs":7}]'),
+        hasLength(1));
+    table.import(PersistedHealth.decode('[{"lineId":"a","latencyMs":7}]'),
+        const Duration(days: 7), DateTime.utc(2026, 8, 23));
+    expect(table['a'].latency, const Duration(milliseconds: 7),
+        reason: 'one bad entry must not cost the good ones');
+  });
+
+  test('a line never measured is not worth writing down', () {
+    final table = HealthTable();
+    table.recordFailure('a', StateError('no'), DateTime.utc(2026, 8, 23));
+    expect(table.export(), isEmpty);
   });
 }

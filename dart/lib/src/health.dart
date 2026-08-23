@@ -12,6 +12,8 @@
 /// never removed, because if everything is down, trying the least-bad option beats refusing to try.
 library;
 
+import 'dart:convert';
+
 import 'registry.dart';
 
 /// How usable a line looks right now.
@@ -78,6 +80,80 @@ class LineHealth {
         lastError: clearError ? null : (lastError ?? this.lastError),
         lastProbedAt: lastProbedAt ?? this.lastProbedAt,
       );
+}
+
+/// What is worth remembering between visits.
+///
+/// Only the measurements, never the states: "down" is a fact about a moment, and a line that was
+/// unreachable on a train yesterday must not start today demoted. Latency and throughput age more
+/// gracefully — a line that was fast last week is a better guess than the registry's fixed order,
+/// which is the alternative.
+class PersistedHealth {
+  const PersistedHealth({
+    required this.lineId,
+    required this.latency,
+    required this.throughputBps,
+    required this.at,
+  });
+
+  final String lineId;
+  final Duration? latency;
+  final double throughputBps;
+
+  /// When the measurement was taken. Null when the line was never probed.
+  final DateTime? at;
+
+  /// Milliseconds on the wire, so the Dart and TypeScript clients can read each other's records —
+  /// they share a browser, and one overwriting the other's entry with a shape it cannot parse
+  /// would silently cost both of them their memory.
+  Map<String, Object?> toJson() => {
+        'lineId': lineId,
+        'latencyMs': latency?.inMicroseconds == null
+            ? null
+            : latency!.inMicroseconds / 1000,
+        'throughputBps': throughputBps == 0 ? null : throughputBps,
+        'at': at?.millisecondsSinceEpoch ?? 0,
+      };
+
+  /// Null for anything that is not a record this wrote: a foreign or corrupt entry is skipped
+  /// rather than failing the whole restore, since one bad line should not cost the others.
+  static PersistedHealth? fromJson(Object? raw) {
+    if (raw is! Map) return null;
+    final id = raw['lineId'];
+    if (id is! String || id.isEmpty) return null;
+    final latencyMs = raw['latencyMs'];
+    final throughput = raw['throughputBps'];
+    final at = raw['at'];
+    return PersistedHealth(
+      lineId: id,
+      latency: latencyMs is num
+          ? Duration(microseconds: (latencyMs * 1000).round())
+          : null,
+      throughputBps: throughput is num ? throughput.toDouble() : 0,
+      at: at is num && at > 0
+          ? DateTime.fromMillisecondsSinceEpoch(at.toInt())
+          : null,
+    );
+  }
+
+  static String encode(List<PersistedHealth> entries) =>
+      jsonEncode([for (final entry in entries) entry.toJson()]);
+
+  /// An empty list for anything unreadable — see [fromJson].
+  static List<PersistedHealth> decode(String? encoded) {
+    if (encoded == null || encoded.isEmpty) return const [];
+    Object? parsed;
+    try {
+      parsed = jsonDecode(encoded);
+    } catch (_) {
+      return const [];
+    }
+    if (parsed is! List) return const [];
+    return [
+      for (final raw in parsed)
+        if (fromJson(raw) case final entry?) entry,
+    ];
+  }
 }
 
 /// Tuning for the table. The defaults are the other packages' defaults.
@@ -155,6 +231,41 @@ class HealthTable {
           : entry.throughputBps * (1 - options.smoothing) +
               bytesPerSecond * options.smoothing,
     );
+  }
+
+  /// The measurements worth carrying to the next visit.
+  List<PersistedHealth> export() => [
+        for (final entry in all)
+          if (entry.measured || entry.throughputBps > 0)
+            PersistedHealth(
+              lineId: entry.lineId,
+              latency: entry.latency,
+              throughputBps: entry.throughputBps,
+              at: entry.lastProbedAt,
+            ),
+      ];
+
+  /// Seeds from a previous visit.
+  ///
+  /// Seeded as measurements rather than as certainties: the next probe blends into them normally,
+  /// so a line that has genuinely changed is corrected within a few samples rather than being
+  /// trusted indefinitely. Nothing here can mark a line down — see [PersistedHealth].
+  void import(
+    Iterable<PersistedHealth> entries,
+    Duration maxAge,
+    DateTime now,
+  ) {
+    for (final entry in entries) {
+      final at = entry.at;
+      // Stale enough and it is worse than no information: the network the user was on last month
+      // says nothing about the one they are on now.
+      if (at != null && now.difference(at) > maxAge) continue;
+      _entries[entry.lineId] = this[entry.lineId].copyWith(
+        latency: entry.latency,
+        throughputBps: entry.throughputBps,
+        lastProbedAt: at,
+      );
+    }
   }
 
   /// Forgets lines that have left the registry, so a re-added id cannot inherit the reputation of

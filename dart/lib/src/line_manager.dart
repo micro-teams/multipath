@@ -11,6 +11,8 @@
 /// moment it is constructed is one that surprises people.
 library;
 
+import 'dart:async';
+
 import 'health.dart';
 import 'prober.dart';
 import 'registry.dart';
@@ -31,6 +33,22 @@ class AttemptReport {
   final Object? error;
 }
 
+/// Where measurements are kept between visits.
+///
+/// Asynchronous, unlike the browser's `Storage`, because every Dart store worth using is —
+/// `shared_preferences`, a file, a database. Worth wiring at all because the alternative for a cold
+/// start is the registry's fixed order, which is a guess that never improves; from the second visit
+/// on, the ranking begins from what was actually measured, which is the only way to tell a
+/// stable-but-slow line from a fast one, since both answer a probe promptly.
+abstract class HealthStore {
+  const HealthStore();
+
+  /// The last thing [save] wrote, or null on a first visit.
+  Future<String?> load();
+
+  Future<void> save(String encoded);
+}
+
 class LineManager {
   LineManager({
     required Registry registry,
@@ -39,9 +57,14 @@ class LineManager {
     this.onAttempt,
     SendProbe? send,
     ProberOptions probe = const ProberOptions(),
+    HealthStore? storage,
+    this.storageMaxAge = const Duration(days: 7),
+    int attemptHistory = 100,
     DateTime Function()? now,
   })  : _registry = registry,
         health = HealthTable(health),
+        _storage = storage,
+        _historyLimit = attemptHistory,
         _now = now ?? DateTime.now {
     // Only if the consumer said how to send one. Without it the manager still works — it just ranks
     // on configured weight, having measured nothing, which is what the Dart port did for everybody
@@ -60,6 +83,16 @@ class LineManager {
 
   Prober? _prober;
 
+  final HealthStore? _storage;
+
+  /// Measurements older than this are ignored: last month's network says nothing about today's.
+  final Duration storageMaxAge;
+
+  final int _historyLimit;
+  final List<AttemptReport> _history = [];
+
+  Future<void>? _restored;
+
   Registry _registry;
   final HealthTable health;
   final StrategyOptions strategy;
@@ -77,17 +110,77 @@ class LineManager {
   /// The lines best-first.
   List<Line> get ranked => health.rank(_registry.lines);
 
+  /// Recent attempts, newest first.
+  ///
+  /// The developer panel's second half: health says what each line is like, this says what actually
+  /// happened — which line served the last request, and how often each one wins. The two disagree
+  /// more often than you would expect, and the disagreement is usually where the bug is.
+  ///
+  /// Bounded, because a diagnostic that grows without limit is a memory leak with good intentions.
+  List<AttemptReport> get recentAttempts => List.unmodifiable(_history);
+
+  /// Line ids in remembered preference order, for a launcher to use on the next cold start.
+  ///
+  /// The launcher races every line regardless; this only decides who is asked first among lines
+  /// that are all reachable, which is the part racing cannot settle.
+  List<String> get preferredLineIds => [for (final line in ranked) line.id];
+
+  /// Seeds the table from the last visit. Safe to call more than once; only the first does work.
+  ///
+  /// Separate from construction, and a future, because reading a store is asynchronous here. A
+  /// caller that does not await it loses nothing but the first few requests' head start.
+  Future<void> restoreHealth() => _restored ??= _restoreHealth();
+
+  Future<void> _restoreHealth() async {
+    final storage = _storage;
+    if (storage == null) return;
+    try {
+      health.import(
+        PersistedHealth.decode(await storage.load()),
+        storageMaxAge,
+        _now(),
+      );
+    } catch (_) {
+      // Corrupt or unavailable: start from nothing rather than from something misread. Never worth
+      // failing an application's startup over a performance hint.
+    }
+  }
+
+  /// Keeps what has been measured, so the next visit does not start from a guess.
+  Future<void> saveHealth() async {
+    final storage = _storage;
+    if (storage == null) return;
+    try {
+      await storage.save(PersistedHealth.encode(health.export()));
+    } catch (_) {
+      // A full or unavailable store is not worth failing a request over.
+    }
+  }
+
   /// Begin measuring the lines.
   ///
   /// Separate from construction because probing costs real requests, and a library that starts
   /// making them the moment it is instantiated is one that surprises people. Until this is called
   /// the manager still works — it just ranks on configured weight, having measured nothing.
-  void start() => _prober?.start();
+  void start() {
+    // The seeding is only a head start, so it must not delay the measuring that will correct it.
+    if (_storage != null) unawaited(restoreHealth());
+    _prober?.start();
+  }
 
-  void stop() => _prober?.stop();
+  void stop() {
+    _prober?.stop();
+    // Written on the way out rather than after every probe: a browser tab can be discarded at any
+    // moment, so this is a best effort either way, and writing on every sample would be a store
+    // write every fifteen seconds for a hint.
+    unawaited(saveHealth());
+  }
 
   /// Probe every line now and wait for the answers. The panel's refresh button.
-  Future<void> probeNow() async => _prober?.probeAll();
+  Future<void> probeNow() async {
+    await _prober?.probeAll();
+    await saveHealth();
+  }
 
   /// Swaps the lines at runtime, forgetting health for lines that have gone.
   set registry(Registry next) {
@@ -161,6 +254,10 @@ class LineManager {
   }
 
   void _report(AttemptReport report) {
+    if (_historyLimit > 0) {
+      _history.insert(0, report);
+      if (_history.length > _historyLimit) _history.removeLast();
+    }
     final observer = onAttempt;
     if (observer == null) return;
     try {
