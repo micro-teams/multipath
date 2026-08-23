@@ -223,13 +223,13 @@ window.__multipath__ = ${JSON.stringify(config)};
 </script>
 <script type="module">
 ${versionGuard(options)}${
-  options.serviceWorker
-    ? `if ("serviceWorker" in navigator) {
+    options.serviceWorker
+      ? `if ("serviceWorker" in navigator) {
 navigator.serviceWorker.register(${JSON.stringify(options.serviceWorker)}${registrationOptions(options)}).catch(() => {});
 }
 `
-    : ""
-}const __entry = ${JSON.stringify(options.appEntry)};
+      : ""
+  }const __entry = ${JSON.stringify(options.appEntry)};
 const __mp = window.__multipath__;
 const __lines = (__mp.registry && __mp.registry.lines) || [];
 const __pref = ${JSON.stringify(options.preferredLineIds ?? [])};
