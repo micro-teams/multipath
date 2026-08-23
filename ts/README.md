@@ -183,6 +183,29 @@ A file whose size nobody could establish — no declared bytes, no usable `Conte
 contributes to what has arrived but nothing to the total, so it does not move the bar rather than
 making it lie. And a launcher that preloads nothing does not ship any of this code at all.
 
+### Knowing that it is out of date
+
+A cached client cannot answer "am I the build that is deployed?" on its own: every copy it holds is
+its own, and a copy has no way to notice that it is stale. So the version rides INSIDE the launcher
+and the server is asked for the current one on every start:
+
+```ts
+buildLauncher({
+  version: "0.1.16-abc1234",
+  versionUrl: "/version",
+  clearOnUpdate: ["flutter.mt:cache:"],
+  // …
+});
+```
+
+When the two disagree, everything cached under the origin belongs to the build being replaced — the
+caches, the consumer's own remembered responses in local storage, and the worker that would
+otherwise answer the reload out of its own memory. All of it goes, and the page reloads once. Blunt
+on purpose: a half-updated client is the state that produces the failures nobody can reproduce.
+
+Failing to ask is silence rather than an error — offline is the ordinary case — and the reload is
+guarded per tab, so a server that somehow disagrees forever cannot turn this into a loop.
+
 `LineManager` can persist what it measures (`storage`), so the *second* visit onward starts from
 measurements rather than from the registry's fixed order. Racing settles the entry point on its own;
 persistence matters for everything after it, which is hedged rather than raced and so does care

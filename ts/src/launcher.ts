@@ -36,6 +36,19 @@ export interface PreloadFile {
   readonly url: string;
   /** Uncompressed size in bytes. Omit only if the build genuinely does not know. */
   readonly bytes?: number;
+  /**
+   * A JavaScript expression, evaluated in the page: the file is fetched only if it is truthy.
+   *
+   * For builds that ship alternatives and choose between them at runtime — a wasm engine with a
+   * variant per browser being the case this exists for. Preloading both would waste megabytes on
+   * every visit; preloading the wrong one wastes them AND leaves the real one to be fetched
+   * afterwards, outside the progress bar. The condition belongs to whoever knows how the choice is
+   * made, which is the build, not this library.
+   *
+   * It is emitted into the launcher as written, so it must be an expression the build itself
+   * authored — never anything derived from user input.
+   */
+  readonly when?: string;
 }
 
 export type PreloadEntry = string | PreloadFile;
@@ -104,6 +117,30 @@ export interface LauncherOptions {
    * `"classic"`, which is the safer assumption for a hand-written worker.
    */
   readonly serviceWorkerType?: "classic" | "module";
+  /**
+   * This build's version, and where to ask what the server has.
+   *
+   * The one question a cached client cannot answer for itself: "am I the build that is deployed?"
+   * Everything else it holds — the document, the code, the engine — may be its own stale copy, and
+   * a copy has no way to notice that it is one. So the version travels INSIDE the launcher, and the
+   * launcher asks the server for the current one on every start.
+   *
+   * When they disagree, everything cached under this origin is from the older build: caches, the
+   * request cache in local storage, and the worker holding them. All of it goes, and the page
+   * reloads once into the new build. That is blunt on purpose — a half-updated client is the state
+   * that produces the failures nobody can reproduce.
+   */
+  readonly version?: string;
+  /** Where the deployed version is served, unfudged and uncached. Requires [version]. */
+  readonly versionUrl?: string;
+  /**
+   * Local-storage keys to drop when the version changed, matched by prefix.
+   *
+   * The consumer's own caches, which this library cannot recognise: a framework's persistence
+   * layer usually prefixes what it writes, and a build change is precisely when a remembered
+   * response may no longer mean what it says.
+   */
+  readonly clearOnUpdate?: readonly string[];
 }
 
 /**
@@ -185,7 +222,7 @@ ${options.bodyHtml ?? ""}
 window.__multipath__ = ${JSON.stringify(config)};
 </script>
 <script type="module">
-${
+${versionGuard(options)}${
   options.serviceWorker
     ? `if ("serviceWorker" in navigator) {
 navigator.serviceWorker.register(${JSON.stringify(options.serviceWorker)}${registrationOptions(options)}).catch(() => {});
@@ -223,11 +260,19 @@ ${
   (options.preload ?? []).length
     ? `const __pre = ${JSON.stringify(
         (options.preload ?? []).map((entry) =>
-          typeof entry === "string" ? { url: entry } : { url: entry.url, bytes: entry.bytes },
+          typeof entry === "string"
+            ? { url: entry }
+            : { url: entry.url, bytes: entry.bytes, when: entry.when },
         ),
       )};
-// Known up front, from the build, so the first byte already moves a bar that means something.
-let __got = 0, __want = __pre.reduce((sum, f) => sum + (f.bytes || 0), 0);
+// Known up front, from the build, so the first byte already moves a bar that means something. Only
+// the files this browser will actually ask for: a build that ships alternatives says which is
+// which, and preloading the other one spends megabytes warming a cache nobody reads.
+const __want_files = __pre.filter((f) => !f.when || __cond(f.when));
+let __got = 0, __want = __want_files.reduce((sum, f) => sum + (f.bytes || 0), 0);
+function __cond(expression) {
+  try { return !!eval(expression); } catch (e) { return false; }
+}
 function __say(p) {
   document.querySelectorAll("[data-multipath-progress]").forEach((e) => { e.textContent = p + "%"; });
   window.dispatchEvent(new CustomEvent("multipath:progress", { detail: { percent: p, loaded: __got, total: __want } }));
@@ -255,7 +300,7 @@ function __warm(base) {
   if (!__pre.length) return Promise.resolve();
   __say(0);
   return Promise.all(
-    __pre.map((f) =>
+    __want_files.map((f) =>
       fetch(base + f.url, { credentials: "omit" })
         .then((r) => (r.ok ? __drain(r, !!f.bytes) : 0))
         .catch(() => {}),
@@ -277,6 +322,58 @@ __race()
 </script>
 </body>
 </html>
+`;
+}
+
+/**
+ * The version check, emitted before anything else runs.
+ *
+ * It is first because everything after it is a decision made with cached material: which worker
+ * answers, what it answers with, and what the application believes it already knows. Asking the
+ * question afterwards would mean acting on the old build and correcting later, which is precisely
+ * the half-updated state this exists to prevent.
+ *
+ * A failed check is silence, not an error: offline is the ordinary case, and a client that refused
+ * to start because it could not confirm its version would be broken far more often than a stale one
+ * would be wrong.
+ *
+ * The reload is guarded by a session key so that a server which somehow disagrees forever cannot
+ * turn this into a loop — one attempt per tab, then it carries on with what it has.
+ */
+function versionGuard(options: LauncherOptions): string {
+  if (!options.version || !options.versionUrl) return "";
+  const prefixes = options.clearOnUpdate ?? [];
+  return `const __version = ${JSON.stringify(options.version)};
+await (async function () {
+  try {
+    const response = await fetch(${JSON.stringify(options.versionUrl)}, { cache: "no-store" });
+    if (!response.ok) return;
+    const deployed = (await response.text()).trim();
+    if (!deployed || deployed === __version) return;
+    if (sessionStorage.getItem("multipath:updating") === deployed) return;
+    sessionStorage.setItem("multipath:updating", deployed);
+    console.warn("multipath: this is " + __version + ", the server has " + deployed + " — starting over");
+    // Everything cached under this origin belongs to the build that is being replaced.
+    if (window.caches) {
+      const names = await caches.keys();
+      await Promise.all(names.map((name) => caches.delete(name)));
+    }
+    const prefixes = ${JSON.stringify(prefixes)};
+    for (const key of Object.keys(localStorage)) {
+      if (prefixes.some((p) => key.startsWith(p))) localStorage.removeItem(key);
+    }
+    // The worker included: it is code from the old build, and it is the thing that would otherwise
+    // answer the reload from its own memory.
+    if (navigator.serviceWorker) {
+      const registrations = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(registrations.map((r) => r.unregister()));
+    }
+    location.reload();
+    await new Promise(() => {});
+  } catch (e) {
+    // Offline, or no /version on this deployment. Both are ordinary; carry on with what we have.
+  }
+})();
 `;
 }
 
