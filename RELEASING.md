@@ -40,6 +40,12 @@ committed versions, and publishes:
 | `ts/` | GitHub Packages (npm) | `@micro-teams/multipath` |
 | `jvm/` | GitHub Packages (Maven) | `app.microteams.multipath:multipath-spring-boot-starter` |
 | `go/` | nowhere | `go get github.com/micro-teams/multipath/go@vX.Y.Z` — the tag *is* the release |
+| `dart/` | nowhere | a git dependency on `path: dart` at `ref: vX.Y.Z` — the tag is the release |
+
+`dart/pubspec.yaml` carries the number too. Nothing resolves by it — a git dependency is pinned by
+ref, not by version — but a package that says 0.1.1 inside a 0.1.6 release is a package whose own
+answer to "which one is this?" is wrong, and that is the question somebody asks when something is
+behaving strangely.
 
 The Go module lives in `go/`, so Go requires its tag to carry that prefix: **`go/vX.Y.Z`**, alongside
 the plain `vX.Y.Z` the publish workflow keys on. Without it `go get …/go@vX.Y.Z` reports "module
@@ -49,10 +55,11 @@ tag. Cutting 0.1.1 hit exactly this.
 ### Cutting a release
 
 ```sh
-# 1. bump all three to the same number
+# 1. bump all four to the same number
 #    ts/package.json          ->  "version": "0.2.0"
 #    jvm/pom.xml              ->  <version>0.2.0</version>
 #    testbed/server/pom.xml   ->  the multipath-spring-boot-starter dependency
+#    dart/pubspec.yaml        ->  version: 0.2.0
 # 2. commit, then
 git tag v0.2.0 && git push origin v0.2.0
 # 3. and the Go module's own tag, which Go resolves by subdirectory prefix
