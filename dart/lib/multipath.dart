@@ -12,6 +12,7 @@ export 'src/cache.dart' show CacheStore, RequestCache;
 export 'src/health.dart' show HealthOptions, HealthTable, LineHealth, LineState;
 export 'src/idempotency.dart' show idempotencyHeader, newIdempotencyKey;
 export 'src/line_manager.dart' show AttemptReport, LineManager;
+export 'src/prober.dart' show ProbeOutcome, Prober, ProberOptions, SendProbe;
 export 'src/registry.dart'
     show Line, Registry, RegistryFormatException, parseRegistry;
 export 'src/strategy.dart'
