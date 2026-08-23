@@ -224,8 +224,31 @@ describe("the race and credentials", () => {
       preload: ["/main.dart.js"],
       registry,
     });
-    expect(html).toContain('["/main.dart.js"]');
+    expect(html).toContain('[{"url":"/main.dart.js"}]');
     expect(html).toContain("__warm(__base(urls[0]))");
+  });
+
+  /**
+   * A bar that means something from the first byte.
+   *
+   * The size has to come from the BUILD. A compressed response's Content-Length counts wire bytes
+   * while a stream reader hands over decoded ones, so a bar that trusted the header was comparing
+   * two different units: it reached 99% after the first few chunks of a gzipped megabyte and then
+   * sat there. Which is exactly what "the progress is always 0% or 100%" looks like from outside.
+   */
+  it("takes the sizes from the build, so the total is known before anything arrives", () => {
+    const html = buildLauncher({
+      appEntry: "/flutter_bootstrap.js",
+      preload: [
+        { url: "/main.dart.js", bytes: 3_700_000 },
+        { url: "/canvaskit/chromium/canvaskit.wasm", bytes: 5_400_000 },
+      ],
+      registry,
+    });
+    expect(html).toContain('{"url":"/main.dart.js","bytes":3700000}');
+    expect(html).toContain("__pre.reduce((sum, f) => sum + (f.bytes || 0), 0)");
+    // And Content-Length is consulted only for the files the build could not measure.
+    expect(html).toContain('if (!known && !r.headers.get("content-encoding"))');
   });
 
   /**

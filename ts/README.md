@@ -153,10 +153,21 @@ bundle. `preload` names those files:
 ```ts
 buildLauncher({
   appEntry: "/flutter_bootstrap.js",
-  preload: ["/main.dart.js"],
+  preload: [
+    { url: "/main.dart.js", bytes: 3_700_000 },
+    { url: "/canvaskit/chromium/canvaskit.wasm", bytes: 5_400_000 },
+  ],
   // …
 });
 ```
+
+**Give the sizes.** They come from the build, and they are the files' own sizes rather than what the
+wire carries. That distinction is the whole point: a compressed response's `Content-Length` counts
+COMPRESSED bytes while a stream reader hands over DECOMPRESSED ones, so a bar that trusted the
+header was comparing two different units — it reached 99% after the first few chunks of a gzipped
+megabyte and then sat there. Told the real sizes, the total is known before anything arrives and the
+first byte moves a bar that means something. A bare string still works and falls back to
+`Content-Length`, but only for responses that are not compressed.
 
 They are fetched on the line that has just proved itself fastest, all at once, so they are warm in
 the HTTP cache by the time the application asks for them. And their bytes are what the progress
@@ -168,9 +179,9 @@ element, and dispatches `multipath:progress` on `window` with `{ percent, loaded
 a splash screen may be markup or may be a canvas. It stops at 99 until the application's module has
 actually been imported: a bar that reaches 100% and then waits is read as a hang.
 
-A file served without `Content-Length` contributes its bytes to what has arrived but nothing to the
-total, so it does not move the bar rather than making it lie. And a launcher that preloads nothing
-does not ship any of this code at all.
+A file whose size nobody could establish — no declared bytes, no usable `Content-Length` —
+contributes to what has arrived but nothing to the total, so it does not move the bar rather than
+making it lie. And a launcher that preloads nothing does not ship any of this code at all.
 
 `LineManager` can persist what it measures (`storage`), so the *second* visit onward starts from
 measurements rather than from the registry's fixed order. Racing settles the entry point on its own;

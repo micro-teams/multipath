@@ -23,6 +23,23 @@
 
 import type { Registry } from "./registry.js";
 
+/**
+ * One artefact to fetch before the entry point, and how big it is.
+ *
+ * The size comes from the build, and it is the file's own size rather than what the wire carries.
+ * That distinction is the whole reason this exists: a compressed response's `Content-Length` counts
+ * COMPRESSED bytes while a stream reader hands over DECOMPRESSED ones, so a bar that trusted the
+ * header was comparing two different units and reached 99% after the first few chunks. A build
+ * knows the real number; nothing at runtime does.
+ */
+export interface PreloadFile {
+  readonly url: string;
+  /** Uncompressed size in bytes. Omit only if the build genuinely does not know. */
+  readonly bytes?: number;
+}
+
+export type PreloadEntry = string | PreloadFile;
+
 export interface LauncherOptions {
   /**
    * The application's real entry point, as an origin-relative path.
@@ -63,7 +80,7 @@ export interface LauncherOptions {
    * which is the only way a percentage can mean anything. A percentage of the stub alone would go
    * 0 to 100 and then sit there while the real download happened.
    */
-  readonly preload?: readonly string[];
+  readonly preload?: readonly PreloadEntry[];
   readonly title?: string;
   /**
    * Extra markup inside the head.
@@ -204,15 +221,25 @@ function __race() {
 }
 ${
   (options.preload ?? []).length
-    ? `const __pre = ${JSON.stringify(options.preload)};
-let __got = 0, __want = 0;
+    ? `const __pre = ${JSON.stringify(
+        (options.preload ?? []).map((entry) =>
+          typeof entry === "string" ? { url: entry } : { url: entry.url, bytes: entry.bytes },
+        ),
+      )};
+// Known up front, from the build, so the first byte already moves a bar that means something.
+let __got = 0, __want = __pre.reduce((sum, f) => sum + (f.bytes || 0), 0);
 function __say(p) {
   document.querySelectorAll("[data-multipath-progress]").forEach((e) => { e.textContent = p + "%"; });
   window.dispatchEvent(new CustomEvent("multipath:progress", { detail: { percent: p, loaded: __got, total: __want } }));
 }
-function __drain(r) {
-  const length = Number(r.headers.get("content-length"));
-  if (length > 0) __want += length;
+function __drain(r, known) {
+  // Content-Length only when the build did not say and the response is not compressed: the header
+  // counts wire bytes, and what a reader hands over is decoded ones. Mixing the two makes a bar
+  // that leaps to 99 and then crawls.
+  if (!known && !r.headers.get("content-encoding")) {
+    const length = Number(r.headers.get("content-length"));
+    if (length > 0) __want += length;
+  }
   if (!r.body || !r.body.getReader) return r.blob().then(() => {});
   const reader = r.body.getReader();
   return (function pump() {
@@ -228,7 +255,11 @@ function __warm(base) {
   if (!__pre.length) return Promise.resolve();
   __say(0);
   return Promise.all(
-    __pre.map((p) => fetch(base + p, { credentials: "omit" }).then((r) => (r.ok ? __drain(r) : 0)).catch(() => {})),
+    __pre.map((f) =>
+      fetch(base + f.url, { credentials: "omit" })
+        .then((r) => (r.ok ? __drain(r, !!f.bytes) : 0))
+        .catch(() => {}),
+    ),
   ).then(() => {});
 }`
     : "function __warm() { return Promise.resolve(); }\nfunction __say() {}\n"
