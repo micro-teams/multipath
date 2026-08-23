@@ -2,7 +2,7 @@ name: multipath
 description: >-
   Transport resilience across redundant network paths: line registry, health and ranking, hedged
   reads, idempotent write failover, and stream line selection. No dependencies, no transport.
-version: 0.1.1
+version: 0.1.6
 repository: https://github.com/micro-teams/multipath
 issue_tracker: https://github.com/micro-teams/multipath/issues
 
