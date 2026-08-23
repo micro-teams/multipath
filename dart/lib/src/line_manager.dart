@@ -12,6 +12,7 @@
 library;
 
 import 'health.dart';
+import 'prober.dart';
 import 'registry.dart';
 import 'strategy.dart';
 
@@ -36,10 +37,28 @@ class LineManager {
     HealthOptions health = const HealthOptions(),
     this.strategy = const StrategyOptions(),
     this.onAttempt,
+    SendProbe? send,
+    ProberOptions probe = const ProberOptions(),
     DateTime Function()? now,
   })  : _registry = registry,
         health = HealthTable(health),
-        _now = now ?? DateTime.now;
+        _now = now ?? DateTime.now {
+    // Only if the consumer said how to send one. Without it the manager still works — it just ranks
+    // on configured weight, having measured nothing, which is what the Dart port did for everybody
+    // until now.
+    if (send != null) {
+      _prober = Prober(
+        lines: () => _registry.lines,
+        health: this.health,
+        send: send,
+        resolve: (path, line) => line.resolve(path),
+        options: probe,
+        now: _now,
+      );
+    }
+  }
+
+  Prober? _prober;
 
   Registry _registry;
   final HealthTable health;
@@ -57,6 +76,18 @@ class LineManager {
 
   /// The lines best-first.
   List<Line> get ranked => health.rank(_registry.lines);
+
+  /// Begin measuring the lines.
+  ///
+  /// Separate from construction because probing costs real requests, and a library that starts
+  /// making them the moment it is instantiated is one that surprises people. Until this is called
+  /// the manager still works — it just ranks on configured weight, having measured nothing.
+  void start() => _prober?.start();
+
+  void stop() => _prober?.stop();
+
+  /// Probe every line now and wait for the answers. The panel's refresh button.
+  Future<void> probeNow() async => _prober?.probeAll();
 
   /// Swaps the lines at runtime, forgetting health for lines that have gone.
   set registry(Registry next) {
@@ -103,6 +134,9 @@ class LineManager {
   /// keep sending over a line it has watched fail all morning.
   Attempt<T> _observed<T>(Attempt<T> attempt) {
     return (Line line, {required Future<void> cancelled}) async {
+      // The throughput probe downloads real bytes, so it must not run while the application is
+      // using the pipe — it would be measuring itself competing with the user.
+      _prober?.noteTraffic();
       final started = _now();
       try {
         final value = await attempt(line, cancelled: cancelled);
