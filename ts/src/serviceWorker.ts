@@ -45,6 +45,27 @@ export interface PrecacheOptions {
   readonly registry?: Registry;
   /** Prefixes that must always go to the network. Defaults to the MultiPath endpoints. */
   readonly networkOnly?: readonly string[];
+  /**
+   * Where the server says which build is deployed. Omit to skip the check entirely.
+   *
+   * Answered with either a bare version string or `{ "version": "…" }`, and it must be served
+   * WITHOUT caching — an answer to "what is deployed?" that came from a cache is an answer about
+   * the past, which is the one thing it must never be.
+   *
+   * This exists because a Service Worker is only replaced when its OWN bytes change. A deploy that
+   * ships new application files beside an unchanged worker is invisible: no update, no activate, no
+   * eviction, and every visitor keeps being served the build this worker cached. Nothing about that
+   * looks wrong from outside — the files are new, the site is up, the app is old. Consumers have
+   * lost days to it. With this set, the worker stops trusting its own version and asks.
+   */
+  readonly versionUrl?: string;
+  /**
+   * How often that question is worth asking. Defaults to a minute.
+   *
+   * Cheap but not free, so a consumer is expected to call `reconcile()` on activation and on
+   * navigations rather than on every request; this bounds the cost when they do it anyway.
+   */
+  readonly checkEveryMs?: number;
   readonly cachePrefix?: string;
   /** Injected in tests. */
   readonly fetch?: typeof globalThis.fetch;
@@ -72,6 +93,8 @@ export function createPrecache(options: PrecacheOptions) {
   const cacheStorage = options.caches ?? globalThis.caches;
   // Used for the install only: there is no caller to defer to at that point.
   const lines = options.registry?.lines ?? [];
+  const checkEveryMs = options.checkEveryMs ?? 60_000;
+  let lastChecked = 0;
 
   return {
     cacheName,
@@ -104,6 +127,51 @@ export function createPrecache(options: PrecacheOptions) {
           .filter((key) => key !== cacheName)
           .map((key) => cacheStorage.delete(key)),
       );
+    },
+
+    /**
+     * Ask the server which build is deployed, and throw this cache away if it is not this one.
+     *
+     * Returns whether it did — a consumer usually answers that by calling `registration.update()`,
+     * which is the thing that was supposed to happen by itself, and by telling its clients to
+     * reload.
+     *
+     * Blunt on purpose: being stale is precisely the state in which a cache is worth nothing, so
+     * there is no attempt to repair it entry by entry. Everything goes, and the next request for
+     * anything goes to the network.
+     *
+     * Silent on failure. Offline, a 404 from a deployment older than this feature, a body that is
+     * not what we expect — none of them are a reason to act, because none of them are evidence that
+     * what we hold is wrong.
+     */
+    async reconcile(now: number = Date.now()): Promise<boolean> {
+      if (!options.versionUrl) return false;
+      if (now - lastChecked < checkEveryMs) return false;
+      lastChecked = now;
+
+      let deployed: string | null = null;
+      try {
+        const response = await fetchImpl(options.versionUrl, { cache: "no-store" });
+        if (!response.ok) return false;
+        const body: unknown = await response.json();
+        deployed =
+          typeof body === "string"
+            ? body
+            : typeof (body as { version?: unknown })?.version === "string"
+              ? (body as { version: string }).version
+              : null;
+      } catch {
+        return false;
+      }
+
+      if (deployed === null || deployed === options.version) return false;
+
+      const prefix = options.cachePrefix ?? DEFAULTS.cachePrefix;
+      const keys = await cacheStorage.keys();
+      await Promise.all(
+        keys.filter((key) => key.startsWith(prefix)).map((key) => cacheStorage.delete(key)),
+      );
+      return true;
     },
 
     /**
