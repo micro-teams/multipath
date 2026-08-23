@@ -233,6 +233,8 @@ describe("the race and credentials", () => {
     });
     expect(html).toContain('const __version = "0.1.16-abc1234"');
     expect(html).toContain('fetch("/version", { cache: "no-store" })');
+    // The local half of the question: what were the caches on this machine filled for?
+    expect(html).toContain('localStorage.getItem(KEY)');
     // Everything cached under this origin belongs to the build being replaced.
     expect(html).toContain("caches.delete(name)");
     expect(html).toContain('["flutter.mt:cache:"]');
@@ -240,6 +242,14 @@ describe("the race and credentials", () => {
     expect(html).toContain("location.reload()");
     // One attempt per tab: a server that somehow disagrees forever must not become a reload loop.
     expect(html).toContain('sessionStorage.getItem("multipath:updating")');
+  });
+
+  it("asks locally even with no server to ask", () => {
+    // A cache filled by an older build is the case that actually breaks startup — new code against
+    // the previous build's engine — and noticing it needs no network at all.
+    const html = buildLauncher({ appEntry: "/app.js", version: "0.1.16-abc1234", registry });
+    expect(html).toContain('localStorage.getItem(KEY)');
+    expect(html).not.toContain("cache: \"no-store\"");
   });
 
   it("says nothing about versions when it was not given one", () => {

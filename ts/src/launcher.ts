@@ -329,31 +329,61 @@ __race()
  * The version check, emitted before anything else runs.
  *
  * It is first because everything after it is a decision made with cached material: which worker
- * answers, what it answers with, and what the application believes it already knows. Asking the
- * question afterwards would mean acting on the old build and correcting later, which is precisely
- * the half-updated state this exists to prevent.
+ * answers, what it answers with, and what the application believes it already knows. Asking
+ * afterwards would mean acting on the old build and correcting later, which is the half-updated
+ * state this exists to prevent.
  *
- * A failed check is silence, not an error: offline is the ordinary case, and a client that refused
- * to start because it could not confirm its version would be broken far more often than a stale one
- * would be wrong.
+ * There are two ways to be out of date and they need different questions. What is CACHED here may
+ * belong to an older build — asked locally, by remembering which version filled these caches, and
+ * it is the case that matters most because a fresh document with a stale engine does not start.
+ * And this DOCUMENT may itself be an old copy served while a newer build is deployed — which only
+ * the server can answer, on the one request of a page load that is never answered from a cache.
  *
- * The reload is guarded by a session key so that a server which somehow disagrees forever cannot
- * turn this into a loop — one attempt per tab, then it carries on with what it has.
+ * A failed check is silence, not an error: offline is ordinary, and a client that refused to start
+ * because it could not confirm its version would be broken far more often than a stale one is.
+ *
+ * The reload is guarded per tab, so a disagreement that somehow never resolves cannot become a
+ * loop — one attempt, then it carries on with what it has.
  */
 function versionGuard(options: LauncherOptions): string {
-  if (!options.version || !options.versionUrl) return "";
+  if (!options.version) return "";
   const prefixes = options.clearOnUpdate ?? [];
+  const askServer = options.versionUrl
+    ? `    if (!stale) {
+      // The other way to be out of date: this document is itself a cached copy, served while a
+      // newer build sits on the server. Only the server can answer that, and this is the one
+      // request in a page load that is never answered from a cache.
+      try {
+        const response = await fetch(${JSON.stringify(options.versionUrl)}, { cache: "no-store" });
+        if (response.ok) {
+          const deployed = (await response.text()).trim();
+          if (deployed && deployed !== __version) stale = deployed;
+        }
+      } catch (e) {
+        // Offline. Carrying on with what we have is exactly right.
+      }
+    }
+`
+    : "";
   return `const __version = ${JSON.stringify(options.version)};
 await (async function () {
+  const KEY = "multipath:version";
   try {
-    const response = await fetch(${JSON.stringify(options.versionUrl)}, { cache: "no-store" });
-    if (!response.ok) return;
-    const deployed = (await response.text()).trim();
-    if (!deployed || deployed === __version) return;
-    if (sessionStorage.getItem("multipath:updating") === deployed) return;
-    sessionStorage.setItem("multipath:updating", deployed);
-    console.warn("multipath: this is " + __version + ", the server has " + deployed + " — starting over");
-    // Everything cached under this origin belongs to the build that is being replaced.
+    // What the caches on this machine were filled for. A build change makes every one of them a
+    // copy of something that no longer exists — and mixing them with new code is the failure this
+    // guard exists to prevent: new application code running against the previous build's engine
+    // does not start, and nothing on screen says why.
+    let stale = null;
+    const held = localStorage.getItem(KEY);
+    if (held && held !== __version) stale = held;
+${askServer}    if (!stale) {
+      localStorage.setItem(KEY, __version);
+      return;
+    }
+    if (sessionStorage.getItem("multipath:updating") === __version + ">" + stale) return;
+    sessionStorage.setItem("multipath:updating", __version + ">" + stale);
+    console.warn("multipath: " + __version + " meeting " + stale + " — starting over");
+
     if (window.caches) {
       const names = await caches.keys();
       await Promise.all(names.map((name) => caches.delete(name)));
@@ -362,8 +392,9 @@ await (async function () {
     for (const key of Object.keys(localStorage)) {
       if (prefixes.some((p) => key.startsWith(p))) localStorage.removeItem(key);
     }
-    // The worker included: it is code from the old build, and it is the thing that would otherwise
-    // answer the reload from its own memory.
+    localStorage.setItem(KEY, __version);
+    // The worker included: it is code from the build being replaced, and it is what would answer
+    // the reload out of its own memory.
     if (navigator.serviceWorker) {
       const registrations = await navigator.serviceWorker.getRegistrations();
       await Promise.all(registrations.map((r) => r.unregister()));
@@ -371,7 +402,8 @@ await (async function () {
     location.reload();
     await new Promise(() => {});
   } catch (e) {
-    // Offline, or no /version on this deployment. Both are ordinary; carry on with what we have.
+    // A guard that throws would stop the application starting, which is strictly worse than the
+    // staleness it is guarding against.
   }
 })();
 `;

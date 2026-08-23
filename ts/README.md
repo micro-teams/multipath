@@ -198,13 +198,23 @@ buildLauncher({
 });
 ```
 
-When the two disagree, everything cached under the origin belongs to the build being replaced — the
-caches, the consumer's own remembered responses in local storage, and the worker that would
-otherwise answer the reload out of its own memory. All of it goes, and the page reloads once. Blunt
-on purpose: a half-updated client is the state that produces the failures nobody can reproduce.
+There are two ways to be out of date, and they need different questions.
 
-Failing to ask is silence rather than an error — offline is the ordinary case — and the reload is
-guarded per tab, so a server that somehow disagrees forever cannot turn this into a loop.
+What is **cached** here may belong to an older build. That is asked locally — the launcher remembers
+which version filled these caches — and it is the case that matters most: a fresh document running
+against the previous build's engine does not start, and nothing on screen says why. `versionUrl` is
+not needed for this half.
+
+This **document** may itself be an old copy, served while a newer build is deployed. Only the server
+can answer that, which is what `versionUrl` is for.
+
+Either way, everything cached under the origin belongs to the build being replaced — the caches, the
+consumer's own remembered responses in local storage, and the worker that would otherwise answer the
+reload out of its own memory. All of it goes and the page reloads once. Blunt on purpose: a
+half-updated client is the state that produces the failures nobody can reproduce.
+
+Failing to ask is silence rather than an error — offline is ordinary — and the reload is guarded per
+tab, so a disagreement that somehow never resolves cannot become a loop.
 
 `LineManager` can persist what it measures (`storage`), so the *second* visit onward starts from
 measurements rather than from the registry's fixed order. Racing settles the entry point on its own;
