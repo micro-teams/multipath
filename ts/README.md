@@ -153,10 +153,21 @@ bundle. `preload` names those files:
 ```ts
 buildLauncher({
   appEntry: "/flutter_bootstrap.js",
-  preload: ["/main.dart.js"],
+  preload: [
+    { url: "/main.dart.js", bytes: 3_700_000 },
+    { url: "/canvaskit/chromium/canvaskit.wasm", bytes: 5_400_000 },
+  ],
   // …
 });
 ```
+
+**Give the sizes.** They come from the build, and they are the files' own sizes rather than what the
+wire carries. That distinction is the whole point: a compressed response's `Content-Length` counts
+COMPRESSED bytes while a stream reader hands over DECOMPRESSED ones, so a bar that trusted the
+header was comparing two different units — it reached 99% after the first few chunks of a gzipped
+megabyte and then sat there. Told the real sizes, the total is known before anything arrives and the
+first byte moves a bar that means something. A bare string still works and falls back to
+`Content-Length`, but only for responses that are not compressed.
 
 They are fetched on the line that has just proved itself fastest, all at once, so they are warm in
 the HTTP cache by the time the application asks for them. And their bytes are what the progress
@@ -168,9 +179,42 @@ element, and dispatches `multipath:progress` on `window` with `{ percent, loaded
 a splash screen may be markup or may be a canvas. It stops at 99 until the application's module has
 actually been imported: a bar that reaches 100% and then waits is read as a hang.
 
-A file served without `Content-Length` contributes its bytes to what has arrived but nothing to the
-total, so it does not move the bar rather than making it lie. And a launcher that preloads nothing
-does not ship any of this code at all.
+A file whose size nobody could establish — no declared bytes, no usable `Content-Length` —
+contributes to what has arrived but nothing to the total, so it does not move the bar rather than
+making it lie. And a launcher that preloads nothing does not ship any of this code at all.
+
+### Knowing that it is out of date
+
+A cached client cannot answer "am I the build that is deployed?" on its own: every copy it holds is
+its own, and a copy has no way to notice that it is stale. So the version rides INSIDE the launcher
+and the server is asked for the current one on every start:
+
+```ts
+buildLauncher({
+  version: "0.1.16-abc1234",
+  versionUrl: "/version",
+  clearOnUpdate: ["flutter.mt:cache:"],
+  // …
+});
+```
+
+There are two ways to be out of date, and they need different questions.
+
+What is **cached** here may belong to an older build. That is asked locally — the launcher remembers
+which version filled these caches — and it is the case that matters most: a fresh document running
+against the previous build's engine does not start, and nothing on screen says why. `versionUrl` is
+not needed for this half.
+
+This **document** may itself be an old copy, served while a newer build is deployed. Only the server
+can answer that, which is what `versionUrl` is for.
+
+Either way, everything cached under the origin belongs to the build being replaced — the caches, the
+consumer's own remembered responses in local storage, and the worker that would otherwise answer the
+reload out of its own memory. All of it goes and the page reloads once. Blunt on purpose: a
+half-updated client is the state that produces the failures nobody can reproduce.
+
+Failing to ask is silence rather than an error — offline is ordinary — and the reload is guarded per
+tab, so a disagreement that somehow never resolves cannot become a loop.
 
 `LineManager` can persist what it measures (`storage`), so the *second* visit onward starts from
 measurements rather than from the registry's fixed order. Racing settles the entry point on its own;

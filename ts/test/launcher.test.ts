@@ -218,14 +218,92 @@ describe("the race and credentials", () => {
    * fetching what it actually runs on. Naming those files here puts them on the line that just
    * proved itself fastest, and makes them the bytes the percentage is a percentage of.
    */
+  /**
+   * A cached client cannot answer "am I the build that is deployed?" on its own — every copy it
+   * holds is its own, and a copy has no way to notice that it is stale. So the version rides inside
+   * the launcher and the server is asked on every start.
+   */
+  it("carries its own version and asks the server for the current one", () => {
+    const html = buildLauncher({
+      appEntry: "/flutter_bootstrap.js",
+      version: "0.1.16-abc1234",
+      versionUrl: "/version",
+      clearOnUpdate: ["flutter.mt:cache:"],
+      registry,
+    });
+    expect(html).toContain('const __version = "0.1.16-abc1234"');
+    expect(html).toContain('fetch("/version", { cache: "no-store" })');
+    // The local half of the question: what were the caches on this machine filled for?
+    expect(html).toContain("localStorage.getItem(KEY)");
+    // Everything cached under this origin belongs to the build being replaced.
+    expect(html).toContain("caches.delete(name)");
+    expect(html).toContain('["flutter.mt:cache:"]');
+    expect(html).toContain("r.unregister()");
+    expect(html).toContain("location.reload()");
+    // One attempt per tab: a server that somehow disagrees forever must not become a reload loop.
+    expect(html).toContain('sessionStorage.getItem("multipath:updating")');
+  });
+
+  it("asks locally even with no server to ask", () => {
+    // A cache filled by an older build is the case that actually breaks startup — new code against
+    // the previous build's engine — and noticing it needs no network at all.
+    const html = buildLauncher({ appEntry: "/app.js", version: "0.1.16-abc1234", registry });
+    expect(html).toContain("localStorage.getItem(KEY)");
+    expect(html).not.toContain('cache: "no-store"');
+  });
+
+  it("says nothing about versions when it was not given one", () => {
+    const html = buildLauncher({ appEntry: "/app.js", registry });
+    expect(html).not.toContain("__version");
+    expect(html).not.toContain("multipath:updating");
+  });
+
+  it("preloads only the alternative this browser will ask for", () => {
+    // A wasm engine with a variant per browser: preloading both wastes megabytes on every visit,
+    // and preloading the wrong one wastes them AND leaves the real one outside the progress bar.
+    const html = buildLauncher({
+      appEntry: "/flutter_bootstrap.js",
+      preload: [
+        { url: "/canvaskit/chromium/canvaskit.wasm", bytes: 5_400_000, when: "!!window.chrome" },
+        { url: "/canvaskit/canvaskit.wasm", bytes: 7_300_000, when: "!window.chrome" },
+      ],
+      registry,
+    });
+    expect(html).toContain('"when":"!!window.chrome"');
+    expect(html).toContain("__pre.filter((f) => !f.when || __cond(f.when))");
+  });
+
   it("warms the named artefacts on the winning line", () => {
     const html = buildLauncher({
       appEntry: "/flutter_bootstrap.js",
       preload: ["/main.dart.js"],
       registry,
     });
-    expect(html).toContain('["/main.dart.js"]');
+    expect(html).toContain('[{"url":"/main.dart.js"}]');
     expect(html).toContain("__warm(__base(urls[0]))");
+  });
+
+  /**
+   * A bar that means something from the first byte.
+   *
+   * The size has to come from the BUILD. A compressed response's Content-Length counts wire bytes
+   * while a stream reader hands over decoded ones, so a bar that trusted the header was comparing
+   * two different units: it reached 99% after the first few chunks of a gzipped megabyte and then
+   * sat there. Which is exactly what "the progress is always 0% or 100%" looks like from outside.
+   */
+  it("takes the sizes from the build, so the total is known before anything arrives", () => {
+    const html = buildLauncher({
+      appEntry: "/flutter_bootstrap.js",
+      preload: [
+        { url: "/main.dart.js", bytes: 3_700_000 },
+        { url: "/canvaskit/chromium/canvaskit.wasm", bytes: 5_400_000 },
+      ],
+      registry,
+    });
+    expect(html).toContain('{"url":"/main.dart.js","bytes":3700000}');
+    expect(html).toContain("__want_files.reduce((sum, f) => sum + (f.bytes || 0), 0)");
+    // And Content-Length is consulted only for the files the build could not measure.
+    expect(html).toContain('if (!known && !r.headers.get("content-encoding"))');
   });
 
   /**
