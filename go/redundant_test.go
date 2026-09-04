@@ -208,21 +208,30 @@ func TestFrameRoundTrip(t *testing.T) {
 	}, nil)
 	r := &frameReader{conn: bytes.NewReader(frames)}
 
-	typ, off, pl, _, err := r.next()
-	if err != nil || typ != frameData || off != 42 || !bytes.Equal(pl, payload) {
-		t.Fatalf("data: typ=%x off=%d eq=%v err=%v", typ, off, bytes.Equal(pl, payload), err)
+	f, err := r.next()
+	if err != nil || f.typ != frameData || f.offset != 42 || !bytes.Equal(f.payload, payload) {
+		t.Fatalf("data: typ=%x off=%d eq=%v err=%v", f.typ, f.offset, bytes.Equal(f.payload, payload), err)
 	}
-	typ, off, _, _, err = r.next()
-	if err != nil || typ != frameAck || off != 12345 {
-		t.Fatalf("ack: typ=%x off=%d err=%v", typ, off, err)
+	f, err = r.next()
+	if err != nil || f.typ != frameAck || f.offset != 12345 {
+		t.Fatalf("ack: typ=%x off=%d err=%v", f.typ, f.offset, err)
 	}
-	typ, _, _, nonce, err := r.next()
-	if err != nil || typ != framePing || nonce != 7 {
-		t.Fatalf("ping: typ=%x nonce=%d err=%v", typ, nonce, err)
+	f, err = r.next()
+	if err != nil || f.typ != framePing || f.nonce != 7 {
+		t.Fatalf("ping: typ=%x nonce=%d err=%v", f.typ, f.nonce, err)
 	}
-	typ, _, _, nonce, err = r.next()
-	if err != nil || typ != framePong || nonce != 7 {
-		t.Fatalf("pong: typ=%x nonce=%d err=%v", typ, nonce, err)
+	f, err = r.next()
+	if err != nil || f.typ != framePong || f.nonce != 7 {
+		t.Fatalf("pong: typ=%x nonce=%d err=%v", f.typ, f.nonce, err)
+	}
+}
+
+func TestHelloRoundTrip(t *testing.T) {
+	id := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	r := &frameReader{conn: bytes.NewReader(encodeHello(id, 3))}
+	f, err := r.next()
+	if err != nil || f.typ != frameHello || f.connID != id || f.linkIdx != 3 {
+		t.Fatalf("hello: %+v err=%v", f, err)
 	}
 }
 
@@ -230,7 +239,7 @@ func TestFrameRejectsCorruptCRC(t *testing.T) {
 	f := encodeData(0, []byte("hello world"))
 	f[len(f)-1] ^= 0xFF // corrupt the payload's last byte; CRC no longer matches
 	r := &frameReader{conn: bytes.NewReader(f)}
-	if _, _, _, _, err := r.next(); err != errCorruptFrame {
+	if _, err := r.next(); err != errCorruptFrame {
 		t.Fatalf("want errCorruptFrame, got %v", err)
 	}
 }
@@ -239,7 +248,7 @@ func TestFrameRejectsBadLength(t *testing.T) {
 	f := encodeData(0, []byte("x"))
 	binary.BigEndian.PutUint16(f[9:], uint16(maxSegment+1)) // impossible length
 	r := &frameReader{conn: bytes.NewReader(f)}
-	if _, _, _, _, err := r.next(); err != errCorruptFrame {
+	if _, err := r.next(); err != errCorruptFrame {
 		t.Fatalf("want errCorruptFrame for over-long len, got %v", err)
 	}
 }

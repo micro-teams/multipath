@@ -36,8 +36,10 @@ package multipath
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"io"
+	"net"
 	"sync"
 	"time"
 )
@@ -48,10 +50,11 @@ var errCorruptFrame = errors.New("multipath: corrupt frame")
 
 // Frame type tags.
 const (
-	frameData = 0x01
-	frameAck  = 0x02
-	framePing = 0x03
-	framePong = 0x04
+	frameData  = 0x01
+	frameAck   = 0x02
+	framePing  = 0x03
+	framePong  = 0x04
+	frameHello = 0x05
 )
 
 const (
@@ -85,6 +88,9 @@ type RedundantOptions struct {
 	// ReconnectDelay is the first reconnect backoff; it doubles per consecutive failure to MaxDelay.
 	ReconnectDelay time.Duration
 	MaxDelay       time.Duration
+	// ConnID identifies this logical stream to the server across all its links and reconnects. If
+	// left zero, DialRedundant generates a random one. Only the client (DialRedundant) uses it.
+	ConnID [16]byte
 }
 
 func (o *RedundantOptions) withDefaults() {
@@ -118,6 +124,9 @@ type RedundantStream struct {
 	opt    RedundantOptions
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	client bool     // true if this end dials + reconnects; false if it accepts links (server)
+	connID [16]byte // identifies this logical stream across its links (set by the client)
 
 	mu       sync.Mutex
 	readable *sync.Cond // signalled when delivered bytes are available or the stream closes
@@ -161,11 +170,16 @@ func DialRedundant(ctx context.Context, opt RedundantOptions) (*RedundantStream,
 	if opt.N <= 0 || opt.Dial == nil {
 		return nil, errors.New("multipath: RedundantOptions needs N>0 and Dial")
 	}
+	if opt.ConnID == ([16]byte{}) {
+		_, _ = rand.Read(opt.ConnID[:])
+	}
 	sctx, cancel := context.WithCancel(context.Background())
 	s := &RedundantStream{
 		opt:      opt,
 		ctx:      sctx,
 		cancel:   cancel,
+		client:   true,
+		connID:   opt.ConnID,
 		links:    make([]*redundantLink, opt.N),
 		reasm:    make(map[uint64][]byte),
 		lastSeen: make([]time.Time, opt.N),
@@ -210,8 +224,125 @@ func DialRedundant(ctx context.Context, opt RedundantOptions) (*RedundantStream,
 	return s, nil
 }
 
-// connectLink dials link i and, on success, installs it and starts its reader. firstTry controls
-// whether a single failed dial returns immediately (startup) or keeps retrying (reconnect).
+// newServerStream builds the accept-side end of a redundant stream (it never dials; links are
+// attached by the acceptor as they arrive) and starts its keepalive and ACK loops.
+func newServerStream(opt RedundantOptions, connID [16]byte) *RedundantStream {
+	opt.withDefaults()
+	sctx, cancel := context.WithCancel(context.Background())
+	s := &RedundantStream{
+		opt:      opt,
+		ctx:      sctx,
+		cancel:   cancel,
+		client:   false,
+		connID:   connID,
+		links:    make([]*redundantLink, opt.N),
+		reasm:    make(map[uint64][]byte),
+		lastSeen: make([]time.Time, opt.N),
+	}
+	now := time.Now()
+	for i := range s.lastSeen {
+		s.lastSeen[i] = now
+	}
+	s.readable = sync.NewCond(&s.mu)
+	s.writable = sync.NewCond(&s.mu)
+	go s.keepaliveLoop()
+	go s.ackLoop()
+	return s
+}
+
+// Acceptor accepts raw links off a net.Listener and groups them by connID into server-side
+// RedundantStreams. A new connID yields a new stream delivered on Accept; a reconnecting link of a
+// known connID re-attaches to the existing stream.
+type Acceptor struct {
+	ln      net.Listener
+	opt     RedundantOptions
+	handOff chan *RedundantStream
+
+	mu      sync.Mutex
+	streams map[[16]byte]*RedundantStream
+}
+
+// Listen starts accepting redundant links on ln. Each logical connection is surfaced once via
+// Accept; its N links attach underneath it as they arrive and reconnect.
+func Listen(ln net.Listener, opt RedundantOptions) *Acceptor {
+	opt.withDefaults()
+	a := &Acceptor{
+		ln:      ln,
+		opt:     opt,
+		handOff: make(chan *RedundantStream, 16),
+		streams: make(map[[16]byte]*RedundantStream),
+	}
+	go a.loop()
+	return a
+}
+
+func (a *Acceptor) loop() {
+	for {
+		c, err := a.ln.Accept()
+		if err != nil {
+			return
+		}
+		go a.onLink(c)
+	}
+}
+
+// onLink reads the HELLO off a freshly accepted link and attaches it to the right logical stream.
+func (a *Acceptor) onLink(c net.Conn) {
+	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	r := &frameReader{conn: c}
+	f, err := r.next()
+	if err != nil || f.typ != frameHello {
+		_ = c.Close()
+		return
+	}
+	_ = c.SetReadDeadline(time.Time{})
+	idx := int(f.linkIdx)
+	if idx < 0 || idx >= a.opt.N {
+		_ = c.Close()
+		return
+	}
+	a.mu.Lock()
+	s, known := a.streams[f.connID]
+	if !known {
+		s = newServerStream(a.opt, f.connID)
+		a.streams[f.connID] = s
+	}
+	a.mu.Unlock()
+	if !known {
+		select {
+		case a.handOff <- s:
+		default:
+			// Nobody is accepting; drop the whole logical stream rather than leak it.
+			a.mu.Lock()
+			delete(a.streams, f.connID)
+			a.mu.Unlock()
+			s.Close()
+			_ = c.Close()
+			return
+		}
+	}
+	if !s.attachLink(idx, c) {
+		// Stream was closed; forget it so a later connID re-use starts fresh.
+		a.mu.Lock()
+		delete(a.streams, f.connID)
+		a.mu.Unlock()
+	}
+}
+
+// Accept returns the next new logical stream. It blocks until one arrives or the acceptor closes.
+func (a *Acceptor) Accept() (*RedundantStream, error) {
+	s, ok := <-a.handOff
+	if !ok {
+		return nil, ErrStreamClosed
+	}
+	return s, nil
+}
+
+// Close stops accepting new links. In-flight streams are unaffected.
+func (a *Acceptor) Close() error { return a.ln.Close() }
+
+// connectLink dials link i and, on success, sends HELLO then installs it. firstTry controls whether
+// a single failed dial returns immediately (startup) or keeps retrying (reconnect). Client-only.
 func (s *RedundantStream) connectLink(dialCtx context.Context, i int, firstTry bool) bool {
 	delay := s.opt.ReconnectDelay
 	for {
@@ -220,25 +351,16 @@ func (s *RedundantStream) connectLink(dialCtx context.Context, i int, firstTry b
 		}
 		conn, err := s.opt.Dial(dialCtx, i)
 		if err == nil {
-			l := &redundantLink{conn: conn}
-			s.mu.Lock()
-			if s.closed {
-				s.mu.Unlock()
+			// HELLO first so the server can group this link (and a reconnect re-attaches).
+			if _, werr := conn.Write(encodeHello(s.connID, uint16(i))); werr != nil {
 				_ = conn.Close()
+			} else if s.attachLink(i, conn) {
+				return true
+			}
+			// attach failed because the stream is closing.
+			if s.isClosed() {
 				return false
 			}
-			s.links[i] = l
-			// Replay everything still unacknowledged onto the fresh link so a reconnect resumes
-			// without a gap; the peer de-duplicates by offset.
-			replay := s.snapshotUnackedLocked()
-			s.mu.Unlock()
-			for _, f := range replay {
-				if l.write(f) != nil {
-					break
-				}
-			}
-			go s.readLoop(i, l)
-			return true
 		}
 		if firstTry {
 			return false
@@ -257,6 +379,34 @@ func (s *RedundantStream) connectLink(dialCtx context.Context, i int, firstTry b
 	}
 }
 
+// attachLink installs conn as link i, replays the unacknowledged send buffer onto it (so a fresh or
+// reconnected link resumes without a gap — the peer de-duplicates by offset), and starts its reader.
+// Used by the client after HELLO and by the server after reading a HELLO. Returns false if the
+// stream is already closed.
+func (s *RedundantStream) attachLink(i int, conn io.ReadWriteCloser) bool {
+	l := &redundantLink{conn: conn}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_ = conn.Close()
+		return false
+	}
+	if old := s.links[i]; old != nil {
+		_ = old.conn.Close() // a stale link in this slot is superseded
+	}
+	s.links[i] = l
+	s.lastSeen[i] = time.Now()
+	replay := s.snapshotUnackedLocked()
+	s.mu.Unlock()
+	for _, f := range replay {
+		if l.write(f) != nil {
+			break
+		}
+	}
+	go s.readLoop(i, l)
+	return true
+}
+
 // snapshotUnackedLocked returns DATA frames covering the whole current send buffer, for replay onto
 // a freshly (re)connected link. Caller holds mu.
 func (s *RedundantStream) snapshotUnackedLocked() [][]byte {
@@ -272,36 +422,40 @@ func (s *RedundantStream) snapshotUnackedLocked() [][]byte {
 	return frames
 }
 
-// readLoop parses frames off one link until it errors or the link is reaped, then triggers reconnect.
+// readLoop parses frames off one link until it errors or the link is reaped. On the client a dropped
+// link is reconnected here; on the server it is simply dropped and the slot waits for the client to
+// reconnect it (the listener re-attaches the new link).
 func (s *RedundantStream) readLoop(i int, l *redundantLink) {
 	r := &frameReader{conn: l.conn}
 	for {
-		typ, off, payload, nonce, err := r.next()
+		f, err := r.next()
 		if err != nil {
 			break
 		}
-		switch typ {
+		switch f.typ {
 		case frameData:
-			s.onData(off, payload)
+			s.onData(f.offset, f.payload)
 		case frameAck:
-			s.onAck(off) // for ACK, off carries the cumulative value
+			s.onAck(f.offset)
 		case framePing:
-			_ = l.write(encodePong(nonce))
-			s.touch(i)
+			_ = l.write(encodePong(f.nonce))
 		case framePong:
-			s.touch(i)
+			// liveness only
+		case frameHello:
+			// A server reads HELLO in the listener before attaching; a stray HELLO here is ignored.
 		}
 		s.touch(i)
 	}
-	// Link i died. Drop it and, unless the stream is closing, reconnect in the background.
+	// Link i died. Drop it; the client reconnects, the server waits for re-accept.
 	s.mu.Lock()
 	if s.links[i] == l {
 		s.links[i] = nil
 	}
 	closing := s.closed
+	client := s.client
 	s.mu.Unlock()
 	_ = l.conn.Close()
-	if !closing {
+	if !closing && client {
 		go s.connectLink(s.ctx, i, false)
 	}
 }
