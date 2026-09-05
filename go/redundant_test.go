@@ -287,6 +287,24 @@ func TestE2EClean(t *testing.T) {
 	}
 }
 
+// readExactly reads n bytes (or until error) without touching *testing.T, so it is safe to call
+// from a goroutine; the caller asserts on the main goroutine.
+func readExactly(s *RedundantStream, n int) []byte {
+	out := make([]byte, 0, n)
+	buf := make([]byte, 64*1024)
+	deadline := time.Now().Add(10 * time.Second)
+	for len(out) < n && time.Now().Before(deadline) {
+		m, err := s.Read(buf)
+		if m > 0 {
+			out = append(out, buf[:m]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+	return out
+}
+
 func TestE2EBothDirections(t *testing.T) {
 	f := newFabric(3)
 	cli, srv := pair(t, f)
@@ -294,19 +312,18 @@ func TestE2EBothDirections(t *testing.T) {
 	defer srv.Close()
 	a := randBytes(256 << 10)
 	b := randBytes(256 << 10)
-	var gotA, gotB []byte
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); _, _ = cli.Write(a) }()
-	go func() { defer wg.Done(); _, _ = srv.Write(b) }()
-	go func() { gotB = recvN(t, cli, len(b)) }()
-	gotA = recvN(t, srv, len(a))
-	wg.Wait()
-	// give the reverse direction a moment if needed
+	go func() { _, _ = cli.Write(a) }()
+	go func() { _, _ = srv.Write(b) }()
+	gotBCh := make(chan []byte, 1)
+	go func() { gotBCh <- readExactly(cli, len(b)) }()
+	gotA := recvN(t, srv, len(a))
+	gotB := <-gotBCh
 	if !bytes.Equal(gotA, a) {
 		t.Fatalf("cli->srv mismatch")
 	}
-	_ = gotB
+	if !bytes.Equal(gotB, b) {
+		t.Fatalf("srv->cli mismatch")
+	}
 }
 
 func TestE2ELinkDropMidStream(t *testing.T) {
