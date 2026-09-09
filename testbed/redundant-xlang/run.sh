@@ -19,4 +19,4 @@ export MP_JVM_CP="$jvm/target/classes:$(cat "$cp_file")"
 rm -f "$cp_file"
 
 echo "==> running cross-language e2e (Java server + Go client + fault middlebox)"
-( cd "$go_dir" && go test -run TestXLangJavaServerGoClient -count=1 -v -timeout 180s )
+( cd "$go_dir" && go test -run TestXLang -count=1 -v -timeout 180s )
