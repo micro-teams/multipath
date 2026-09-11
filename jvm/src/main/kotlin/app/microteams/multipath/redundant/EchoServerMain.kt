@@ -25,7 +25,12 @@ object EchoServerMain {
             )
         val mux = args.size > 2 && args[2] == "mux"
         val serverSocket = ServerSocket(port)
-        val server = RedundantServer(serverSocket, opt)
+        // Sniff each link so a browser client's WebSocket links are accepted alongside plaintext
+        // ones (the Go xlang tests dial plaintext; the TS xlang tests dial ws).
+        val server =
+            RedundantServer(serverSocket, opt) {
+                app.microteams.multipath.decapLink(it, null, "/mt/link")
+            }
         println("LISTENING ${serverSocket.localPort}")
         System.out.flush()
         val stream = server.accept()
