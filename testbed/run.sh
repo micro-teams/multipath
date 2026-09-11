@@ -26,5 +26,9 @@ cp_file="$(mktemp)"
 export MP_JVM_CP="$jvm/target/classes:$(cat "$cp_file")"
 rm -f "$cp_file"
 
-echo "==> running the cross-language substrate e2e (Go clients, JVM origin, fault middlebox)"
+echo "==> running the Go cross-language substrate e2e (Go client, JVM origin, fault middlebox)"
 (cd "$go_dir" && go test -run TestXLang -count=1 -v -timeout 240s)
+
+echo "==> running the TypeScript cross-language e2e (browser client over WebSocket links, JVM origin)"
+ts_dir="$repo/ts"
+(cd "$ts_dir" && npm ci --silent && npm run build --silent && npx vitest run xlang)

@@ -4,3 +4,4 @@ export * from './link.js';
 export * from './redundant.js';
 export * from './mux.js';
 export * from './client.js';
+export * from './serviceWorker.js';

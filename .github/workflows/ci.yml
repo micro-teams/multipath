@@ -13,11 +13,11 @@ on:
 # parallel, and publishing hangs off the same run rather than off a second workflow that could
 # disagree with it about whether the code was any good.
 #
-#   go / jvm   check each package on its own, because each is released on its own
-#   e2e        the whole substrate over the wire: a real JVM origin, a Go client, and a per-link
-#              fault middlebox cutting links underneath — the job that decides whether MultiPath
-#              works, as opposed to whether it compiles
-#   publish-*  only after all three are green
+#   go / jvm / ts   check each package on its own, because each is released on its own
+#   e2e             the whole substrate over the wire: a real JVM origin, the Go and browser clients,
+#                   and a per-link fault middlebox cutting links underneath — the job that decides
+#                   whether MultiPath works, as opposed to whether it compiles
+#   publish-*       only after all four are green
 #
 # Nothing here depends on anything outside this repository: no consumer application, no database,
 # no external service.
@@ -44,6 +44,25 @@ jobs:
       # data race there would surface as an occasional lost byte, the kind of bug blamed on the
       # network for weeks. The cross-language legs are skipped here (no JVM classpath) and run in e2e.
       - run: go test -race -skip XLang ./...
+
+  ts:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ts
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: ts/package-lock.json
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run build
+      # The cross-language legs skip here (no JVM classpath) and run in e2e; this is the unit level.
+      - run: npm test
 
   jvm:
     runs-on: ubuntu-latest
@@ -87,6 +106,11 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go/go.mod
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: ts/package-lock.json
       - name: Build the origin and run the cross-language substrate e2e
         run: ./testbed/run.sh
 
@@ -98,15 +122,22 @@ jobs:
   #   a v* tag        ->  an immutable release
   #
   # Go needs no publishing step at all: `go get github.com/micro-teams/multipath/go@<ref>` resolves
-  # straight from the commit. So only the JVM package is pushed to a registry.
+  # straight from the commit. The JVM (Maven) and browser (npm) packages are pushed to registries.
   # ---------------------------------------------------------------------------------------------
 
   publish-branch:
-    needs: [go, jvm, e2e]
+    needs: [go, jvm, ts, e2e]
     if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: ts/package-lock.json
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@micro-teams"
       - uses: actions/setup-java@v5
         with:
           java-version: "21"
@@ -120,6 +151,21 @@ jobs:
       - name: Derive the branch label
         id: label
         run: echo "value=$(echo '${{ github.ref_name }}' | tr '/_' '--' | tr -cd '[:alnum:]-')" >> "$GITHUB_OUTPUT"
+
+      # npm refuses to replace a version, so a branch build gets a unique prerelease number and the
+      # *dist-tag* is the moving pointer: install @micro-teams/multipath@<branch> for the newest.
+      - name: Publish the browser package
+        working-directory: ts
+        run: |
+          set -euo pipefail
+          base="$(node -p "require('./package.json').version")"
+          version="${base}-${{ steps.label.outputs.value }}.${{ github.run_number }}"
+          npm ci
+          npm run build
+          npm version "$version" --no-git-tag-version
+          npm publish --tag "${{ steps.label.outputs.value }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # A -SNAPSHOT version is expected to be replaced, and resolvers re-check it, so the branch
       # label goes in the version and the snapshot suffix does the rest — no per-run number, no
@@ -141,11 +187,18 @@ jobs:
         run: echo 'go get github.com/micro-teams/multipath/go@${{ github.ref_name }}'
 
   publish-release:
-    needs: [go, jvm, e2e]
+    needs: [go, jvm, ts, e2e]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: ts/package-lock.json
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@micro-teams"
       - uses: actions/setup-java@v5
         with:
           java-version: "21"
@@ -156,13 +209,25 @@ jobs:
           server-username: MAVEN_USERNAME
           server-password: MAVEN_PASSWORD
 
-      # A tag that disagrees with the committed version would publish a release nobody asked for.
-      - name: Check the tag matches the committed version
+      # A tag that disagrees with either committed version would publish a release nobody asked for,
+      # and an npm version cannot be replaced once taken — so this comes before any publish.
+      - name: Check the tag matches both committed versions
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
           pom="$(cd jvm && ./mvnw -q -B help:evaluate -Dexpression=project.version -DforceStdout)"
+          pkg="$(node -p "require('./ts/package.json').version")"
           [[ "$tag" == "$pom" ]] || { echo "tag $tag != jvm/pom.xml $pom" >&2; exit 1; }
+          [[ "$tag" == "$pkg" ]] || { echo "tag $tag != ts/package.json $pkg" >&2; exit 1; }
+
+      - name: Publish the browser package
+        working-directory: ts
+        run: |
+          npm ci
+          npm run build
+          npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish the JVM package
         working-directory: jvm
