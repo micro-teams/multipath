@@ -1,62 +1,48 @@
 # MultiPath testbed
 
-A complete, self-contained deployment of MultiPath with **no business logic in it at all**, so that
-the library can be proven end to end — real browser, real separate network paths, real single
-backend — without depending on any consumer.
+A complete, self-contained end-to-end for MultiPath with **no business logic in it at all**, so the
+library is proven over the wire — a real origin, a real client, real links being cut underneath —
+without depending on any consumer.
 
-That independence is the point. Verifying MultiPath by installing it into MicroTeams would make
-MicroTeams' test suite the judge of MultiPath's correctness, and would leave MultiPath unable to
-test the situations that matter most: two lines delivering the same write *at the same instant*,
-a line that answers slowly, a line that dies mid-request. Those are trivial to stage here and
-nearly impossible to stage against a real deployment.
+That independence is the point. Verifying MultiPath by installing it into a consumer would make that
+consumer's test suite the judge of MultiPath's correctness, and would leave MultiPath unable to
+stage the situations that matter most: the same bytes arriving over two links at once, a link that
+goes silent, a link that dies mid-stream. Those are trivial here and nearly impossible against a
+real deployment.
 
 ```
-                    ┌── line-fast  :9001 ── delay   0ms ──┐
-browser ── web :8000├── line-slow  :9002 ── delay 400ms ──┼──→ server :8080  (ONE instance)
-                    └── line-flaky :9003 ── fails 1 in 2 ─┘
+                 ┌── middlebox ─ cut ──┐
+Go client ───────┼── middlebox ─ cut ──┼──→  JVM origin  (one process)
+   (Dial once,   └── middlebox ─ cut ──┘         demux → splice:
+    N links)                                       normal → local app
+                                                   tunnel → target
 ```
 
-Every line is a separate origin as far as the browser is concerned, and every line forwards to the
-**same single server process** — which is precisely the assumption the whole design rests on, so
-the testbed would be lying if it did anything else.
+Each link is a separate path to the **same single origin process** — the assumption the whole design
+rests on — and each is fronted by its own fault middlebox that black-holes, one-directionally cuts,
+and hard-disconnects it on a random schedule. The substrate has to deliver correctly anyway.
 
 ## Parts
 
 | | |
 |---|---|
-| `server/` | A tiny Spring Boot app using the `jvm/` starter. A probe, a line registry, a counting write, an adjustable-latency read. Nothing else. |
-| `lines/` | A dependency-free Node proxy, one process per line, with configurable added latency, failure rate and hard stalls. This is what makes adverse timing reproducible. |
-| `web/` | A static page that drives the built `ts/` package in a real browser. |
-| `e2e/` | Playwright specs: the assertions that actually decide whether MultiPath works. |
-| `dart/` | The same questions asked of the Dart client, over real sockets rather than a browser. |
+| origin | `app.microteams.multipath` (the `jvm/` package), run from `OriginMain`: accepts redundant streams, demuxes, reads the one-line header, splices a normal stream to a local app and a tunnel to its target. |
+| client | The Go `Client` (`go/`): `Dial` once over all links, then `OpenTunnel` / `RoundTrip`. The connector's language; the browser clients join the same origin and scenario when they land. |
+| middlebox | One fault-injecting per-link TCP cutter (in the Go test package), the single implementation every client routes through. |
+| scenario | One flow each client drives: open a tunnel and echo bytes, open a normal stream and round-trip HTTP. |
 
 ## Run it locally
 
 ```sh
-npm --prefix testbed/e2e install
-testbed/run.sh          # builds everything, starts server + lines + web, waits for health
-testbed/run.sh --e2e    # …and then runs the Playwright specs against it
+testbed/run.sh    # build the origin + classpath, then run the cross-language e2e through the middlebox
 ```
 
-## Two clients, one deployment
+It runs as ordinary processes — no containers. The cross-language legs are gated on `MP_JVM_CP`,
+which `run.sh` builds from the JVM classpath; the same script is what CI's `e2e` job runs.
 
-`e2e/` drives `ts/` in a real browser; `testbed/dart/bin/e2e.dart` drives `dart/` as a plain
-program. They run against the *same* lines and the same origin, which is the point: the two
-packages are meant to mean the same thing by "a line", and the cheapest way for that to stop being
-true is for each to be tested only against its own fixtures.
+## Why cross-language, and why through faults
 
-The Dart leg is a program rather than a test file because it asserts against a deployment that has
-to be up — a test that silently passes when nothing is listening is worse than no test. It also
-proves one thing no unit suite on either side can: that the Dart client's idempotency header and
-the JVM filter's agree, since the write is counted at the origin.
-
-`run.sh --e2e` runs both. Without a `dart` on PATH it says so and skips that leg, because the other
-three packages must stay runnable on a machine with no Dart SDK; CI installs one, so there the leg
-is a gate rather than a courtesy.
-
-## The counting write is the whole trick
-
-`POST /mt/echo` takes an `op` and increments a counter for it. A test can then send the same `op`
-down two lines simultaneously and assert the counter reads **1**. There is no cleverness in the
-endpoint and no de-duplication in it either — any de-duplication observed is MultiPath's, which is
-what makes the assertion mean something.
+Compiling the Go and JVM halves proves nothing about whether they agree on the wire. The e2e drives
+a real Go client against a real JVM origin so the redundant frames, the mux, and the L5 header must
+agree byte for byte — and it does so *through the middlebox*, so "works" means "works while links are
+being cut", which is the only claim the redundant primitive exists to make.
