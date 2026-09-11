@@ -1,0 +1,75 @@
+import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
+import { describe, expect, it } from 'vitest';
+import { Client } from '../src/client.js';
+
+// Cross-language proof for the whole browser client: the TypeScript Client (global WebSocket standing
+// in for the browser's) against a real JVM Origin, driving both routed paths — a tunnel spliced to an
+// echo and a normal HTTP exchange spliced to a greeter. Skipped unless MP_JVM_CP is set.
+const cp = process.env.MP_JVM_CP;
+const maybe = cp ? it : it.skip;
+
+async function startOrigin(n: number): Promise<{ port: number; kill: () => void }> {
+  const proc = spawn('java', ['-cp', cp!, 'app.microteams.multipath.OriginMain', String(n)]);
+  proc.stderr.pipe(process.stderr);
+  const rl = createInterface({ input: proc.stdout });
+  const port = await new Promise<number>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error('java origin did not report LISTENING')),
+      30000,
+    );
+    rl.on('line', (line) => {
+      const m = /^LISTENING (\d+)/.exec(line);
+      if (m) {
+        clearTimeout(timer);
+        resolve(Number(m[1]));
+      }
+    });
+  });
+  return { port, kill: () => proc.kill() };
+}
+
+const fast = {
+  pingIntervalMs: 20,
+  deadAfterMs: 2000,
+  ackIntervalMs: 8,
+  reconnectDelayMs: 20,
+  maxDelayMs: 200,
+};
+
+describe('browser client cross-language', () => {
+  maybe(
+    'tunnels and round-trips HTTP through a JVM origin over WebSocket links',
+    async () => {
+      const n = 3;
+      const origin = await startOrigin(n);
+      try {
+        const lines = Array.from({ length: n }, () => `ws://127.0.0.1:${origin.port}`);
+        const client = await Client.dial(lines, fast);
+
+        // Tunnel: write, half-close, read the echo back to EOF.
+        const st = client.openTunnel('echo:0', new TextEncoder().encode('ticket'));
+        const msg = new Uint8Array(20 * 1024).map((_, i) => (i * 7 + 3) & 0xff);
+        await st.write(msg);
+        st.closeWrite();
+        const echoed: number[] = [];
+        for (;;) {
+          const chunk = await st.read();
+          if (chunk === null) break;
+          echoed.push(...chunk);
+        }
+        expect(Uint8Array.from(echoed)).toEqual(msg);
+
+        // Normal: an HTTP round trip to the origin's own greeter.
+        const resp = await client.fetch(new Request('http://origin/xlang'));
+        expect(resp.status).toBe(200);
+        expect(await resp.text()).toBe('hello /xlang');
+
+        client.close();
+      } finally {
+        origin.kill();
+      }
+    },
+    40000,
+  );
+});
