@@ -53,11 +53,18 @@ func TestXLangSubstrateGoClientJavaOrigin(t *testing.T) {
 
 	// One fault middlebox per link, each fronting the Java origin; the client reaches the origin
 	// only through them, so every byte crosses a link that is being cut on a random schedule.
+	// Mixed encapsulation into one redundant stream: even links plaintext, odd links WebSocket, so
+	// one run exercises both of the origin's decapsulation paths and proves a redundant stream can
+	// aggregate links of different transports.
 	lines := make([]Line, n)
 	for i := 0; i < n; i++ {
 		box := newMiddlebox(t, "127.0.0.1:"+originPort, int64(6000+i))
 		t.Cleanup(box.close)
-		lines[i] = Line{ID: "l" + strconv.Itoa(i), URL: "http://" + box.addr(), Transport: string(TransportTCP)}
+		transport := TransportTCP
+		if i%2 == 1 {
+			transport = TransportWS
+		}
+		lines[i] = Line{ID: "l" + strconv.Itoa(i), URL: "http://" + box.addr(), Transport: string(transport)}
 	}
 
 	c, err := Dial(t.Context(), ClientOptions{

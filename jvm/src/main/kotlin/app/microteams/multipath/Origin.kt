@@ -32,9 +32,15 @@ fun interface Route {
 /**
  * The origin server: accept redundant streams and serve each client's streams through a [Route].
  */
-class Origin(private val serverSocket: ServerSocket, private val opt: RedundantOptions) :
-    Closeable {
-    private val server = RedundantServer(serverSocket, opt)
+class Origin(
+    private val serverSocket: ServerSocket,
+    private val opt: RedundantOptions,
+    // Terminates raw-TLS (direct) links; null accepts only plaintext / CDN-fronted links — enough
+    // for a testbed, not for a public origin. WebSocket (CDN) and plaintext links need no config.
+    sslContext: javax.net.ssl.SSLContext? = null,
+    linkPath: String = "/mt/link",
+) : Closeable {
+    private val server = RedundantServer(serverSocket, opt) { decapLink(it, sslContext, linkPath) }
 
     /** The bound port, useful when the server was opened on port 0. */
     val port: Int
