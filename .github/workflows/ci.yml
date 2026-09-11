@@ -13,11 +13,11 @@ on:
 # parallel, and publishing hangs off the same run rather than off a second workflow that could
 # disagree with it about whether the code was any good.
 #
-#   go / jvm / ts   check each package on its own, because each is released on its own
-#   e2e             the whole substrate over the wire: a real JVM origin, the Go and browser clients,
-#                   and a per-link fault middlebox cutting links underneath — the job that decides
-#                   whether MultiPath works, as opposed to whether it compiles
-#   publish-*       only after all four are green
+#   go / ts / dart / jvm   check each package on its own, because each is released on its own
+#   e2e                     the whole substrate over the wire: a real JVM origin, every client (Go,
+#                           browser, Dart), and a per-link fault middlebox cutting links underneath —
+#                           the job that decides whether MultiPath works, not just whether it compiles
+#   publish-*               only after all five are green
 #
 # Nothing here depends on anything outside this repository: no consumer application, no database,
 # no external service.
@@ -63,6 +63,22 @@ jobs:
       - run: npm run build
       # The cross-language legs skip here (no JVM classpath) and run in e2e; this is the unit level.
       - run: npm test
+
+  dart:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dart
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - run: dart pub get
+      - run: dart format --output=none --set-exit-if-changed .
+      - run: dart analyze --fatal-infos
+      # The cross-language leg skips without a JVM classpath and runs in e2e; this is the unit level.
+      - run: dart test test/codecs_test.dart
 
   jvm:
     runs-on: ubuntu-latest
@@ -111,6 +127,9 @@ jobs:
           node-version: "22"
           cache: "npm"
           cache-dependency-path: ts/package-lock.json
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
       - name: Build the origin and run the cross-language substrate e2e
         run: ./testbed/run.sh
 
@@ -126,7 +145,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------
 
   publish-branch:
-    needs: [go, jvm, ts, e2e]
+    needs: [go, ts, dart, jvm, e2e]
     if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -187,7 +206,7 @@ jobs:
         run: echo 'go get github.com/micro-teams/multipath/go@${{ github.ref_name }}'
 
   publish-release:
-    needs: [go, jvm, ts, e2e]
+    needs: [go, ts, dart, jvm, e2e]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:

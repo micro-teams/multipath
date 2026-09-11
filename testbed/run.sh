@@ -32,3 +32,11 @@ echo "==> running the Go cross-language substrate e2e (Go client, JVM origin, fa
 echo "==> running the TypeScript cross-language e2e (browser client over WebSocket links, JVM origin)"
 ts_dir="$repo/ts"
 (cd "$ts_dir" && npm ci --silent && npm run build --silent && npx vitest run xlang)
+
+echo "==> running the Dart cross-language e2e (Dart client over WebSocket links, JVM origin)"
+dart_dir="$repo/dart"
+if command -v dart >/dev/null 2>&1; then
+  (cd "$dart_dir" && dart pub get >/dev/null && dart test test/client_xlang_test.dart)
+else
+  echo "  no dart on PATH — skipping the Dart leg (CI installs one)"
+fi

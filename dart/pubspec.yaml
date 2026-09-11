@@ -1,0 +1,8 @@
+name: multipath
+description: Redundant multi-path transport for Dart and Flutter — one reliable, multiplexed byte stream over many network paths to one origin.
+version: 0.2.0
+publish_to: none
+environment:
+  sdk: ^3.5.0
+dev_dependencies:
+  test: ^1.25.0
