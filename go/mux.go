@@ -320,6 +320,19 @@ func (st *MuxStream) remoteFin() {
 	st.remoteEOF = true
 	st.readable.Broadcast()
 	st.mu.Unlock()
+	st.cleanupIfClosed()
+}
+
+// cleanupIfClosed frees a stream's slot once both sides have half-closed. A cleanly finished stream
+// must not be aborted with RST to reclaim it: the peer may still be draining buffered DATA, and an
+// RST discards it. So both-FIN is the graceful teardown, and Reset stays for the abnormal case only.
+func (st *MuxStream) cleanupIfClosed() {
+	st.mu.Lock()
+	done := st.localFIN && st.remoteEOF
+	st.mu.Unlock()
+	if done {
+		st.sess.removeStream(st.id)
+	}
 }
 
 func (st *MuxStream) grantSend(n uint32) {
@@ -406,7 +419,9 @@ func (st *MuxStream) Close() error {
 	st.localFIN = true
 	st.writable.Broadcast()
 	st.mu.Unlock()
-	return st.sess.writeFrame(muxFin, st.id, nil)
+	err := st.sess.writeFrame(muxFin, st.id, nil)
+	st.cleanupIfClosed()
+	return err
 }
 
 // Reset aborts the stream immediately in both directions.

@@ -194,19 +194,24 @@ func (c *bufConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 // teardown) unblocks the copies, so nothing leaks.
 func spliceStreamConn(st *MuxStream, c net.Conn) {
 	var wg sync.WaitGroup
+	var toStream, toConn error
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(st, c)
+		_, toStream = io.Copy(st, c)
 		_ = st.Close() // FIN: no more from this side
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(c, st)
+		_, toConn = io.Copy(c, st)
 		halfCloseWrite(c)
 	}()
 	wg.Wait()
-	_ = st.Reset()
+	// Reset only aborts an abnormal end; a clean both-way EOF is torn down by the FINs above (the
+	// mux frees the stream on both-FIN), so the peer keeps whatever it had not yet drained.
+	if toStream != nil || toConn != nil {
+		_ = st.Reset()
+	}
 	_ = c.Close()
 }
 

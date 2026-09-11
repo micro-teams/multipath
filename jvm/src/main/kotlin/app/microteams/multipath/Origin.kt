@@ -117,24 +117,33 @@ class Origin(private val serverSocket: ServerSocket, private val opt: RedundantO
  * once both directions end.
  */
 private fun splice(st: MuxStream, up: Socket) {
+    val fault = java.util.concurrent.atomic.AtomicBoolean(false)
     val upToStream = thread {
         try {
             up.getInputStream().copyTo(st.outputStream())
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+            fault.set(true)
+        }
         try {
             st.closeWrite()
         } catch (_: Exception) {}
     }
     try {
         st.inputStream().copyTo(up.getOutputStream())
-    } catch (_: Exception) {}
+    } catch (_: Exception) {
+        fault.set(true)
+    }
     try {
         up.shutdownOutput()
     } catch (_: Exception) {}
     upToStream.join()
-    try {
-        st.reset()
-    } catch (_: Exception) {}
+    // Reset only aborts an abnormal end; a clean both-way EOF is torn down by the FINs above (the
+    // mux frees the stream on both-FIN), so the peer keeps whatever it had not yet drained.
+    if (fault.get()) {
+        try {
+            st.reset()
+        } catch (_: Exception) {}
+    }
     try {
         up.close()
     } catch (_: Exception) {}

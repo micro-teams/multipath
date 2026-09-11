@@ -12,16 +12,18 @@ import (
 	"time"
 )
 
-// TestXLangSubstrateGoClientJavaOrigin is the cross-language proof for the whole substrate: the Go
-// Client dials a real JVM Origin over several links and drives it through the header-routed paths —
-// a tunnel spliced to an echo and a normal stream spliced to an HTTP greeter — so the redundant
-// frames, the mux, and the L5 header all have to agree on the wire between the two implementations.
+// TestXLangSubstrateGoClientJavaOrigin is the cross-language proof for the whole substrate, over an
+// adverse network: the Go Client dials a real JVM Origin over several links, each fronted by its own
+// fault middlebox (black-hole / one-directional / disconnect), and drives it through both routed
+// paths — a tunnel spliced to an echo and a normal stream spliced to an HTTP greeter. So the
+// redundant frames, the mux, and the L5 header all have to agree on the wire between the two
+// implementations AND survive links being cut underneath them.
 //
-// Skipped unless MP_JVM_CP is set to the JVM classpath (see testbed/redundant-xlang/run.sh).
+// Skipped unless MP_JVM_CP is set to the JVM classpath (see testbed/run.sh).
 func TestXLangSubstrateGoClientJavaOrigin(t *testing.T) {
 	cp := os.Getenv("MP_JVM_CP")
 	if cp == "" {
-		t.Skip("set MP_JVM_CP to run the cross-language substrate e2e (see testbed/redundant-xlang/run.sh)")
+		t.Skip("set MP_JVM_CP to run the cross-language substrate e2e (see testbed/run.sh)")
 	}
 	const n = 3
 
@@ -36,37 +38,53 @@ func TestXLangSubstrateGoClientJavaOrigin(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
 
-	port := ""
-	lines := bufio.NewScanner(stdout)
+	originPort := ""
+	scan := bufio.NewScanner(stdout)
 	deadline := time.Now().Add(30 * time.Second)
-	for lines.Scan() && time.Now().Before(deadline) {
-		if rest, ok := strings.CutPrefix(lines.Text(), "LISTENING "); ok {
-			port = strings.TrimSpace(rest)
+	for scan.Scan() && time.Now().Before(deadline) {
+		if rest, ok := strings.CutPrefix(scan.Text(), "LISTENING "); ok {
+			originPort = strings.TrimSpace(rest)
 			break
 		}
 	}
-	if port == "" {
+	if originPort == "" {
 		t.Fatal("java origin did not report LISTENING")
 	}
 
-	origin := "127.0.0.1:" + port
-	c := dialClientOverN(t, origin, n)
+	// One fault middlebox per link, each fronting the Java origin; the client reaches the origin
+	// only through them, so every byte crosses a link that is being cut on a random schedule.
+	lines := make([]Line, n)
+	for i := 0; i < n; i++ {
+		box := newMiddlebox(t, "127.0.0.1:"+originPort, int64(6000+i))
+		t.Cleanup(box.close)
+		lines[i] = Line{ID: "l" + strconv.Itoa(i), URL: "http://" + box.addr(), Transport: string(TransportTCP)}
+	}
+
+	c, err := Dial(t.Context(), ClientOptions{
+		Lines: lines,
+		Redundant: RedundantOptions{
+			Window: 2 << 20, PingInterval: 20 * time.Millisecond, DeadAfter: 100 * time.Millisecond,
+			AckInterval: 8 * time.Millisecond, ReconnectDelay: 5 * time.Millisecond, MaxDelay: 40 * time.Millisecond,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
 
 	t.Run("tunnel", func(t *testing.T) {
 		st, err := c.OpenTunnel("echo:0", []byte("ticket"))
 		if err != nil {
 			t.Fatalf("OpenTunnel: %v", err)
 		}
-		msg := []byte("bytes across the language boundary, deduped by offset")
-		if _, err := st.Write(msg); err != nil {
-			t.Fatalf("write: %v", err)
-		}
-		got := make([]byte, len(msg))
-		if _, err := io.ReadFull(st, got); err != nil {
+		msg := randBytes(48 << 10)
+		go func() { _, _ = st.Write(msg); _ = st.Close() }()
+		got, err := io.ReadAll(st)
+		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
 		if string(got) != string(msg) {
-			t.Fatalf("tunnel echo mismatch: %q", got)
+			t.Fatalf("tunnel echo mismatch: %d of %d bytes", len(got), len(msg))
 		}
 	})
 
