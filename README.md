@@ -42,6 +42,13 @@ handler may serve its stream in process (no listening port anywhere) or splice i
 There is no request middleware, no idempotency, no coalescing: the redundant layer already delivered
 each byte exactly once, so a handler sees each request exactly once.
 
+A stream is opaque bytes, so a client can run any protocol over it, not only raw tunneling: `RoundTrip`
+(Go) / `fetch` (TS) / `roundTrip` (Dart) each carry one HTTP exchange, and `OpenWebSocket` /
+`openWebSocket` run a full RFC 6455 client — a real WebSocket, not just a byte pipe — to whatever
+WebSocket server the service's handler is fronting. Written once here rather than by every consumer,
+because a browser has no other way to do it: a service worker's `fetch` handler never sees WebSocket
+traffic, and the platform's own `WebSocket` can't be pointed at an arbitrary byte stream.
+
 ## The one assumption everything rests on
 
 **Every route leads to the same origin.** Routes are different *network paths*, not different

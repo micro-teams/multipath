@@ -5,6 +5,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'appws.dart';
 import 'header.dart';
 import 'link.dart';
 import 'mux.dart';
@@ -55,6 +56,22 @@ class Client {
     final st = _sess.openStream();
     st.write(encodeHeader(Header(service, ticket: ticket)));
     return st;
+  }
+
+  /// Opens a stream to the named [service] and performs the RFC 6455 client handshake at [path],
+  /// returning a callback-based WebSocket (onMessage/onError/onDone, sendText/sendBinary, close) —
+  /// neither dart:io's WebSocket nor the web platform gives another way to run WebSocket traffic
+  /// over the substrate (dart:io's is a stub on web; on native it only wraps a real Socket or dials
+  /// a real URL, never an arbitrary byte stream). The far end must be a real WebSocket server;
+  /// [headers] are sent verbatim in the handshake request (e.g. a sub-protocol the target expects).
+  Future<MultipathWebSocket> openWebSocket(
+    String service,
+    String path, {
+    Uint8List? ticket,
+    Map<String, String> headers = const {},
+  }) {
+    final st = open(service, ticket: ticket);
+    return MultipathWebSocket.open(st, path, headers: headers);
   }
 
   /// Carries one HTTP exchange over a normal stream: the request is serialized to HTTP/1.1, written

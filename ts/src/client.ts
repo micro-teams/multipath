@@ -5,6 +5,7 @@
 // client-chosen address): a caller opens a service by name, or uses fetch(service, request), which
 // carries one HTTP exchange over such a stream (the drop-in the service worker routes through).
 
+import { MultipathWebSocket } from './appws.js';
 import { encodeHeader } from './header.js';
 import { MuxSession, MuxStream } from './mux.js';
 import { LinkStat, RedundantOptions, RedundantStream } from './redundant.js';
@@ -53,6 +54,24 @@ export class Client {
     await st.write(await serializeRequest(request));
     const bytes = await readToEnd(st);
     return parseResponse(bytes);
+  }
+
+  /**
+   * Opens a stream to the named service and performs the RFC 6455 client handshake at path,
+   * returning a WebSocket-shaped object (onopen/onmessage/onerror/onclose, send, close) — the
+   * browser platform gives no other way to run WebSocket traffic over the substrate (fetch/service
+   * workers never see it, and the native WebSocket can't be pointed at an arbitrary byte stream).
+   * The far end must be a real WebSocket server; headers are sent verbatim in the handshake request
+   * (e.g. a sub-protocol the target expects).
+   */
+  async openWebSocket(
+    service: string,
+    path: string,
+    ticket?: Uint8Array,
+    headers?: Record<string, string>,
+  ): Promise<MultipathWebSocket> {
+    const st = this.open(service, ticket);
+    return MultipathWebSocket.open(st, path, headers);
   }
 
   /**

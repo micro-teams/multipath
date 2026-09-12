@@ -107,4 +107,28 @@ func TestXLangSubstrateGoClientJavaOrigin(t *testing.T) {
 			t.Fatalf("unexpected response %d %q", resp.StatusCode, body)
 		}
 	})
+
+	t.Run("websocket", func(t *testing.T) {
+		ws, err := c.OpenWebSocket("ws-echo", []byte("ticket"), "/echo", nil)
+		if err != nil {
+			t.Fatalf("OpenWebSocket: %v", err)
+		}
+		defer ws.Close()
+		for i := 0; i < 3; i++ {
+			msg := randBytes(1024 * (i + 1))
+			if err := ws.WriteMessage(WSBinary, msg); err != nil {
+				t.Fatalf("WriteMessage: %v", err)
+			}
+			typ, got, err := ws.ReadMessage()
+			if err != nil {
+				t.Fatalf("ReadMessage: %v", err)
+			}
+			if typ != WSBinary {
+				t.Fatalf("message %d: type = %v, want WSBinary", i, typ)
+			}
+			if string(got) != string(msg) {
+				t.Fatalf("message %d: echo mismatch: %d of %d bytes", i, len(got), len(msg))
+			}
+		}
+	})
 }

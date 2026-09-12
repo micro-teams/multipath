@@ -33,6 +33,7 @@ const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 const (
 	wsOpContinuation = 0x0
+	wsOpText         = 0x1 // unused by the link layer (links never carry text frames); appws.go does
 	wsOpBinary       = 0x2
 	wsOpClose        = 0x8
 	wsOpPing         = 0x9

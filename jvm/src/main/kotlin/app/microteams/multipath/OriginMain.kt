@@ -1,8 +1,10 @@
 /*
- * A standalone origin for the cross-language end-to-end test: a Go client dials this JVM Origin over
- * several links, opens tunnel and normal streams, and the two must interoperate byte for byte on the
- * shared wire format (redundant frames, mux, and the L5 header). Tunnels are spliced to an internal
- * echo; normal streams to an internal HTTP greeter, so one process proves both routes.
+ * A standalone origin for the cross-language end-to-end test: a client in any of the four
+ * languages dials this JVM Origin over several links and opens streams against its services, which
+ * must interoperate byte-for-byte on the shared wire format (redundant frames, mux, L5 header) and,
+ * for "ws-echo", the RFC 6455 handshake and framing too. "echo" is a raw byte tunnel, "greeter" a
+ * one-shot HTTP reply, "ws-echo" a real WebSocket server that echoes whole messages back —
+ * exercising a client's application-level WebSocket-over-the-substrate, not just a byte pipe.
  *
  * Args: <n>. Prints "LISTENING <port>" once ready, then serves.
  */
@@ -41,6 +43,17 @@ object OriginMain {
             }
         }
 
+        // A real WebSocket server: accepts the RFC 6455 handshake, then echoes each message back as
+        // one frame of the same type. Proves an application-level WebSocket tunnels through the
+        // substrate to a genuine WS backend, not just a byte pipe like "echo" above.
+        val wsEcho = ServerSocket(0)
+        daemon {
+            while (true) {
+                val c = wsEcho.accept()
+                daemon { serveWsEcho(c) }
+            }
+        }
+
         val opt =
             RedundantOptions(
                 n = n,
@@ -54,6 +67,7 @@ object OriginMain {
             mapOf(
                 "echo" to Origin.dialService("127.0.0.1", echo.localPort),
                 "greeter" to Origin.dialService("127.0.0.1", app.localPort),
+                "ws-echo" to Origin.dialService("127.0.0.1", wsEcho.localPort),
             )
         println("LISTENING ${origin.port}")
         System.out.flush()
@@ -75,6 +89,27 @@ object OriginMain {
                 "HTTP/1.1 200 OK\r\nContent-Length: ${body.toByteArray().size}\r\nConnection: close\r\n\r\n$body"
             c.getOutputStream().write(response.toByteArray())
             c.getOutputStream().flush()
+        } catch (_: Exception) {} finally {
+            c.close()
+        }
+    }
+
+    /**
+     * Accepts one RFC 6455 handshake on c, then echoes each message back as one frame — relies on
+     * the (test-only) assumption that one input.read() drains exactly one frame's payload when the
+     * buffer given is bigger than any message this test sends, so echoing preserves the
+     * frame/message boundary.
+     */
+    private fun serveWsEcho(c: Socket) {
+        try {
+            val ws = acceptWebSocket(c.getInputStream(), c.getOutputStream(), "/echo")
+            val buf = ByteArray(65536)
+            while (true) {
+                val n = ws.input.read(buf)
+                if (n < 0) break
+                ws.output.write(buf, 0, n)
+                ws.output.flush()
+            }
         } catch (_: Exception) {} finally {
             c.close()
         }
