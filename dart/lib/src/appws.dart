@@ -71,7 +71,16 @@ class WSFrameReader {
       headerLen = 4;
     } else if (length == 127) {
       if (_buf.length < 10) return null;
-      length = v.getUint64(2);
+      // ByteData.getUint64 throws at runtime on dart2js (no JS 64-bit integer view) — see
+      // frames.dart's _getU64 for the same fix. A single WebSocket frame is never remotely close to
+      // 2^53 bytes, so the top half is expected to be zero; not decoding it would silently misparse
+      // a frame no real peer sends, so it stays an explicit rejection instead.
+      final hi = v.getUint32(2);
+      if (hi != 0) {
+        throw StateError(
+            'multipath: websocket frame too large to decode on this platform');
+      }
+      length = v.getUint32(6);
       headerLen = 10;
     }
     final maskLen = masked ? 4 : 0;
@@ -332,7 +341,11 @@ Future<Uint8List> computeSha1ForTesting(List<int> message) async {
   while (padded.length % 64 != 56) {
     padded.add(0);
   }
-  final lenBytes = ByteData(8)..setUint64(0, ml, Endian.big);
+  // ByteData.setUint64 throws at runtime on dart2js (no JS 64-bit integer view) — see frames.dart's
+  // _setU64 for the same fix, split into two big-endian u32 words via plain arithmetic instead.
+  final lenBytes = ByteData(8);
+  lenBytes.setUint32(0, ml ~/ 0x100000000, Endian.big);
+  lenBytes.setUint32(4, ml % 0x100000000, Endian.big);
   padded.addAll(lenBytes.buffer.asUint8List());
 
   var h0 = 0x67452301,

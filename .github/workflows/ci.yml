@@ -109,6 +109,9 @@ jobs:
   # client, driving both routed paths (a tunnel and a normal HTTP exchange) across a per-link fault
   # middlebox that black-holes, one-directionally cuts, and hard-disconnects links. Compiling both
   # halves proves nothing about whether they interoperate on the wire under loss; this job does.
+  # It also runs the Dart client leg twice — once natively (link_io.dart, dart:io) and once inside a
+  # real headless Chrome (link_web.dart, package:web) — since the web L2 link is JS-interop code a
+  # unit test on the Dart VM can't exercise at all.
   e2e:
     runs-on: ubuntu-latest
     steps:
@@ -130,6 +133,11 @@ jobs:
       - uses: dart-lang/setup-dart@v1
         with:
           sdk: stable
+      # Explicit rather than relying on whatever Chrome the runner image happens to ship — the Dart
+      # web leg (link_web.dart, a real browser-native L2 link) needs a real browser, not a stub.
+      - uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
       - name: Build the origin and run the cross-language substrate e2e
         run: ./testbed/run.sh
 
