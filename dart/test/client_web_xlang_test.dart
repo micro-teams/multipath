@@ -74,6 +74,5 @@ void main() {
     ws.close();
 
     client.close();
-  },
-      timeout: const Timeout(Duration(seconds: 40)));
+  }, timeout: const Timeout(Duration(seconds: 40)));
 }
