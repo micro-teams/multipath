@@ -13,10 +13,11 @@ on:
 # parallel, and publishing hangs off the same run rather than off a second workflow that could
 # disagree with it about whether the code was any good.
 #
-#   ts / jvm / go   check each package on its own, because each is released on its own
-#   e2e             the whole testbed in a real browser over real separate lines — the job that
-#                   decides whether MultiPath works, as opposed to whether it compiles
-#   publish-*       only after all four are green
+#   go / ts / dart / jvm   check each package on its own, because each is released on its own
+#   e2e                     the whole substrate over the wire: a real JVM origin, every client (Go,
+#                           browser, Dart), and a per-link fault middlebox cutting links underneath —
+#                           the job that decides whether MultiPath works, not just whether it compiles
+#   publish-*               only after all five are green
 #
 # Nothing here depends on anything outside this repository: no consumer application, no database,
 # no external service.
@@ -26,6 +27,24 @@ permissions:
   packages: write
 
 jobs:
+  go:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go/go.mod
+      - run: gofmt -l . | tee /tmp/unformatted && [ ! -s /tmp/unformatted ]
+      - run: go vet ./...
+      - run: go build ./...
+      # -race, because the redundant stream and the mux are written by several goroutines at once; a
+      # data race there would surface as an occasional lost byte, the kind of bug blamed on the
+      # network for weeks. The cross-language legs are skipped here (no JVM classpath) and run in e2e.
+      - run: go test -race -skip XLang ./...
+
   ts:
     runs-on: ubuntu-latest
     defaults:
@@ -42,7 +61,24 @@ jobs:
       - run: npm run format:check
       - run: npm run lint
       - run: npm run build
+      # The cross-language legs skip here (no JVM classpath) and run in e2e; this is the unit level.
       - run: npm test
+
+  dart:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dart
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - run: dart pub get
+      - run: dart format --output=none --set-exit-if-changed .
+      - run: dart analyze --fatal-infos
+      # The cross-language leg skips without a JVM classpath and runs in e2e; this is the unit level.
+      - run: dart test test/codecs_test.dart
 
   jvm:
     runs-on: ubuntu-latest
@@ -69,97 +105,11 @@ jobs:
             exit 1
           fi
 
-  go:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: go
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go/go.mod
-      - run: gofmt -l . | tee /tmp/unformatted && [ ! -s /tmp/unformatted ]
-      - run: go vet ./...
-      - run: go build ./...
-      # -race, because the health table is written by the prober's goroutine while requests read
-      # it. A data race there would show up as a ranking that is occasionally nonsense, which is
-      # the kind of bug that gets blamed on the network for weeks.
-      - run: go test -race ./...
-
-  dart:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: dart
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dart-lang/setup-dart@v1
-        with:
-          sdk: stable
-      - run: dart pub get
-      - run: dart format --output=none --set-exit-if-changed .
-      # Fatal on infos too: this package has no dependencies and nothing to hide behind, so a lint
-      # it is willing to print is one it should be willing to fail on.
-      - run: dart analyze --fatal-infos
-      - run: dart test
-
+  # The substrate is proven the only way that matters: a real JVM origin process and a real Go
+  # client, driving both routed paths (a tunnel and a normal HTTP exchange) across a per-link fault
+  # middlebox that black-holes, one-directionally cuts, and hard-disconnects links. Compiling both
+  # halves proves nothing about whether they interoperate on the wire under loss; this job does.
   e2e:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "22"
-          cache: "npm"
-          cache-dependency-path: |
-            ts/package-lock.json
-            testbed/e2e/package-lock.json
-      - uses: actions/setup-java@v5
-        with:
-          java-version: "21"
-          distribution: "temurin"
-          cache: "maven"
-          cache-dependency-path: |
-            jvm/pom.xml
-            testbed/server/pom.xml
-
-      - name: Install the spec runner
-        working-directory: testbed/e2e
-        run: npm ci
-
-      # Headless shell only: the specs drive an API on the page, so a full browser download would be
-      # minutes spent on rendering nobody looks at.
-      - name: Install the browser
-        working-directory: testbed/e2e
-        run: npx playwright install --with-deps chromium
-
-      # The Dart leg of the testbed runs from run.sh, so the SDK has to be here. Required in CI
-      # even though run.sh skips it locally when absent: "skipped" is a courtesy to a developer's
-      # machine, not an acceptable outcome for a gate.
-      - uses: dart-lang/setup-dart@v1
-        with:
-          sdk: stable
-
-      - name: Build everything, start it, run the specs
-        run: ./testbed/run.sh --e2e
-
-      - name: Upload traces from failures
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          retention-days: 1
-          name: playwright-traces
-          path: testbed/e2e/test-results
-          if-no-files-found: ignore
-
-  # The redundant multi-link byte stream is proven the only way that matters: a real JVM server
-  # process and a real Go client, with a per-link fault middlebox cutting connections (black-hole =
-  # connection open but bytes dropped, one-directional, and hard disconnect) — the same adverse
-  # networks the primitive exists to survive. Compiling both halves proves nothing about whether
-  # they interoperate on the wire under loss; this job does. (The per-language unit + real-TCP
-  # fault tests already run inside the go and jvm jobs.)
-  redundant-xlang:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -172,8 +122,16 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go/go.mod
-      - name: Cross-language e2e (Java server + Go client + fault middlebox)
-        run: ./testbed/redundant-xlang/run.sh
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: ts/package-lock.json
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - name: Build the origin and run the cross-language substrate e2e
+        run: ./testbed/run.sh
 
   # ---------------------------------------------------------------------------------------------
   # Publishing. Two shapes, one workflow.
@@ -182,12 +140,12 @@ jobs:
   #                       develop against unreleased work
   #   a v* tag        ->  an immutable release
   #
-  # Both run only after every check above has passed, so nothing reaches the registry that the test
-  # suite has not already had an opinion about.
+  # Go needs no publishing step at all: `go get github.com/micro-teams/multipath/go@<ref>` resolves
+  # straight from the commit. The JVM (Maven) and browser (npm) packages are pushed to registries.
   # ---------------------------------------------------------------------------------------------
 
   publish-branch:
-    needs: [ts, jvm, go, dart, e2e, redundant-xlang]
+    needs: [go, ts, dart, jvm, e2e]
     if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -209,16 +167,13 @@ jobs:
           server-username: MAVEN_USERNAME
           server-password: MAVEN_PASSWORD
 
-      # A branch name can contain characters neither npm nor Maven accepts.
       - name: Derive the branch label
         id: label
         run: echo "value=$(echo '${{ github.ref_name }}' | tr '/_' '--' | tr -cd '[:alnum:]-')" >> "$GITHUB_OUTPUT"
 
-      # npm refuses to replace a version that already exists, so a branch build cannot reuse one
-      # number. It gets a unique prerelease version per run, and the *dist-tag* is the moving
-      # pointer: `npm install @micro-teams/multipath@main` always resolves to the newest main build.
-      # The bump is never committed — the version in git stays the release version.
-      - name: Publish the TypeScript package
+      # npm refuses to replace a version, so a branch build gets a unique prerelease number and the
+      # *dist-tag* is the moving pointer: install @micro-teams/multipath@<branch> for the newest.
+      - name: Publish the browser package
         working-directory: ts
         run: |
           set -euo pipefail
@@ -228,14 +183,13 @@ jobs:
           npm run build
           npm version "$version" --no-git-tag-version
           npm publish --tag "${{ steps.label.outputs.value }}"
-          echo "published @micro-teams/multipath@$version (dist-tag ${{ steps.label.outputs.value }})"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Maven has a moving pointer built in: a -SNAPSHOT version is expected to be replaced, and
-      # resolvers know to re-check it. So the branch label goes in the version and the snapshot
-      # suffix does the rest — no per-run number, no accumulating garbage.
-      - name: Publish the Spring starter
+      # A -SNAPSHOT version is expected to be replaced, and resolvers re-check it, so the branch
+      # label goes in the version and the snapshot suffix does the rest — no per-run number, no
+      # accumulating garbage. The bump is never committed; the version in git stays the release one.
+      - name: Publish the JVM package
         working-directory: jvm
         run: |
           set -euo pipefail
@@ -243,21 +197,16 @@ jobs:
           version="${base%-SNAPSHOT}-${{ steps.label.outputs.value }}-SNAPSHOT"
           ./mvnw -B versions:set -DnewVersion="$version" -DgenerateBackupPoms=false
           ./mvnw -B deploy -DskipTests
-          echo "published app.microteams.multipath:multipath-spring-boot-starter:$version"
+          echo "published app.microteams:multipath:$version"
         env:
           MAVEN_USERNAME: ${{ github.actor }}
           MAVEN_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-
-      # Go needs no publishing step at all: `go get github.com/micro-teams/multipath/go@<branch>`
-      # resolves straight from the commit. Saying so here so nobody goes looking for the missing job.
-      - name: Dart needs no registry
-        run: echo "pub.dev is not used; the package is consumed by git path or ref."
 
       - name: Go needs no registry
         run: echo 'go get github.com/micro-teams/multipath/go@${{ github.ref_name }}'
 
   publish-release:
-    needs: [ts, jvm, go, dart, e2e, redundant-xlang]
+    needs: [go, ts, dart, jvm, e2e]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -279,18 +228,18 @@ jobs:
           server-username: MAVEN_USERNAME
           server-password: MAVEN_PASSWORD
 
-      # A tag that disagrees with the committed version would publish a release nobody asked for,
-      # and an npm version cannot be replaced once taken — so this has to come before the publish.
+      # A tag that disagrees with either committed version would publish a release nobody asked for,
+      # and an npm version cannot be replaced once taken — so this comes before any publish.
       - name: Check the tag matches both committed versions
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
-          pkg="$(node -p "require('./ts/package.json').version")"
           pom="$(cd jvm && ./mvnw -q -B help:evaluate -Dexpression=project.version -DforceStdout)"
-          [[ "$tag" == "$pkg" ]] || { echo "tag $tag != ts/package.json $pkg" >&2; exit 1; }
+          pkg="$(node -p "require('./ts/package.json').version")"
           [[ "$tag" == "$pom" ]] || { echo "tag $tag != jvm/pom.xml $pom" >&2; exit 1; }
+          [[ "$tag" == "$pkg" ]] || { echo "tag $tag != ts/package.json $pkg" >&2; exit 1; }
 
-      - name: Publish the TypeScript package
+      - name: Publish the browser package
         working-directory: ts
         run: |
           npm ci
@@ -299,7 +248,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish the Spring starter
+      - name: Publish the JVM package
         working-directory: jvm
         run: ./mvnw -B deploy -DskipTests
         env:

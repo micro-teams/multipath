@@ -422,8 +422,16 @@ internal constructor(
  * RedundantStreams. A new connID surfaces a stream via [accept]; a reconnecting link of a known
  * connID re-attaches underneath the existing stream.
  */
-class RedundantServer(private val serverSocket: ServerSocket, private val opt: RedundantOptions) :
-    Closeable {
+class RedundantServer(
+    private val serverSocket: ServerSocket,
+    private val opt: RedundantOptions,
+    // Decapsulates each accepted socket into a link (raw TLS / WebSocket / plaintext) so this class
+    // always sees the same thing above it: a byte stream whose first frame is HELLO. The default is
+    // plaintext, for a testbed or an origin fronted by something that terminates TLS elsewhere.
+    private val decap: (Socket) -> LinkConn = {
+        LinkConn(it.getInputStream(), it.getOutputStream(), it)
+    },
+) : Closeable {
     private val streams = HashMap<String, RedundantStream>()
     private val lock = ReentrantLock()
     private val handoff = SynchronousQueue<RedundantStream>()
@@ -448,20 +456,20 @@ class RedundantServer(private val serverSocket: ServerSocket, private val opt: R
     private fun onLink(sock: Socket) {
         try {
             sock.soTimeout = 10_000
-            val reader = FrameReader(sock.getInputStream())
+            val conn = decap(sock)
+            val reader = FrameReader(conn.input)
             val hello = reader.next()
             if (hello.type != FRAME_HELLO) {
-                sock.close()
+                conn.close()
                 return
             }
             sock.soTimeout = 0
             val idx = hello.linkIdx
             if (idx < 0 || idx >= opt.n) {
-                sock.close()
+                conn.close()
                 return
             }
             val key = hello.connId!!.joinToString("") { "%02x".format(it) }
-            val conn = LinkConn(sock.getInputStream(), sock.getOutputStream(), sock)
             var isNew = false
             val stream =
                 lock.withLock {

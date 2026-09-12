@@ -236,11 +236,21 @@ class MuxStream internal constructor(private val sess: MuxSession, private val i
             readable.signalAll()
         }
 
-    internal fun remoteFin() =
+    internal fun remoteFin() {
         lock.withLock {
             remoteEof = true
             readable.signalAll()
         }
+        cleanupIfClosed()
+    }
+
+    // Frees a stream's slot once both sides have half-closed. A cleanly finished stream must not be
+    // aborted with RST to reclaim it: the peer may still be draining buffered DATA, and an RST
+    // discards it. So both-FIN is the graceful teardown, and reset() stays for the abnormal case.
+    private fun cleanupIfClosed() {
+        val done = lock.withLock { localFin && remoteEof }
+        if (done) sess.removeStream(id)
+    }
 
     internal fun grantSend(n: Long) =
         lock.withLock {
@@ -296,6 +306,7 @@ class MuxStream internal constructor(private val sess: MuxSession, private val i
             writable.signalAll()
         }
         sess.writeFrame(MUX_FIN, id, null, 0, 0)
+        cleanupIfClosed()
     }
 
     /** Abort the stream in both directions (RST). */

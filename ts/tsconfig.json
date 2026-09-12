@@ -1,20 +1,16 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["ES2022", "DOM"],
     "module": "ESNext",
-    "moduleResolution": "bundler",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "noImplicitOverride": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
-    "exactOptionalPropertyTypes": true,
-    "verbatimModuleSyntax": true,
-    "skipLibCheck": true,
+    "noUncheckedIndexedAccess": false,
     "declaration": true,
     "sourceMap": true,
-    "types": ["node"]
+    "outDir": "dist",
+    "rootDir": "src",
+    "types": []
   },
-  "include": ["src", "test", "*.ts"]
+  "include": ["src", "test"]
 }

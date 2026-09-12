@@ -1,141 +1,42 @@
 #!/usr/bin/env bash
 #
-#  Description: Build and start the whole testbed: one origin, three lines, one page.
+# The end-to-end testbed: build the origin, then run every client against it over the shared wire,
+# across a fault middlebox that cuts links underneath the substrate.
 #
-#               Everything runs as an ordinary process — no docker. A testbed that needs a
-#               container runtime is a testbed people stop running locally, and one that only ever
-#               runs in CI stops being trusted.
+# There is one origin (the Kotlin app.microteams.multipath, run from OriginMain), one fault
+# middlebox implementation (the per-link TCP cutter in the Go tests: black-hole, one-directional,
+# hard disconnect), and one scenario each client drives — open a tunnel and echo bytes, open a
+# normal stream and round-trip HTTP — so what is exercised is interoperation on the wire under an
+# adverse network, not merely that each half compiles.
 #
-#               Ports and impairments live here rather than in the specs, so a spec reads as an
-#               assertion about MultiPath and not as a deployment description.
+# Today the client is Go (the connector's language); the browser clients join the same origin and
+# the same scenario when they land. The whole thing runs as ordinary processes, no containers.
 #
-#  Author(s):
-#      agent4
-#
+# Usage: testbed/run.sh
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(dirname "$HERE")"
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+jvm="$repo/jvm"
+go_dir="$repo/go"
 
-SERVER_PORT="${TESTBED_SERVER_PORT:-8080}"
-WEB_PORT="${WEB_PORT:-8000}"
+echo "==> building the origin (JVM classes + dependency classpath)"
+(cd "$jvm" && ./mvnw -q -B -DskipTests compile)
+cp_file="$(mktemp)"
+(cd "$jvm" && ./mvnw -q -B dependency:build-classpath -Dmdep.outputFile="$cp_file")
+export MP_JVM_CP="$jvm/target/classes:$(cat "$cp_file")"
+rm -f "$cp_file"
 
-# id:port:delay_ms:fail_every — the topology every spec is written against.
-LINES=(
-  "fast:9001:0:0"
-  "slow:9002:400:0"
-  "flaky:9003:0:3"
-  # Accepts the connection and never answers — what a black-holed route looks like from a browser,
-  # and the case hedging and failover exist for.
-  "stalled:9004:0:0:stall"
-)
+echo "==> running the Go cross-language substrate e2e (Go client, JVM origin, fault middlebox)"
+(cd "$go_dir" && go test -run TestXLang -count=1 -v -timeout 240s)
 
-RUN_E2E=0
-[[ "${1:-}" == "--e2e" ]] && RUN_E2E=1
+echo "==> running the TypeScript cross-language e2e (browser client over WebSocket links, JVM origin)"
+ts_dir="$repo/ts"
+(cd "$ts_dir" && npm ci --silent && npm run build --silent && npx vitest run xlang)
 
-pids=()
-cleanup() {
-  for pid in "${pids[@]:-}"; do kill "$pid" 2>/dev/null || true; done
-  wait 2>/dev/null || true
-}
-trap cleanup EXIT INT TERM
-
-say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
-
-say "building the library"
-npm --prefix "$ROOT/ts" ci --silent
-npm --prefix "$ROOT/ts" run build --silent
-
-say "installing the starter into the local maven repository"
-# The testbed depends on the published artifact, not on source: what gets exercised here is
-# byte-for-byte what a consumer would resolve.
-(cd "$ROOT/jvm" && ./mvnw -q -B install -DskipTests)
-
-say "building the testbed server"
-(cd "$HERE/server" && ./mvnw -q -B package -DskipTests)
-
-say "publishing the built package to the page"
-rm -rf "$HERE/web/vendor"
-mkdir -p "$HERE/web/vendor"
-cp "$ROOT"/ts/dist/*.js "$HERE/web/vendor/"
-
-# The registry the server hands out, describing the lines started below.
-registry=""
-registry_json="["
-for spec in "${LINES[@]}"; do
-  IFS=: read -r id port _ _ _ <<<"$spec"
-  registry+="${registry:+,}${id}=http://localhost:${port}=test=100"
-  [[ "$registry_json" != "[" ]] && registry_json+=","
-  registry_json+="{\"id\":\"$id\",\"url\":\"http://localhost:$port\",\"weight\":100}"
-done
-registry_json+="]"
-
-# The consumer's build step, standing in for whatever a real application would do.
-say "generating the launcher and the service worker"
-TESTBED_REGISTRY_JSON="$registry_json" TESTBED_BUILD_VERSION="$(date +%s 2>/dev/null || echo test)" \
-  node "$HERE/web/build-launcher.mjs"
-
-say "starting the origin (one instance) on :$SERVER_PORT"
-TESTBED_SERVER_PORT="$SERVER_PORT" TESTBED_LINES="$registry" \
-  java -jar "$HERE"/server/target/multipath-testbed-server-*.jar &
-pids+=($!)
-
-say "starting the lines"
-for spec in "${LINES[@]}"; do
-  IFS=: read -r id port delay fail stall <<<"$spec"
-  LINE_NAME="$id" LINE_PORT="$port" LINE_TARGET_PORT="$SERVER_PORT" \
-    LINE_DELAY_MS="$delay" LINE_FAIL_EVERY="$fail" \
-    LINE_STALL="$([[ "$stall" == "stall" ]] && echo 1 || echo 0)" \
-    node "$HERE/lines/line.js" &
-  pids+=($!)
-done
-
-say "starting the page on :$WEB_PORT"
-WEB_PORT="$WEB_PORT" node "$HERE/web/serve.js" &
-pids+=($!)
-
-say "waiting for everything to answer"
-wait_for() {
-  local url="$1" name="$2"
-  for _ in $(seq 1 120); do
-    if curl -fsS -o /dev/null "$url" 2>/dev/null; then
-      echo "  $name ready"
-      return 0
-    fi
-    sleep 1
-  done
-  echo "  $name did NOT come up: $url" >&2
-  return 1
-}
-wait_for "http://localhost:$SERVER_PORT/mt/probe" "origin"
-for spec in "${LINES[@]}"; do
-  IFS=: read -r id port _ _ _ <<<"$spec"
-  # The flaky line fails one request in three by design, so retry rather than trust one probe.
-  # The stalled line still answers its own control endpoint; only proxied traffic is black-holed.
-  wait_for "http://localhost:$port/__line" "line $id"
-done
-wait_for "http://localhost:$WEB_PORT/" "page"
-
-if [[ $RUN_E2E == 1 ]]; then
-  say "running the end-to-end specs"
-  TESTBED_WEB_URL="http://localhost:$WEB_PORT" \
-    TESTBED_SERVER_URL="http://localhost:$SERVER_PORT" \
-    npm --prefix "$HERE/e2e" test
-  say "specs passed"
-
-  # The Dart client, over the same lines. Skipped rather than failed when there is no SDK: this
-  # repository's other three packages must stay runnable on a machine that has no Dart, and a
-  # testbed people cannot run locally is a testbed that stops being trusted.
-  if command -v dart >/dev/null 2>&1; then
-    say "running the Dart end-to-end assertions"
-    (cd "$HERE/dart" && dart pub get >/dev/null)
-    TESTBED_SERVER_URL="http://localhost:$SERVER_PORT" \
-      dart run "$HERE/dart/bin/e2e.dart"
-    say "Dart assertions passed"
-  else
-    say "no dart on PATH — skipping the Dart end-to-end assertions"
-  fi
+echo "==> running the Dart cross-language e2e (Dart client over WebSocket links, JVM origin)"
+dart_dir="$repo/dart"
+if command -v dart >/dev/null 2>&1; then
+  (cd "$dart_dir" && dart pub get >/dev/null && dart test test/client_xlang_test.dart)
 else
-  say "testbed up — page at http://localhost:$WEB_PORT (ctrl-c to stop)"
-  wait
+  echo "  no dart on PATH — skipping the Dart leg (CI installs one)"
 fi

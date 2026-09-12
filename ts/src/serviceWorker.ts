@@ -1,239 +1,52 @@
-/*
- *  Description: The Service Worker runtime: what makes starting the app independent of the lines.
- *
- *               Precaching is what takes "load the application" out of the network entirely. After
- *               the first visit, every build artefact is on disk, and opening the app is a cache
- *               read — no line has to be alive, fast, or even reachable. That is the whole of the
- *               design's "as long as there is still a cache, it starts" claim, and it is why this
- *               is a worker rather than a clever fetch wrapper: only a worker is consulted before
- *               the page exists.
- *
- *               Two boundaries are load-bearing.
- *
- *               Only build artefacts are cached. An API response must never be served from here —
- *               staleness in data is the application's business, and a transport layer that
- *               silently answered a request with yesterday's data would be lying about what it is.
- *
- *               A cache miss still goes over the lines. The assets are on every line, so a miss
- *               during a partial outage is recoverable rather than fatal; falling back to the one
- *               origin the page happened to come from would throw that away.
- *
- *  Author(s):
- *      agent4
- */
+// The browser integration point: a service worker that intercepts fetch and routes it over the
+// multipath substrate instead of the network. The application keeps calling fetch() as it always
+// did; underneath, every request becomes a mux stream over one redundant transport across all lines,
+// and nothing in the app learns that more than one path exists.
+//
+// The scope and event are typed by the minimum this needs, so the package compiles against the DOM
+// lib alone without pulling in the WebWorker lib (whose globals collide with the DOM's).
 
-import type { Line, Registry } from "./registry.js";
+import { Client, ClientOptions } from './client.js';
 
-export interface PrecacheOptions {
-  /**
-   * Every URL the application needs to start, as the build emitted them.
-   *
-   * Supplied by the consumer, because a product-agnostic library cannot know what a build produces.
-   * Generating it is the consumer's build step; getting it wrong shows up as an app that will not
-   * start offline, so it is worth generating rather than hand-writing.
-   */
-  readonly manifest: readonly string[];
-  /**
-   * Changes whenever the manifest does — a build hash is the obvious source.
-   *
-   * The cache is keyed by it, so a new version installs alongside the old and the old is deleted
-   * only once the new one is in charge. A user mid-session is never left with half of one build and
-   * half of another.
-   */
-  readonly version: string;
-  /** Lines to try on a cache miss. Baked in at build time, since a worker has no page to ask. */
-  readonly registry?: Registry;
-  /** Prefixes that must always go to the network. Defaults to the MultiPath endpoints. */
-  readonly networkOnly?: readonly string[];
-  /**
-   * Where the server says which build is deployed. Omit to skip the check entirely.
-   *
-   * Answered with either a bare version string or `{ "version": "…" }`, and it must be served
-   * WITHOUT caching — an answer to "what is deployed?" that came from a cache is an answer about
-   * the past, which is the one thing it must never be.
-   *
-   * This exists because a Service Worker is only replaced when its OWN bytes change. A deploy that
-   * ships new application files beside an unchanged worker is invisible: no update, no activate, no
-   * eviction, and every visitor keeps being served the build this worker cached. Nothing about that
-   * looks wrong from outside — the files are new, the site is up, the app is old. Consumers have
-   * lost days to it. With this set, the worker stops trusting its own version and asks.
-   */
-  readonly versionUrl?: string;
-  /**
-   * How often that question is worth asking. Defaults to a minute.
-   *
-   * Cheap but not free, so a consumer is expected to call `reconcile()` on activation and on
-   * navigations rather than on every request; this bounds the cost when they do it anyway.
-   */
-  readonly checkEveryMs?: number;
-  readonly cachePrefix?: string;
-  /** Injected in tests. */
-  readonly fetch?: typeof globalThis.fetch;
-  readonly caches?: CacheStorage;
+export interface FetchEventLike {
+  readonly request: Request;
+  respondWith(response: Response | Promise<Response>): void;
 }
 
-const DEFAULTS = {
-  cachePrefix: "multipath-precache-",
-  // The line endpoints themselves must never be answered from cache: a cached probe would report
-  // the latency of the disk, and a cached registry would hide the line you just added.
-  networkOnly: ["/mt/probe", "/mt/lines", "/mt/bandwidth"],
-} as const;
-
-/**
- * The handlers a consumer's `sw.js` wires up.
- *
- * Returned rather than registered, so the consumer keeps control of its own worker and can add
- * behaviour of its own. A library that called `addEventListener` for you would own a file it does
- * not own.
- */
-export function createPrecache(options: PrecacheOptions) {
-  const cacheName = `${options.cachePrefix ?? DEFAULTS.cachePrefix}${options.version}`;
-  const networkOnly = options.networkOnly ?? DEFAULTS.networkOnly;
-  const fetchImpl = options.fetch ?? globalThis.fetch;
-  const cacheStorage = options.caches ?? globalThis.caches;
-  // Used for the install only: there is no caller to defer to at that point.
-  const lines = options.registry?.lines ?? [];
-  const checkEveryMs = options.checkEveryMs ?? 60_000;
-  let lastChecked = 0;
-
-  return {
-    cacheName,
-
-    /**
-     * Fetch and store every artefact.
-     *
-     * One failure fails the install, deliberately: a half-populated cache is worse than none,
-     * because it starts the app and then breaks on the first missing chunk — a failure that looks
-     * like a bug in the app rather than a bad install.
-     */
-    async install(): Promise<void> {
-      const cache = await cacheStorage.open(cacheName);
-      const responses = await Promise.all(
-        options.manifest.map(async (url) => {
-          const response = await fetchOverLines(url, lines, fetchImpl);
-          if (!response.ok) throw new Error(`precache failed for ${url}: ${response.status}`);
-          return [url, response] as const;
-        }),
-      );
-      await Promise.all(responses.map(([url, response]) => cache.put(url, response)));
-    },
-
-    /** Delete every cache from an older version, once this one is the one in charge. */
-    async activate(): Promise<void> {
-      const keys = await cacheStorage.keys();
-      await Promise.all(
-        keys
-          .filter((key) => key.startsWith(options.cachePrefix ?? DEFAULTS.cachePrefix))
-          .filter((key) => key !== cacheName)
-          .map((key) => cacheStorage.delete(key)),
-      );
-    },
-
-    /**
-     * Ask the server which build is deployed, and throw this cache away if it is not this one.
-     *
-     * Returns whether it did — a consumer usually answers that by calling `registration.update()`,
-     * which is the thing that was supposed to happen by itself, and by telling its clients to
-     * reload.
-     *
-     * Blunt on purpose: being stale is precisely the state in which a cache is worth nothing, so
-     * there is no attempt to repair it entry by entry. Everything goes, and the next request for
-     * anything goes to the network.
-     *
-     * Silent on failure. Offline, a 404 from a deployment older than this feature, a body that is
-     * not what we expect — none of them are a reason to act, because none of them are evidence that
-     * what we hold is wrong.
-     */
-    async reconcile(now: number = Date.now()): Promise<boolean> {
-      if (!options.versionUrl) return false;
-      if (now - lastChecked < checkEveryMs) return false;
-      lastChecked = now;
-
-      let deployed: string | null = null;
-      try {
-        const response = await fetchImpl(options.versionUrl, { cache: "no-store" });
-        if (!response.ok) return false;
-        const body: unknown = await response.json();
-        deployed =
-          typeof body === "string"
-            ? body
-            : typeof (body as { version?: unknown })?.version === "string"
-              ? (body as { version: string }).version
-              : null;
-      } catch {
-        return false;
-      }
-
-      if (deployed === null || deployed === options.version) return false;
-
-      const prefix = options.cachePrefix ?? DEFAULTS.cachePrefix;
-      const keys = await cacheStorage.keys();
-      await Promise.all(
-        keys.filter((key) => key.startsWith(prefix)).map((key) => cacheStorage.delete(key)),
-      );
-      return true;
-    },
-
-    /**
-     * Answer a request, or return null to let it go to the network untouched.
-     *
-     * Null rather than a fetch, so the decision not to interfere is explicit and a consumer can see
-     * exactly which requests this layer declines to touch.
-     */
-    async handle(request: Request): Promise<Response | null> {
-      // A worker sees every request the page makes, including ones to other origins entirely.
-      if (request.method !== "GET") return null;
-
-      const url = new URL(request.url);
-      if (networkOnly.some((prefix) => url.pathname.startsWith(prefix))) return null;
-
-      const cache = await cacheStorage.open(cacheName);
-      // Matched by the manifest-relative path, not the full URL. An artefact cached during install
-      // was stored under "/main.js" while the page may well request it from a line as
-      // "https://cf.example/main.js" — matching on the full URL would miss every single time, and
-      // miss silently, degrading into "it works but always goes to the network".
-      const cached = await cache.match(url.pathname + url.search);
-      // The point of the whole exercise: a hit costs no network at all, so which lines are alive
-      // stops mattering for starting the app.
-      if (cached) return cached;
-
-      // On a miss, get out of the way.
-      //
-      // An earlier version tried each line in turn here. It was worse than redundant: the client
-      // already races the lines, so every parallel attempt it made turned into its own sequential
-      // re-race inside the worker, and the two schemes fought each other into intermittent
-      // timeouts. The worker owns the cache; choosing lines belongs to the caller, which knows
-      // what it has already measured and what it has already asked.
-      return null;
-    },
-  };
+export interface FetchScope {
+  addEventListener(type: 'fetch', listener: (event: FetchEventLike) => void): void;
 }
 
-/**
- * Try each line in turn until one answers. Used only by the install.
- *
- * Sequential rather than raced, and only here: the install has no caller to defer to, and it is the
- * one moment where finishing matters and finishing quickly does not.
- */
-async function fetchOverLines(
-  path: string,
-  lines: readonly Line[],
-  fetchImpl: typeof globalThis.fetch,
-): Promise<Response> {
-  if (lines.length === 0) return fetchImpl(path, { cache: "no-store" });
+export interface RouterOptions extends ClientOptions {
+  // Decide per request whether to route it over multipath; return false to let it hit the network
+  // untouched. Default: route everything.
+  shouldRoute?: (request: Request) => boolean;
+  // Injected in tests; defaults to Client.dial.
+  dial?: (lines: string[], opts: ClientOptions) => Promise<Client>;
+}
 
-  let lastError: unknown = new Error(`no line could serve ${path}`);
-  for (const line of lines) {
-    try {
-      const response = await fetchImpl(line.url === "" ? path : line.url + path, {
-        cache: "no-store",
-        ...(line.url === "" ? {} : { credentials: "include" as const }),
+// installFetchRouter wires a service worker's fetch handler to the substrate. The client is dialled
+// lazily on the first routed request and reused; a failed dial is retried on the next request rather
+// than cached, so a transient startup failure does not wedge the worker.
+export function installFetchRouter(
+  scope: FetchScope,
+  lines: string[],
+  opts: RouterOptions = {},
+): void {
+  const dial = opts.dial ?? Client.dial;
+  let pending: Promise<Client> | null = null;
+  const client = (): Promise<Client> => {
+    if (pending === null) {
+      pending = dial(lines, opts).catch((err) => {
+        pending = null; // let the next request try again
+        throw err;
       });
-      if (response.ok) return response;
-      lastError = new Error(`${line.id} answered ${response.status} for ${path}`);
-    } catch (error) {
-      lastError = error;
     }
-  }
-  throw lastError;
+    return pending;
+  };
+
+  scope.addEventListener('fetch', (event) => {
+    if (opts.shouldRoute && !opts.shouldRoute(event.request)) return;
+    event.respondWith(client().then((c) => c.fetch(event.request)));
+  });
 }
