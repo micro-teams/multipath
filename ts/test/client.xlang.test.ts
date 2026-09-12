@@ -65,6 +65,22 @@ describe('browser client cross-language', () => {
         expect(resp.status).toBe(200);
         expect(await resp.text()).toBe('hello /xlang');
 
+        // WebSocket: a real RFC 6455 handshake and message round trip through the substrate to the
+        // origin's ws-echo backend — proves the browser client's application-level WebSocket, not
+        // just a byte tunnel. Binary only: the origin's test echo reuses the link layer's
+        // byte-stream WebSocketConn, which (by original design — see websocket.go's own header
+        // comment) only understands OP_BINARY; a text frame throws there and drops the connection.
+        const ws = await client.openWebSocket('ws-echo', '/echo');
+        const gotMessages: ArrayBuffer[] = [];
+        ws.onmessage = (ev) => gotMessages.push(ev.data as ArrayBuffer);
+        ws.send(new TextEncoder().encode('hello ws'));
+        ws.send(new TextEncoder().encode('second message'));
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        expect(gotMessages.length).toBe(2);
+        expect(new TextDecoder().decode(gotMessages[0])).toBe('hello ws');
+        expect(new TextDecoder().decode(gotMessages[1])).toBe('second message');
+        ws.close();
+
         client.close();
       } finally {
         origin.kill();

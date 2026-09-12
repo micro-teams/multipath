@@ -70,6 +70,21 @@ void main() {
       expect(stats.every((s) => s.state == 'up'), isTrue);
       expect(linkEvents.any((e) => e.up), isTrue);
 
+      // WebSocket: a real RFC 6455 handshake and message round trip through the substrate to the
+      // origin's ws-echo backend — proves the Dart client's application-level WebSocket, not just a
+      // byte tunnel.
+      final ws = await client.openWebSocket('ws-echo', '/echo');
+      final got = <WSMessage>[];
+      ws.onMessage = got.add;
+      ws.sendBinary(Uint8List.fromList(utf8.encode('hello ws')));
+      final wsDeadline = DateTime.now().add(const Duration(seconds: 5));
+      while (got.isEmpty && DateTime.now().isBefore(wsDeadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(got.length, 1);
+      expect(utf8.decode(got[0].data), 'hello ws');
+      ws.close();
+
       client.close();
     } finally {
       proc.kill();
