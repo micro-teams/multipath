@@ -19,6 +19,21 @@ const int frameReject =
 
 const int maxSegment = 32 * 1024;
 const int _dataHdrLen = 1 + 8 + 2 + 4;
+const int _twoPow32 = 0x100000000;
+
+// ByteData.setUint64/getUint64 are unsupported on the web target (dart2js throws at runtime — see
+// the class doc comment there; there's no JS 64-bit integer view). Wire offsets and nonces never
+// need more than 53 bits in practice (that's exabytes of a single stream), so splitting into two
+// big-endian u32 words via plain arithmetic — not bit shifts, which dart2js also treats specially at
+// this width — keeps the exact wire format from the comment above while working on every platform.
+void _setU64(ByteData v, int offset, int value) {
+  v.setUint32(offset, value ~/ _twoPow32);
+  v.setUint32(offset + 4, value % _twoPow32);
+}
+
+int _getU64(ByteData v, int offset) {
+  return v.getUint32(offset) * _twoPow32 + v.getUint32(offset + 4);
+}
 
 class Frame {
   final int type;
@@ -49,7 +64,7 @@ Uint8List encodeData(int offset, Uint8List payload) {
   final b = Uint8List(_dataHdrLen + payload.length);
   final v = ByteData.view(b.buffer);
   b[0] = frameData;
-  v.setUint64(1, offset);
+  _setU64(v, 1, offset);
   v.setUint16(9, payload.length);
   v.setUint32(11, _crc32(payload));
   b.setRange(_dataHdrLen, _dataHdrLen + payload.length, payload);
@@ -59,14 +74,14 @@ Uint8List encodeData(int offset, Uint8List payload) {
 Uint8List encodeAck(int cumulative) {
   final b = Uint8List(9);
   b[0] = frameAck;
-  ByteData.view(b.buffer).setUint64(1, cumulative);
+  _setU64(ByteData.view(b.buffer), 1, cumulative);
   return b;
 }
 
 Uint8List encodeNonce(int type, int nonce) {
   final b = Uint8List(9);
   b[0] = type;
-  ByteData.view(b.buffer).setUint64(1, nonce);
+  _setU64(ByteData.view(b.buffer), 1, nonce);
   return b;
 }
 
@@ -107,7 +122,7 @@ class FrameReader {
         return Frame(frameHello, connId: connId, linkIdx: linkIdx);
       case frameData:
         if (_buf.length < _dataHdrLen) return null;
-        final offset = v.getUint64(1);
+        final offset = _getU64(v, 1);
         final n = v.getUint16(9);
         final want = v.getUint32(11);
         if (n > maxSegment)
@@ -121,14 +136,14 @@ class FrameReader {
         return Frame(frameData, offset: offset, payload: payload);
       case frameAck:
         if (_buf.length < 9) return null;
-        final cum = v.getUint64(1);
+        final cum = _getU64(v, 1);
         _consume(9);
         return Frame(frameAck, offset: cum);
       case framePing:
       case framePong:
         if (_buf.length < 9) return null;
         final type = _buf[0];
-        final nonce = v.getUint64(1);
+        final nonce = _getU64(v, 1);
         _consume(9);
         return Frame(type, nonce: nonce);
       case frameReject:
