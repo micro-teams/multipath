@@ -31,6 +31,7 @@ void main() {
     final (port, proc) = await startOrigin(n);
     try {
       final lines = List.generate(n, (_) => 'ws://127.0.0.1:$port');
+      final linkEvents = <LinkState>[];
       final client = await Client.dial(
         lines,
         pingInterval: const Duration(milliseconds: 20),
@@ -38,6 +39,7 @@ void main() {
         ackInterval: const Duration(milliseconds: 8),
         reconnectDelay: const Duration(milliseconds: 20),
         maxDelay: const Duration(milliseconds: 200),
+        onLinkState: linkEvents.add,
       );
 
       // Tunnel: write, half-close, read the echo back to EOF.
@@ -54,19 +56,18 @@ void main() {
       }
       expect(echoed.takeBytes(), msg);
 
-      // Normal: a raw HTTP round trip to the origin's own greeter.
-      final http = client.openNormal();
-      await http.write(utf8.encode(
-          'GET /xlang HTTP/1.1\r\nHost: origin\r\nConnection: close\r\n\r\n'));
-      final resp = BytesBuilder();
-      while (true) {
-        final chunk = await http.read();
-        if (chunk == null) break;
-        resp.add(chunk);
-      }
-      final text = utf8.decode(resp.takeBytes());
-      expect(text, contains('200'));
-      expect(text, endsWith('hello /xlang'));
+      // Normal: an HTTP round trip via the client's roundTrip helper — the library serializes the
+      // request and parses the response (status/headers/body), so the caller writes no HTTP by hand.
+      final resp = await client
+          .roundTrip(MultipathRequest('GET', Uri.parse('http://origin/xlang')));
+      expect(resp.statusCode, 200);
+      expect(utf8.decode(resp.body), endsWith('hello /xlang'));
+
+      // The redundant transport exposes per-line health, and up transitions were reported.
+      final stats = client.stats();
+      expect(stats.length, n);
+      expect(stats.every((s) => s.state == 'up'), isTrue);
+      expect(linkEvents.any((e) => e.up), isTrue);
 
       client.close();
     } finally {
