@@ -76,4 +76,40 @@ void main() {
   },
       timeout: const Timeout(Duration(seconds: 40)),
       skip: cp == null ? 'set MP_JVM_CP' : false);
+
+  test('an out-of-range link is rejected by the JVM origin with a reason',
+      () async {
+    final (port, proc) = await startOrigin(1); // origin accepts index 0 only
+    try {
+      final linkEvents = <LinkState>[];
+      // Offer two lines to a one-line origin; line index 1 is out of range and must be refused.
+      final client = await Client.dial(
+        List.generate(2, (_) => 'ws://127.0.0.1:$port'),
+        pingInterval: const Duration(milliseconds: 20),
+        deadAfter: const Duration(seconds: 2),
+        reconnectDelay: const Duration(milliseconds: 20),
+        maxDelay: const Duration(milliseconds: 200),
+        onLinkState: linkEvents.add,
+      );
+
+      final deadline = DateTime.now().add(const Duration(seconds: 5));
+      while (DateTime.now().isBefore(deadline) &&
+          !linkEvents.any((e) =>
+              e.index == 1 && !e.up && e.reason.contains('out of range'))) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(
+          linkEvents.any((e) =>
+              e.index == 1 && !e.up && e.reason.contains('out of range')),
+          isTrue,
+          reason: 'link 1 should be reported rejected with the origin reason');
+      expect(client.stats()[0].state, 'up'); // in-range link still works
+
+      client.close();
+    } finally {
+      proc.kill();
+    }
+  },
+      timeout: const Timeout(Duration(seconds: 40)),
+      skip: cp == null ? 'set MP_JVM_CP' : false);
 }

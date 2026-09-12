@@ -21,6 +21,7 @@ internal const val FRAME_ACK = 0x02
 internal const val FRAME_PING = 0x03
 internal const val FRAME_PONG = 0x04
 internal const val FRAME_HELLO = 0x05
+internal const val FRAME_REJECT = 0x06 // server→client: link refused, with a reason; do not retry
 
 internal const val MAX_SEGMENT = 32 * 1024
 internal const val DATA_HDR_LEN = 1 + 8 + 2 + 4
@@ -36,6 +37,7 @@ internal class Frame(
     val nonce: Long = 0, // PING/PONG
     val connId: ByteArray? = null, // HELLO (16 bytes)
     val linkIdx: Int = 0, // HELLO
+    val reason: String = "", // REJECT
 )
 
 internal fun crc32(b: ByteArray): Long {
@@ -109,6 +111,19 @@ internal fun encodeNonce(type: Int, nonce: Long): ByteArray {
     return b
 }
 
+/**
+ * Frames a server→client refusal with a UTF-8 reason (bounded so a bad length can't over-allocate).
+ */
+internal fun encodeReject(reason: String): ByteArray {
+    var r = reason.toByteArray(Charsets.UTF_8)
+    if (r.size > MAX_SEGMENT) r = r.copyOfRange(0, MAX_SEGMENT)
+    val b = ByteArray(3 + r.size)
+    b[0] = FRAME_REJECT.toByte()
+    putU16(b, 1, r.size)
+    System.arraycopy(r, 0, b, 3, r.size)
+    return b
+}
+
 /** Reads whole frames off a link, reassembling across arbitrary chunk boundaries. */
 internal class FrameReader(private val input: InputStream) {
     private fun readFully(b: ByteArray) {
@@ -151,6 +166,15 @@ internal class FrameReader(private val input: InputStream) {
                 val b = ByteArray(8)
                 readFully(b)
                 Frame(t[0].toInt() and 0xFF, nonce = u64(b, 0))
+            }
+            FRAME_REJECT -> {
+                val l = ByteArray(2)
+                readFully(l)
+                val n = u16(l, 0)
+                if (n > MAX_SEGMENT) throw CorruptFrameException()
+                val buf = ByteArray(n)
+                readFully(buf)
+                Frame(FRAME_REJECT, reason = String(buf, Charsets.UTF_8))
             }
             else -> throw CorruptFrameException()
         }

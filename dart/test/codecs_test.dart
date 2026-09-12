@@ -39,6 +39,14 @@ void main() {
     expect(frames[4].nonce, 43);
   });
 
+  test('REJECT frame round-trips with its reason', () {
+    final wire = encodeReject('link index 5 out of range (n=1)');
+    final frames = drainByteByByte(wire);
+    expect(frames.length, 1);
+    expect(frames[0].type, frameReject);
+    expect(frames[0].reason, 'link index 5 out of range (n=1)');
+  });
+
   test('detects a corrupt DATA payload', () {
     final wire = encodeData(0, Uint8List.fromList([1, 2, 3, 4]));
     wire[wire.length - 1] ^= 0xff;

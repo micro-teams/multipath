@@ -16,6 +16,7 @@ export const FrameType = {
   Ping: 0x03,
   Pong: 0x04,
   Hello: 0x05,
+  Reject: 0x06, // server→client: link refused, with a UTF-8 reason; do not retry it
 } as const;
 
 export const MAX_SEGMENT = 32 * 1024; // largest DATA payload, fits the u16 length
@@ -25,7 +26,21 @@ export type Frame =
   | { type: typeof FrameType.Hello; connID: Uint8Array; linkIdx: number }
   | { type: typeof FrameType.Data; offset: bigint; payload: Uint8Array }
   | { type: typeof FrameType.Ack; cumulative: bigint }
-  | { type: typeof FrameType.Ping | typeof FrameType.Pong; nonce: bigint };
+  | { type: typeof FrameType.Ping | typeof FrameType.Pong; nonce: bigint }
+  | { type: typeof FrameType.Reject; reason: string };
+
+const textDecoder = new TextDecoder();
+const textEncoder = new TextEncoder();
+
+export function encodeReject(reason: string): Uint8Array {
+  let r = textEncoder.encode(reason);
+  if (r.length > MAX_SEGMENT) r = r.subarray(0, MAX_SEGMENT);
+  const b = new Uint8Array(3 + r.length);
+  b[0] = FrameType.Reject;
+  new DataView(b.buffer).setUint16(1, r.length);
+  b.set(r, 3);
+  return b;
+}
 
 export function encodeHello(connID: Uint8Array, linkIdx: number): Uint8Array {
   const b = new Uint8Array(1 + 16 + 2);
@@ -111,6 +126,15 @@ export class FrameReader {
         const nonce = v.getBigUint64(1);
         this.consume(9);
         return { type, nonce };
+      }
+      case FrameType.Reject: {
+        if (this.buf.length < 3) return null;
+        const n = v.getUint16(1);
+        if (n > MAX_SEGMENT) throw new Error('multipath: corrupt frame (oversize REJECT)');
+        if (this.buf.length < 3 + n) return null;
+        const reason = textDecoder.decode(this.buf.subarray(3, 3 + n));
+        this.consume(3 + n);
+        return { type: FrameType.Reject, reason };
       }
       default:
         throw new Error(`multipath: corrupt frame (unknown tag ${this.buf[0]})`);

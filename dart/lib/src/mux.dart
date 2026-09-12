@@ -26,6 +26,17 @@ class MuxSession {
 
   MuxSession._(this._transport, bool client) : _nextId = client ? 1 : 2 {
     _transport.onDeliver = _onBytes;
+    // When the transport closes (e.g. every line rejected by the origin), fail the streams with its
+    // reason so a pending read/write returns fast instead of hanging.
+    _transport.onClose = _failAll;
+  }
+
+  void _failAll(Object? err) {
+    final e = err ?? StateError('multipath: transport closed');
+    for (final st in _streams.values) {
+      st._fail(e);
+    }
+    _streams.clear();
   }
 
   factory MuxSession.client(RedundantStream transport) =>
@@ -184,6 +195,12 @@ class MuxStream {
 
   void _onReset() {
     _err ??= StateError('multipath: stream reset');
+    _wakeReaders();
+    _wakeWriters();
+  }
+
+  void _fail(Object err) {
+    _err ??= err;
     _wakeReaders();
     _wakeWriters();
   }

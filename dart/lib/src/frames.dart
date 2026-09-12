@@ -6,6 +6,7 @@
 //   PING  0x03 | nonce:u64
 //   PONG  0x04 | nonce:u64
 
+import 'dart:convert';
 import 'dart:typed_data';
 
 const int frameData = 0x01;
@@ -13,6 +14,8 @@ const int frameAck = 0x02;
 const int framePing = 0x03;
 const int framePong = 0x04;
 const int frameHello = 0x05;
+const int frameReject =
+    0x06; // server→client: link refused, with a reason; do not retry
 
 const int maxSegment = 32 * 1024;
 const int _dataHdrLen = 1 + 8 + 2 + 4;
@@ -24,12 +27,14 @@ class Frame {
   final int nonce; // PING / PONG
   final Uint8List? connId; // HELLO
   final int linkIdx; // HELLO
+  final String reason; // REJECT
   Frame(this.type,
       {this.offset = 0,
       this.payload,
       this.nonce = 0,
       this.connId,
-      this.linkIdx = 0});
+      this.linkIdx = 0,
+      this.reason = ''});
 }
 
 Uint8List encodeHello(Uint8List connId, int linkIdx) {
@@ -62,6 +67,17 @@ Uint8List encodeNonce(int type, int nonce) {
   final b = Uint8List(9);
   b[0] = type;
   ByteData.view(b.buffer).setUint64(1, nonce);
+  return b;
+}
+
+/// Frames a server→client refusal with a UTF-8 reason (bounded so a bad length can't over-allocate).
+Uint8List encodeReject(String reason) {
+  var r = utf8.encode(reason);
+  if (r.length > maxSegment) r = r.sublist(0, maxSegment);
+  final b = Uint8List(3 + r.length);
+  b[0] = frameReject;
+  ByteData.view(b.buffer).setUint16(1, r.length);
+  b.setRange(3, 3 + r.length, r);
   return b;
 }
 
@@ -115,6 +131,15 @@ class FrameReader {
         final nonce = v.getUint64(1);
         _consume(9);
         return Frame(type, nonce: nonce);
+      case frameReject:
+        if (_buf.length < 3) return null;
+        final n = v.getUint16(1);
+        if (n > maxSegment)
+          throw StateError('multipath: corrupt frame (oversize REJECT)');
+        if (_buf.length < 3 + n) return null;
+        final reason = utf8.decode(_buf.sublist(3, 3 + n));
+        _consume(3 + n);
+        return Frame(frameReject, reason: reason);
       default:
         throw StateError('multipath: corrupt frame (unknown tag ${_buf[0]})');
     }
