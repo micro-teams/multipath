@@ -49,6 +49,14 @@ WebSocket server the service's handler is fronting. Written once here rather tha
 because a browser has no other way to do it: a service worker's `fetch` handler never sees WebSocket
 traffic, and the platform's own `WebSocket` can't be pointed at an arbitrary byte stream.
 
+For Dart specifically, L2 itself (the per-link WebSocket that carries the redundant stream, not the
+application-level one above) has the same platform split: `dart:io`'s `WebSocket` is absent at
+compile time on web, so `dart/lib/src/link.dart` picks between a `dart:io`-based implementation
+(`link_io.dart`) and a `package:web`-based one (`link_web.dart`) via a conditional export, keeping
+everything above L2 (mux, client) unaware of which platform it's on. This is the one place the Dart
+package takes a dependency (`package:web`) — everywhere else it stays at zero, matching the other
+three languages' from-scratch wire-format code.
+
 ## The one assumption everything rests on
 
 **Every route leads to the same origin.** Routes are different *network paths*, not different

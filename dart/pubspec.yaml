@@ -6,3 +6,5 @@ environment:
   sdk: ^3.5.0
 dev_dependencies:
   test: ^1.25.0
+dependencies:
+  web: ^1.1.1
