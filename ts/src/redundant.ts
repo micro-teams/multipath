@@ -11,6 +11,27 @@
 import { FrameType, MAX_SEGMENT, encodeAck, encodeData, encodeNonce } from './frames.js';
 import { Link, openWebSocketLink } from './link.js';
 
+// LinkState is reported to onLinkState the moment a line's up/down state changes — the edge a log
+// wants. up is true on (re)connect, false on drop; reason is the cause of a drop (empty on up);
+// durationMs is how long the line spent in the state it just left.
+export interface LinkState {
+  index: number;
+  up: boolean;
+  reason: string;
+  durationMs: number;
+}
+
+// LinkStat is a point-in-time snapshot of one line — the level a status view wants. state is "up",
+// "connecting" (never yet up) or "down" (was up, now reconnecting). lastByteMs is when a frame last
+// arrived (0 if never). reconnects counts recoveries after a drop; reason is the last drop cause.
+export interface LinkStat {
+  index: number;
+  state: string;
+  lastByteMs: number;
+  reconnects: number;
+  reason: string;
+}
+
 export interface RedundantOptions {
   urls: string[]; // one per line; a link is opened (and reconnected) to each
   window?: number; // max unacknowledged bytes before write() awaits ACKs; default 4MiB
@@ -19,6 +40,9 @@ export interface RedundantOptions {
   ackIntervalMs?: number; // default 50
   reconnectDelayMs?: number; // default 200, doubling to maxDelayMs
   maxDelayMs?: number; // default 5000
+  // Called once per line up/down transition (never on the hot path). Edge-triggered: a repeatedly
+  // failing reconnect does not re-fire it, but the latest reason shows up in stats(). Optional.
+  onLinkState?: (e: LinkState) => void;
   wsCtor?: typeof WebSocket; // injected in tests
   now?: () => number; // injected in tests
 }
@@ -28,13 +52,19 @@ interface LinkSlot {
   lastSeen: number;
   backoff: number;
   reconnectTimer: ReturnType<typeof setTimeout> | null;
+  state: string; // "up" | "connecting" | "down"
+  since: number; // when the current state was entered
+  reconnects: number;
+  reason: string;
+  reapReason: string; // "why" stamped by the reaper before it closes a silent link
 }
 
 export class RedundantStream {
   readonly connID: Uint8Array;
-  private opt: Required<Omit<RedundantOptions, 'wsCtor' | 'now'>>;
+  private opt: Required<Omit<RedundantOptions, 'wsCtor' | 'now' | 'onLinkState'>>;
   private wsCtor: typeof WebSocket;
   private now: () => number;
+  private onLinkState: (e: LinkState) => void;
 
   private slots: LinkSlot[];
   private sendBuf = new Uint8Array(0); // unacknowledged bytes: [ackedOffset, sendOffset)
@@ -64,6 +94,7 @@ export class RedundantStream {
     };
     this.wsCtor = opt.wsCtor ?? WebSocket;
     this.now = opt.now ?? Date.now;
+    this.onLinkState = opt.onLinkState ?? (() => {});
     this.connID = new Uint8Array(16);
     crypto.getRandomValues(this.connID);
     this.slots = this.opt.urls.map(() => ({
@@ -71,6 +102,11 @@ export class RedundantStream {
       lastSeen: this.now(),
       backoff: this.opt.reconnectDelayMs,
       reconnectTimer: null,
+      state: 'connecting',
+      since: this.now(),
+      reconnects: 0,
+      reason: '',
+      reapReason: '',
     }));
     this.openPromise = new Promise((resolve) => (this.onOpenResolve = resolve));
   }
@@ -80,6 +116,41 @@ export class RedundantStream {
     for (let i = 0; i < this.slots.length; i++) this.connect(i);
     this.pingTimer = setInterval(() => this.tick(), this.opt.pingIntervalMs);
     await this.openPromise;
+  }
+
+  // markUp records line i as connected, firing onLinkState on a real transition (edge-triggered).
+  private markUp(i: number): void {
+    const slot = this.slots[i];
+    if (slot.state === 'up') return;
+    const was = slot.state;
+    const durationMs = this.now() - slot.since;
+    slot.state = 'up';
+    slot.since = this.now();
+    if (was === 'down') slot.reconnects++;
+    this.onLinkState({ index: i, up: true, reason: '', durationMs });
+  }
+
+  // markDown records line i as down with a reason. Always updates the last reason; fires onLinkState
+  // only on a real up→down / connecting→down transition, so repeated failed reconnects don't spam.
+  private markDown(i: number, reason: string): void {
+    const slot = this.slots[i];
+    slot.reason = reason;
+    if (slot.state === 'down') return;
+    const durationMs = this.now() - slot.since;
+    slot.state = 'down';
+    slot.since = this.now();
+    this.onLinkState({ index: i, up: false, reason, durationMs });
+  }
+
+  /** A snapshot of every line's current health. A status view reads this; a log uses onLinkState. */
+  stats(): LinkStat[] {
+    return this.slots.map((s, i) => ({
+      index: i,
+      state: s.state,
+      lastByteMs: s.lastSeen,
+      reconnects: s.reconnects,
+      reason: s.reason,
+    }));
   }
 
   private connect(i: number): void {
@@ -93,7 +164,9 @@ export class RedundantStream {
         onOpen: () => {
           slot.backoff = this.opt.reconnectDelayMs;
           slot.lastSeen = this.now();
+          slot.reapReason = '';
           this.replay(slot); // resume: resend everything still unacknowledged
+          this.markUp(i);
           if (!this.opened) {
             this.opened = true;
             this.onOpenResolve?.();
@@ -105,6 +178,8 @@ export class RedundantStream {
         },
         onClose: () => {
           slot.link = null;
+          this.markDown(i, slot.reapReason || 'connection closed');
+          slot.reapReason = '';
           this.scheduleReconnect(i);
         },
       },
@@ -240,6 +315,9 @@ export class RedundantStream {
       if (now - slot.lastSeen > this.opt.deadAfterMs) {
         const dead = slot.link;
         slot.link = null;
+        // close() suppresses the link's own onClose, so mark it down here with the real cause.
+        slot.reapReason = `no data for ${this.opt.deadAfterMs}ms`;
+        this.markDown(i, slot.reapReason);
         dead.close();
         this.scheduleReconnect(i);
         continue;

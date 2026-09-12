@@ -104,6 +104,12 @@ func (c *Client) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
+// Stats returns a snapshot of every underlying line's health (up/connecting/down, last byte seen,
+// reconnect count, last drop reason). A status view reads this; to react to changes as they happen,
+// set ClientOptions.Redundant.OnLinkState instead. The redundant transport hides line failure from
+// the data path on purpose — this is how a caller sees the failures it is surviving.
+func (c *Client) Stats() []LinkStat { return c.rs.Stats() }
+
 // Close tears down the redundant transport and every stream on it.
 func (c *Client) Close() error { return c.sess.Close() }
 
