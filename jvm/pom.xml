@@ -3,7 +3,7 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>app.microteams</groupId>
     <artifactId>multipath</artifactId>
-    <version>0.2.0</version>
+    <version>0.2.0-rc.2</version>
     <name>multipath</name>
     <description>Redundant multi-path transport: one reliable, multiplexed byte stream over many network paths to one origin.</description>
     <url>https://github.com/micro-teams/multipath</url>
