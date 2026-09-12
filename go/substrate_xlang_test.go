@@ -80,9 +80,9 @@ func TestXLangSubstrateGoClientJavaOrigin(t *testing.T) {
 	t.Cleanup(func() { c.Close() })
 
 	t.Run("tunnel", func(t *testing.T) {
-		st, err := c.OpenTunnel("echo:0", []byte("ticket"))
+		st, err := c.Open("echo", []byte("ticket"))
 		if err != nil {
-			t.Fatalf("OpenTunnel: %v", err)
+			t.Fatalf("Open: %v", err)
 		}
 		msg := randBytes(48 << 10)
 		go func() { _, _ = st.Write(msg); _ = st.Close() }()
@@ -97,7 +97,7 @@ func TestXLangSubstrateGoClientJavaOrigin(t *testing.T) {
 
 	t.Run("normal-http", func(t *testing.T) {
 		req, _ := http.NewRequest(http.MethodGet, "http://origin/xlang", nil)
-		resp, err := c.RoundTrip(req)
+		resp, err := c.RoundTrip("greeter", nil, req)
 		if err != nil {
 			t.Fatalf("RoundTrip: %v", err)
 		}

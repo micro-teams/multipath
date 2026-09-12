@@ -48,17 +48,12 @@ class Client {
     return Client._(sess, rs);
   }
 
-  /// Opens an opaque tunnel to [target], carrying [ticket] for the origin to authorise egress.
-  MuxStream openTunnel(String target, {Uint8List? ticket}) {
-    return _open(Header(kindTunnel, target: target, ticket: ticket));
-  }
-
-  /// Opens a stream bound for the origin's own service.
-  MuxStream openNormal() => _open(Header(kindNormal));
-
-  MuxStream _open(Header header) {
+  /// Opens a stream to the named [service], carrying [ticket] for the origin's handler to authorise
+  /// it. If the origin has not registered the name it resets the stream with a reason, which surfaces
+  /// as an error on the first read.
+  MuxStream open(String service, {Uint8List? ticket}) {
     final st = _sess.openStream();
-    st.write(encodeHeader(header));
+    st.write(encodeHeader(Header(service, ticket: ticket)));
     return st;
   }
 
@@ -69,8 +64,9 @@ class Client {
   /// chunked framing is handled here once instead of by every caller. Content-Length and
   /// Transfer-Encoding: chunked responses are both decoded; otherwise the body is delimited by the
   /// stream's EOF (the origin closes per response).
-  Future<MultipathResponse> roundTrip(MultipathRequest request) async {
-    final st = openNormal();
+  Future<MultipathResponse> roundTrip(String service, MultipathRequest request,
+      {Uint8List? ticket}) async {
+    final st = open(service, ticket: ticket);
     await st.write(_serializeRequest(request));
     final raw = await _readToEnd(st);
     return _parseResponse(raw);

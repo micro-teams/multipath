@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -64,7 +65,8 @@ func dialClientOverN(t *testing.T, origin string, n int) *Client {
 	return c
 }
 
-// startOrigin runs a multipath origin routing normal streams to app and tunnels to a fixed echo.
+// startOrigin runs a multipath origin registering an "app" service (dialled to appAddr) and an
+// "echo" service (dialled to echoAddr). Empty addresses register nothing under that name.
 func startOrigin(t *testing.T, appAddr, echoAddr string) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -72,11 +74,14 @@ func startOrigin(t *testing.T, appAddr, echoAddr string) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
-	router := Router(
-		DialLocal(appAddr),
-		func(target string, ticket []byte) (net.Conn, error) { return net.Dial("tcp", echoAddr) },
-	)
-	go Serve(ln, ServerOptions{}, router)
+	services := Services{}
+	if appAddr != "" {
+		services["app"] = DialService(appAddr)
+	}
+	if echoAddr != "" {
+		services["echo"] = DialService(echoAddr)
+	}
+	go Serve(ln, ServerOptions{}, services)
 	return ln.Addr().String()
 }
 
@@ -85,9 +90,9 @@ func TestSubstrateTunnel(t *testing.T) {
 	origin := startOrigin(t, "", echo)
 	c := dialClientOverN(t, origin, 3)
 
-	st, err := c.OpenTunnel("anything:0", []byte("ticket"))
+	st, err := c.Open("echo", []byte("ticket"))
 	if err != nil {
-		t.Fatalf("OpenTunnel: %v", err)
+		t.Fatalf("Open: %v", err)
 	}
 	msg := []byte("redundant tunnel bytes, deduped by offset")
 	if _, err := st.Write(msg); err != nil {
@@ -102,13 +107,33 @@ func TestSubstrateTunnel(t *testing.T) {
 	}
 }
 
+func TestSubstrateUnknownServiceRefused(t *testing.T) {
+	echo := tcpEcho(t)
+	origin := startOrigin(t, "", echo) // registers "echo" only
+	c := dialClientOverN(t, origin, 2)
+
+	st, err := c.Open("not-registered", []byte("ticket"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	// The origin refuses an unregistered service by name; the client sees it as a read error that
+	// carries the reason, not a hang and not a bare reset.
+	_, err = io.ReadFull(st, make([]byte, 1))
+	if err == nil {
+		t.Fatal("expected the unknown service to be refused")
+	}
+	if !strings.Contains(err.Error(), "unknown service") {
+		t.Fatalf("want an unknown-service reason, got %v", err)
+	}
+}
+
 func TestSubstrateHTTPRoundTrip(t *testing.T) {
 	app := httpHello(t)
 	origin := startOrigin(t, app, "")
 	c := dialClientOverN(t, origin, 2)
 
 	req, _ := http.NewRequest(http.MethodGet, "http://origin/greetings", nil)
-	resp, err := c.RoundTrip(req)
+	resp, err := c.RoundTrip("app", nil, req)
 	if err != nil {
 		t.Fatalf("RoundTrip: %v", err)
 	}

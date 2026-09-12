@@ -7,7 +7,7 @@ import {
   encodeHello,
   encodeNonce,
 } from '../src/frames.js';
-import { StreamKind, encodeHeader, readHeader } from '../src/header.js';
+import { encodeHeader, readHeader } from '../src/header.js';
 
 // Feeds bytes to a FrameReader one byte at a time — the worst case a WebSocket can hand it — and
 // collects every frame that falls out, proving reassembly across arbitrary chunk boundaries.
@@ -62,23 +62,21 @@ describe('redundant frames', () => {
 });
 
 describe('L5 header', () => {
-  it('round-trips kind, target and ticket, stopping at the boundary', () => {
+  it('round-trips service and ticket, stopping at the boundary', () => {
     for (const h of [
-      { kind: StreamKind.Normal },
-      { kind: StreamKind.Tunnel, target: 'api.anthropic.com:443' },
-      { kind: StreamKind.Tunnel, target: '10.0.0.1:8080', ticket: Uint8Array.of(9, 8, 7) },
+      { service: 'anthropic' },
+      { service: 'greeter', ticket: Uint8Array.of(9, 8, 7) },
     ]) {
       const wire = new Uint8Array([...encodeHeader(h), 0x58]); // a payload byte follows
       const out = readHeader(wire);
       expect(out).not.toBeNull();
-      expect(out!.header.kind).toBe(h.kind);
-      expect(out!.header.target).toBe(h.target ?? '');
+      expect(out!.header.service).toBe(h.service);
       expect(wire[out!.consumed]).toBe(0x58); // consumed exactly the header
     }
   });
 
   it('asks for more bytes when the header is incomplete', () => {
-    const wire = encodeHeader({ kind: StreamKind.Tunnel, target: 'host:1' });
+    const wire = encodeHeader({ service: 'echo' });
     expect(readHeader(wire.subarray(0, wire.length - 1))).toBeNull();
   });
 });

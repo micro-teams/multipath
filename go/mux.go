@@ -22,7 +22,8 @@
 //	SYN           0x01  length 0            open streamID
 //	DATA          0x02  length n            n bytes for streamID
 //	FIN           0x03  length 0            no more data from this side of streamID
-//	RST           0x04  length 0            abort streamID immediately
+//	RST           0x04  length n            abort streamID immediately; payload (if any) is a UTF-8
+//	                                         reason the peer surfaces on read (e.g. "unknown service")
 //	WINDOW_UPDATE 0x05  length 4            grant streamID this many more bytes of send credit
 //
 // Stream IDs: the client (session opener) uses odd IDs, the server uses even, so both may open
@@ -33,6 +34,7 @@ package multipath
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 )
@@ -214,7 +216,11 @@ func (s *Session) readLoop() {
 			}
 		case muxRst:
 			if st := s.getStream(id); st != nil {
-				st.shutdown(ErrStreamReset)
+				err := ErrStreamReset
+				if len(payload) > 0 {
+					err = fmt.Errorf("multipath: stream reset: %s", payload)
+				}
+				st.shutdown(err)
 				s.removeStream(id)
 			}
 		case muxWindow:
@@ -425,17 +431,34 @@ func (st *MuxStream) Close() error {
 }
 
 // Reset aborts the stream immediately in both directions.
-func (st *MuxStream) Reset() error {
+func (st *MuxStream) Reset() error { return st.ResetWithReason("") }
+
+// ResetWithReason aborts the stream and, if reason is non-empty, sends it so the peer's Read returns
+// an error carrying it — the origin uses this to say why it refused a stream (e.g. "unknown
+// service: X") instead of a bare, indistinguishable-from-a-network-drop reset.
+func (st *MuxStream) ResetWithReason(reason string) error {
 	st.mu.Lock()
 	st.closed = true
 	if st.err == nil {
-		st.err = ErrStreamReset
+		if reason != "" {
+			st.err = fmt.Errorf("multipath: stream reset: %s", reason)
+		} else {
+			st.err = ErrStreamReset
+		}
 	}
 	st.readable.Broadcast()
 	st.writable.Broadcast()
 	st.mu.Unlock()
 	st.sess.removeStream(st.id)
-	return st.sess.writeFrame(muxRst, st.id, nil)
+	var payload []byte
+	if reason != "" {
+		r := reason
+		if len(r) > maxHeaderField {
+			r = r[:maxHeaderField]
+		}
+		payload = []byte(r)
+	}
+	return st.sess.writeFrame(muxRst, st.id, payload)
 }
 
 func u32bytes(v uint32) []byte {

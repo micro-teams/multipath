@@ -1,12 +1,14 @@
-// The client end of the substrate: one redundant mux to the origin, carried over every line at
-// once, with each exchange a mux stream on top of it.
+// The client end of the substrate: one redundant mux to the origin, carried over every line at once,
+// with each exchange a mux stream on top of it.
 //
 // There is no line-picking and no per-request strategy here, because there is nothing to pick: a
 // request is a stream over the one redundant transport, and the redundant transport already writes
 // every byte to every live line and delivers each byte once from whichever line arrived first. A
-// dead line is simply never the fastest; there is no timeout to wait out and no retry to issue. So
-// what a caller does is open a stream — a tunnel to a target, or a normal exchange with the origin's
-// own service — and the redundancy is underneath, in the bytes, where it belongs.
+// dead line is simply never the fastest; there is no timeout to wait out and no retry to issue.
+//
+// Every stream names a service the origin has registered — there is no "normal vs tunnel" and no
+// client-chosen address. A caller opens a service by name (or does one HTTP round trip over it); the
+// redundancy is underneath, in the bytes, and the reachable set is exactly what the origin registered.
 
 package multipath
 
@@ -58,36 +60,27 @@ func Dial(ctx context.Context, opt ClientOptions) (*Client, error) {
 	return &Client{sess: NewClientSession(rs), rs: rs}, nil
 }
 
-// OpenTunnel opens an opaque duplex to target, carrying ticket for the origin to authorise egress.
-// The returned stream is a plain byte pipe; what rides it is the caller's business.
-func (c *Client) OpenTunnel(target string, ticket []byte) (*MuxStream, error) {
-	return c.open(Header{Kind: KindTunnel, Target: target, Ticket: ticket})
-}
-
-// OpenNormal opens a stream bound for the origin's own service — application traffic, not a tunnel.
-func (c *Client) OpenNormal() (*MuxStream, error) {
-	return c.open(Header{Kind: KindNormal})
-}
-
-func (c *Client) open(h Header) (*MuxStream, error) {
+// Open opens a stream to the named service, carrying ticket for the origin's handler to authorise it.
+// The returned stream is a plain byte pipe; what rides it is between the caller and that service. If
+// the origin has not registered the name it resets the stream with a reason, which surfaces as an
+// error on the first Read.
+func (c *Client) Open(service string, ticket []byte) (*MuxStream, error) {
 	st, err := c.sess.OpenStream()
 	if err != nil {
 		return nil, err
 	}
-	if err := WriteHeader(st, h); err != nil {
+	if err := WriteHeader(st, Header{Service: service, Ticket: ticket}); err != nil {
 		_ = st.Reset()
 		return nil, err
 	}
 	return st, nil
 }
 
-// RoundTrip carries one HTTP exchange over a normal stream: the request is written to a fresh stream
-// and the response read back off it. This is the drop-in for a consumer's HTTP stack — line
-// redundancy happens underneath without the caller knowing more than one path exists.
-//
-// It satisfies http.RoundTripper. Closing the response body releases the stream.
-func (c *Client) RoundTrip(req *http.Request) (*http.Response, error) {
-	st, err := c.OpenNormal()
+// RoundTrip carries one HTTP exchange over a stream to the named service: the request is written to a
+// fresh stream and the response read back off it. Line redundancy happens underneath without the
+// caller knowing more than one path exists. Closing the response body releases the stream.
+func (c *Client) RoundTrip(service string, ticket []byte, req *http.Request) (*http.Response, error) {
+	st, err := c.Open(service, ticket)
 	if err != nil {
 		return nil, err
 	}

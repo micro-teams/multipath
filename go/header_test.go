@@ -8,9 +8,9 @@ import (
 
 func TestHeaderRoundTrip(t *testing.T) {
 	cases := []Header{
-		{Kind: KindNormal},
-		{Kind: KindTunnel, Target: "api.anthropic.com:443"},
-		{Kind: KindTunnel, Target: "10.0.0.1:8080", Ticket: []byte("opaque-egress-cap")},
+		{Service: "anthropic"},
+		{Service: "greeter", Ticket: []byte("opaque-cap")},
+		{Service: "echo", Ticket: []byte("t")},
 	}
 	for _, want := range cases {
 		var buf bytes.Buffer
@@ -23,7 +23,7 @@ func TestHeaderRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %+v: %v", want, err)
 		}
-		if got.Kind != want.Kind || got.Target != want.Target || !bytes.Equal(got.Ticket, want.Ticket) {
+		if got.Service != want.Service || !bytes.Equal(got.Ticket, want.Ticket) {
 			t.Fatalf("round trip: got %+v want %+v", got, want)
 		}
 		if b, _ := buf.ReadByte(); b != 'X' {
@@ -33,7 +33,7 @@ func TestHeaderRoundTrip(t *testing.T) {
 }
 
 func TestHeaderRejectsOversizeField(t *testing.T) {
-	if err := WriteHeader(&bytes.Buffer{}, Header{Target: strings.Repeat("a", maxHeaderField+1)}); err == nil {
+	if err := WriteHeader(&bytes.Buffer{}, Header{Service: strings.Repeat("a", maxHeaderField+1)}); err == nil {
 		t.Fatal("expected an error writing an oversize field")
 	}
 }

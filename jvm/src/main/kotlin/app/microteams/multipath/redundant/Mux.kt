@@ -63,7 +63,10 @@ fun RedundantStream.asMuxTransport(): MuxTransport =
 
 class MuxSessionClosedException : IOException("multipath: mux session closed")
 
-class MuxStreamResetException : IOException("multipath: stream reset")
+class MuxStreamResetException(reason: String = "") :
+    IOException(
+        if (reason.isEmpty()) "multipath: stream reset" else "multipath: stream reset: $reason"
+    )
 
 /** Multiplexes many [MuxStream]s over one transport. */
 class MuxSession private constructor(private val transport: MuxTransport, client: Boolean) :
@@ -162,7 +165,8 @@ class MuxSession private constructor(private val transport: MuxTransport, client
                     MUX_DATA -> getStream(id)?.deliver(payload!!)
                     MUX_FIN -> getStream(id)?.remoteFin()
                     MUX_RST -> {
-                        getStream(id)?.shutdown(MuxStreamResetException())
+                        val reason = if (payload != null) String(payload, Charsets.UTF_8) else ""
+                        getStream(id)?.shutdown(MuxStreamResetException(reason))
                         removeStream(id)
                     }
                     MUX_WINDOW ->
@@ -310,16 +314,24 @@ class MuxStream internal constructor(private val sess: MuxSession, private val i
     }
 
     /** Abort the stream in both directions (RST). */
-    fun reset() {
+    fun reset() = resetWithReason("")
+
+    /**
+     * Abort the stream and, if [reason] is non-empty, send it so the peer's read throws an error
+     * carrying it — the origin uses this to say why it refused a stream (e.g. an unknown service)
+     * instead of a bare reset indistinguishable from a network drop.
+     */
+    fun resetWithReason(reason: String) {
         lock.withLock {
             closed = true
-            if (error == null) error = MuxStreamResetException()
+            if (error == null) error = MuxStreamResetException(reason)
             readable.signalAll()
             writable.signalAll()
         }
         sess.removeStream(id)
+        val payload = if (reason.isEmpty()) null else reason.toByteArray(Charsets.UTF_8)
         try {
-            sess.writeFrame(MUX_RST, id, null, 0, 0)
+            sess.writeFrame(MUX_RST, id, payload, 0, payload?.size ?: 0)
         } catch (_: Exception) {}
     }
 

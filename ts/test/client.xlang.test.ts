@@ -48,7 +48,7 @@ describe('browser client cross-language', () => {
         const client = await Client.dial(lines, fast);
 
         // Tunnel: write, half-close, read the echo back to EOF.
-        const st = client.openTunnel('echo:0', new TextEncoder().encode('ticket'));
+        const st = client.open('echo', new TextEncoder().encode('ticket'));
         const msg = new Uint8Array(20 * 1024).map((_, i) => (i * 7 + 3) & 0xff);
         await st.write(msg);
         st.closeWrite();
@@ -61,7 +61,7 @@ describe('browser client cross-language', () => {
         expect(Uint8Array.from(echoed)).toEqual(msg);
 
         // Normal: an HTTP round trip to the origin's own greeter.
-        const resp = await client.fetch(new Request('http://origin/xlang'));
+        const resp = await client.fetch('greeter', new Request('http://origin/xlang'));
         expect(resp.status).toBe(200);
         expect(await resp.text()).toBe('hello /xlang');
 

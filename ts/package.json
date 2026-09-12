@@ -1,6 +1,6 @@
 {
   "name": "@micro-teams/multipath",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Redundant multi-path transport for the browser: one reliable, multiplexed byte stream over many network paths to one origin.",
   "license": "MIT",
   "type": "module",
