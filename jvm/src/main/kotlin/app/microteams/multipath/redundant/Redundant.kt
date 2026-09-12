@@ -22,6 +22,27 @@ import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.thread
 import kotlin.concurrent.withLock
 
+/**
+ * Reported to [RedundantOptions.onLinkState] the moment a line's up/down state changes — the edge a
+ * log wants. [up] is true on (re)connect, false on drop; [reason] is the drop cause (empty on up);
+ * [durationMs] is how long the line spent in the state it just left.
+ */
+data class LinkState(val index: Int, val up: Boolean, val reason: String, val durationMs: Long)
+
+/**
+ * A point-in-time snapshot of one line — the level a status view wants. [state] is "up",
+ * "connecting" (never yet up) or "down" (was up, now reconnecting). [lastByteMs] is when a frame
+ * last arrived (0 if never). [reconnects] counts recoveries after a drop; [reason] is the last drop
+ * cause.
+ */
+data class LinkStat(
+    val index: Int,
+    val state: String,
+    val lastByteMs: Long,
+    val reconnects: Int,
+    val reason: String,
+)
+
 /** Tunables; zero/absent values take the defaults (mirroring the Go RedundantOptions). */
 data class RedundantOptions(
     val n: Int,
@@ -31,6 +52,12 @@ data class RedundantOptions(
     val ackIntervalMs: Long = 50,
     val reconnectDelayMs: Long = 200,
     val maxDelayMs: Long = 5000,
+    // Called once per line up/down transition (never on the hot path, never under the internal
+    // lock).
+    // Edge-triggered: repeated failed reconnects don't re-fire it, but the latest reason shows up
+    // in
+    // stats(). Optional.
+    val onLinkState: ((LinkState) -> Unit)? = null,
 )
 
 /** One underlying link: its streams plus a write lock so frames never interleave on the wire. */
@@ -131,6 +158,57 @@ internal constructor(
     private val lastSeen = LongArray(opt.n) { System.nanoTime() }
     private var closed = false
 
+    // Per-link observability (see LinkState/LinkStat). state ∈ {"up","connecting","down"}.
+    private val linkState = Array(opt.n) { "connecting" }
+    private val linkSince = LongArray(opt.n) { System.currentTimeMillis() }
+    private val linkReconn = IntArray(opt.n)
+    private val linkReason = arrayOfNulls<String>(opt.n)
+    private val lastByteMs = LongArray(opt.n)
+    private val reapReason = arrayOfNulls<String>(opt.n)
+
+    // markUp records link i as connected, firing onLinkState on a real transition. Must not hold
+    // lock.
+    private fun markUp(i: Int) {
+        var fire: LinkState? = null
+        lock.withLock {
+            if (i < 0 || i >= linkState.size || linkState[i] == "up") return
+            val was = linkState[i]
+            val dur = System.currentTimeMillis() - linkSince[i]
+            linkState[i] = "up"
+            linkSince[i] = System.currentTimeMillis()
+            if (was == "down") linkReconn[i]++
+            fire = LinkState(i, true, "", dur)
+        }
+        fire?.let { opt.onLinkState?.invoke(it) }
+    }
+
+    // markDown records link i as down with a reason; fires onLinkState only on a real transition,
+    // so
+    // repeated failed reconnects don't spam. Must not hold lock.
+    private fun markDown(i: Int, reason: String) {
+        var fire: LinkState? = null
+        lock.withLock {
+            if (i < 0 || i >= linkState.size) return
+            linkReason[i] = reason
+            if (linkState[i] == "down") return
+            val dur = System.currentTimeMillis() - linkSince[i]
+            linkState[i] = "down"
+            linkSince[i] = System.currentTimeMillis()
+            fire = LinkState(i, false, reason, dur)
+        }
+        fire?.let { opt.onLinkState?.invoke(it) }
+    }
+
+    /**
+     * A snapshot of every line's current health. A status view reads this; a log uses onLinkState.
+     */
+    fun stats(): List<LinkStat> =
+        lock.withLock {
+            (0 until opt.n).map { i ->
+                LinkStat(i, linkState[i], lastByteMs[i], linkReconn[i], linkReason[i] ?: "")
+            }
+        }
+
     internal fun start() {
         thread(isDaemon = true, name = "mp-keepalive") { keepaliveLoop() }
         thread(isDaemon = true, name = "mp-ack") { ackLoop() }
@@ -148,10 +226,18 @@ internal constructor(
     private fun connectLink(i: Int, firstTry: Boolean) {
         var delay = opt.reconnectDelayMs
         while (!isClosed()) {
-            val conn = dialer?.invoke(i)
+            val conn =
+                try {
+                    dialer?.invoke(i)
+                } catch (e: Exception) {
+                    markDown(i, "dial: ${e.message ?: e.javaClass.simpleName}")
+                    null
+                }
             if (conn != null) {
                 if (conn.write(encodeHello(connId, i)) && attachLink(i, conn)) return
                 if (isClosed()) return
+            } else {
+                markDown(i, linkReason[i] ?: "dial failed")
             }
             if (firstTry) return
             try {
@@ -175,6 +261,7 @@ internal constructor(
             links[i]?.close()
             links[i] = conn
             lastSeen[i] = System.nanoTime()
+            lastByteMs[i] = System.currentTimeMillis()
             base = sendBase
             replay = sendBuf.snapshot()
         }
@@ -185,11 +272,13 @@ internal constructor(
             off += len
         }
         thread(isDaemon = true, name = "mp-read-$i") { readLoop(i, conn) }
+        markUp(i)
         return true
     }
 
     private fun readLoop(i: Int, conn: LinkConn) {
         val r = FrameReader(conn.input)
+        var readErr: String? = null
         try {
             while (true) {
                 val f = r.next()
@@ -202,20 +291,30 @@ internal constructor(
                 }
                 touch(i)
             }
-        } catch (_: Exception) {
-            // fall through to reap
+        } catch (e: Exception) {
+            readErr = e.message ?: e.javaClass.simpleName
         }
         val reconnect: Boolean
+        val closing: Boolean
+        val hint: String?
         lock.withLock {
             if (links[i] === conn) links[i] = null
+            closing = closed
             reconnect = !closed && client
+            hint = reapReason[i]
+            reapReason[i] = null
         }
         conn.close()
+        if (!closing) markDown(i, hint ?: readErr ?: "link closed")
         if (reconnect)
             thread(isDaemon = true, name = "mp-reconnect-$i") { connectLink(i, firstTry = false) }
     }
 
-    private fun touch(i: Int) = lock.withLock { lastSeen[i] = System.nanoTime() }
+    private fun touch(i: Int) =
+        lock.withLock {
+            lastSeen[i] = System.nanoTime()
+            lastByteMs[i] = System.currentTimeMillis()
+        }
 
     // --- receive side ---
 
@@ -365,6 +464,7 @@ internal constructor(
                     if ((now - lastSeen[i]) / 1_000_000 > opt.deadAfterMs) {
                         toReap.add(l)
                         links[i] = null
+                        reapReason[i] = "no data for ${opt.deadAfterMs}ms"
                     } else {
                         toPing.add(l)
                     }

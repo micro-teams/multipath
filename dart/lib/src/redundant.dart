@@ -10,6 +10,31 @@ import 'dart:typed_data';
 import 'frames.dart';
 import 'link.dart';
 
+/// Reported to [RedundantOptions.onLinkState] the moment a line's up/down state changes — the edge a
+/// log wants. [up] is true on (re)connect, false on drop; [reason] is the drop cause (empty on up);
+/// [durationMs] is how long the line spent in the state it just left.
+class LinkState {
+  final int index;
+  final bool up;
+  final String reason;
+  final int durationMs;
+  LinkState(this.index, this.up, this.reason, this.durationMs);
+}
+
+/// A point-in-time snapshot of one line — the level a status view wants. [state] is "up",
+/// "connecting" (never yet up) or "down" (was up, now reconnecting). [lastByteMs] is when a frame
+/// last arrived (0 if never). [reconnects] counts recoveries after a drop; [reason] is the last drop
+/// cause.
+class LinkStat {
+  final int index;
+  final String state;
+  final int lastByteMs;
+  final int reconnects;
+  final String reason;
+  LinkStat(
+      this.index, this.state, this.lastByteMs, this.reconnects, this.reason);
+}
+
 class RedundantOptions {
   final List<String> urls;
   final int window;
@@ -19,6 +44,10 @@ class RedundantOptions {
   final Duration reconnectDelay;
   final Duration maxDelay;
   final WsConnect? connect;
+
+  /// Called once per line up/down transition (never on the hot path). Edge-triggered: a repeatedly
+  /// failing reconnect does not re-fire it, but the latest reason shows up in [RedundantStream.stats].
+  final void Function(LinkState)? onLinkState;
   RedundantOptions({
     required this.urls,
     this.window = 4 << 20,
@@ -28,6 +57,7 @@ class RedundantOptions {
     this.reconnectDelay = const Duration(milliseconds: 200),
     this.maxDelay = const Duration(seconds: 5),
     this.connect,
+    this.onLinkState,
   });
 }
 
@@ -36,7 +66,12 @@ class _Slot {
   int lastSeen;
   int backoffMs;
   Timer? reconnectTimer;
-  _Slot(this.lastSeen, this.backoffMs);
+  String state = 'connecting';
+  int sinceMs;
+  int reconnects = 0;
+  String reason = '';
+  String reapReason = '';
+  _Slot(this.lastSeen, this.backoffMs) : sinceMs = lastSeen;
 }
 
 class RedundantStream {
@@ -81,6 +116,37 @@ class RedundantStream {
     await _openCompleter.future;
   }
 
+  // _markUp records line i as connected, firing onLinkState on a real transition (edge-triggered).
+  void _markUp(int i) {
+    final slot = _slots[i];
+    if (slot.state == 'up') return;
+    final was = slot.state;
+    final dur = _nowMs - slot.sinceMs;
+    slot.state = 'up';
+    slot.sinceMs = _nowMs;
+    if (was == 'down') slot.reconnects++;
+    opt.onLinkState?.call(LinkState(i, true, '', dur));
+  }
+
+  // _markDown records line i as down with a reason. Always updates the last reason; fires
+  // onLinkState only on a real transition, so repeated failed reconnects don't spam.
+  void _markDown(int i, String reason) {
+    final slot = _slots[i];
+    slot.reason = reason;
+    if (slot.state == 'down') return;
+    final dur = _nowMs - slot.sinceMs;
+    slot.state = 'down';
+    slot.sinceMs = _nowMs;
+    opt.onLinkState?.call(LinkState(i, false, reason, dur));
+  }
+
+  /// A snapshot of every line's current health. A status view reads this; a log uses onLinkState.
+  List<LinkStat> stats() => List.generate(
+        _slots.length,
+        (i) => LinkStat(i, _slots[i].state, _slots[i].lastSeen,
+            _slots[i].reconnects, _slots[i].reason),
+      );
+
   void _connect(int i) {
     if (_closed) return;
     final slot = _slots[i];
@@ -92,7 +158,9 @@ class RedundantStream {
         onOpen: () {
           slot.backoffMs = opt.reconnectDelay.inMilliseconds;
           slot.lastSeen = _nowMs;
+          slot.reapReason = '';
           _replay(slot);
+          _markUp(i);
           if (!_opened) {
             _opened = true;
             if (!_openCompleter.isCompleted) _openCompleter.complete();
@@ -104,6 +172,12 @@ class RedundantStream {
         },
         onClose: () {
           slot.link = null;
+          _markDown(
+              i,
+              slot.reapReason.isNotEmpty
+                  ? slot.reapReason
+                  : 'connection closed');
+          slot.reapReason = '';
           _scheduleReconnect(i);
         },
       ),
@@ -114,7 +188,8 @@ class RedundantStream {
       } else {
         slot.link = link;
       }
-    }).catchError((_) {
+    }).catchError((Object e) {
+      _markDown(i, 'connect failed: $e');
       _scheduleReconnect(i);
     });
   }
@@ -239,6 +314,8 @@ class RedundantStream {
       if (link == null) continue;
       if (now - slot.lastSeen > opt.deadAfter.inMilliseconds) {
         slot.link = null;
+        // close() drives the link's onClose, which marks it down; stamp the real cause first.
+        slot.reapReason = 'no data for ${opt.deadAfter.inMilliseconds}ms';
         link.close();
         _scheduleReconnect(i);
         continue;

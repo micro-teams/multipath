@@ -63,8 +63,37 @@ const (
 	dataHdrLen = 1 + 8 + 2 + 4 // type + offset + len + crc
 )
 
+// LinkState is reported to RedundantOptions.OnLinkState the moment a link's up/down state changes —
+// the "edge" a log wants. Up is true when the link (re)connected, false when it dropped. Reason is
+// the cause on a drop ("" on an up). Duration is how long the link spent in the state it just left
+// (uptime on a drop; downtime/connecting-time on an up).
+type LinkState struct {
+	Index    int
+	Up       bool
+	Reason   string
+	Duration time.Duration
+}
+
+// LinkStat is a point-in-time snapshot of one link, returned by RedundantStream.Stats — the "level" a
+// status view wants. State is "up", "connecting" (never yet up, still dialling) or "down" (was up,
+// now broken and reconnecting). LastByte is when a frame last arrived on this link (zero if never).
+// Reconnects counts how many times it recovered after a drop. Reason is the last drop/dial cause.
+type LinkStat struct {
+	Index      int
+	State      string
+	LastByte   time.Time
+	Reconnects int
+	Reason     string
+}
+
 // RedundantOptions configures a RedundantStream. Zero values take the defaults.
 type RedundantOptions struct {
+	// OnLinkState, if set, is called once per link up/down transition (never on the hot path, and
+	// never while holding an internal lock — the callback may do anything, including log or block
+	// briefly). It is the edge-triggered channel: a repeatedly-failing reconnect does not re-fire it,
+	// but the latest reason is visible via Stats. Optional.
+	OnLinkState func(LinkState)
+
 	// N is the number of underlying links.
 	N int
 	// Dial opens link i (0..N-1). It is called once per link at start and again on every reconnect,
@@ -145,8 +174,94 @@ type RedundantStream struct {
 
 	lastSeen []time.Time // per-link time of last inbound frame; drives the keepalive reaper
 
+	// Per-link observability (see LinkState/LinkStat). state ∈ {"up","connecting","down"}.
+	linkState  []string
+	linkSince  []time.Time // when the current state was entered (for Duration)
+	linkReconn []int       // count of recoveries after a drop
+	linkReason []string    // last drop/dial cause
+	reapReason []string    // pending "why" set by the reaper before it closes a silent link
+
 	closed   bool
 	closeErr error
+}
+
+// initObserve sets the per-link observability slices to their starting state ("connecting"). Called
+// from both stream constructors.
+func (s *RedundantStream) initObserve(now time.Time) {
+	n := s.opt.N
+	s.linkState = make([]string, n)
+	s.linkSince = make([]time.Time, n)
+	s.linkReconn = make([]int, n)
+	s.linkReason = make([]string, n)
+	s.reapReason = make([]string, n)
+	for i := 0; i < n; i++ {
+		s.linkState[i] = "connecting"
+		s.linkSince[i] = now
+	}
+}
+
+// markUp records link i as connected and fires OnLinkState if that is a real transition. Must NOT be
+// called while holding s.mu.
+func (s *RedundantStream) markUp(i int) {
+	s.mu.Lock()
+	if i < 0 || i >= len(s.linkState) || s.linkState[i] == "up" {
+		s.mu.Unlock()
+		return
+	}
+	was := s.linkState[i]
+	dur := time.Since(s.linkSince[i])
+	s.linkState[i] = "up"
+	s.linkSince[i] = time.Now()
+	if was == "down" {
+		s.linkReconn[i]++
+	}
+	cb := s.opt.OnLinkState
+	s.mu.Unlock()
+	if cb != nil {
+		cb(LinkState{Index: i, Up: true, Duration: dur})
+	}
+}
+
+// markDown records link i as down with a reason. It always updates the last reason, but fires
+// OnLinkState only on a real up→down (or connecting→down) transition, so repeated failed reconnects
+// don't spam. Must NOT be called while holding s.mu.
+func (s *RedundantStream) markDown(i int, reason string) {
+	s.mu.Lock()
+	if i < 0 || i >= len(s.linkState) {
+		s.mu.Unlock()
+		return
+	}
+	s.linkReason[i] = reason
+	if s.linkState[i] == "down" {
+		s.mu.Unlock()
+		return
+	}
+	dur := time.Since(s.linkSince[i])
+	s.linkState[i] = "down"
+	s.linkSince[i] = time.Now()
+	cb := s.opt.OnLinkState
+	s.mu.Unlock()
+	if cb != nil {
+		cb(LinkState{Index: i, Up: false, Reason: reason, Duration: dur})
+	}
+}
+
+// Stats returns a snapshot of every link's current health. It never blocks on the network and is safe
+// to call at any time — a status view or health check reads it; a log reacts to OnLinkState instead.
+func (s *RedundantStream) Stats() []LinkStat {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]LinkStat, s.opt.N)
+	for i := 0; i < s.opt.N; i++ {
+		out[i] = LinkStat{
+			Index:      i,
+			State:      s.linkState[i],
+			LastByte:   s.lastSeen[i],
+			Reconnects: s.linkReconn[i],
+			Reason:     s.linkReason[i],
+		}
+	}
+	return out
 }
 
 // redundantLink is the writer half of one link. Reads happen in a per-link goroutine.
@@ -188,6 +303,7 @@ func DialRedundant(ctx context.Context, opt RedundantOptions) (*RedundantStream,
 	for i := range s.lastSeen {
 		s.lastSeen[i] = now
 	}
+	s.initObserve(now)
 	s.readable = sync.NewCond(&s.mu)
 	s.writable = sync.NewCond(&s.mu)
 
@@ -243,6 +359,7 @@ func newServerStream(opt RedundantOptions, connID [16]byte) *RedundantStream {
 	for i := range s.lastSeen {
 		s.lastSeen[i] = now
 	}
+	s.initObserve(now)
 	s.readable = sync.NewCond(&s.mu)
 	s.writable = sync.NewCond(&s.mu)
 	go s.keepaliveLoop()
@@ -354,6 +471,7 @@ func (s *RedundantStream) connectLink(dialCtx context.Context, i int, firstTry b
 			// HELLO first so the server can group this link (and a reconnect re-attaches).
 			if _, werr := conn.Write(encodeHello(s.connID, uint16(i))); werr != nil {
 				_ = conn.Close()
+				s.markDown(i, "hello write: "+werr.Error())
 			} else if s.attachLink(i, conn) {
 				return true
 			}
@@ -361,6 +479,8 @@ func (s *RedundantStream) connectLink(dialCtx context.Context, i int, firstTry b
 			if s.isClosed() {
 				return false
 			}
+		} else {
+			s.markDown(i, "dial: "+err.Error())
 		}
 		if firstTry {
 			return false
@@ -404,6 +524,7 @@ func (s *RedundantStream) attachLink(i int, conn io.ReadWriteCloser) bool {
 		}
 	}
 	go s.readLoop(i, l)
+	s.markUp(i)
 	return true
 }
 
@@ -427,9 +548,11 @@ func (s *RedundantStream) snapshotUnackedLocked() [][]byte {
 // reconnect it (the listener re-attaches the new link).
 func (s *RedundantStream) readLoop(i int, l *redundantLink) {
 	r := &frameReader{conn: l.conn}
+	var readErr error
 	for {
 		f, err := r.next()
 		if err != nil {
+			readErr = err
 			break
 		}
 		switch f.typ {
@@ -453,8 +576,20 @@ func (s *RedundantStream) readLoop(i int, l *redundantLink) {
 	}
 	closing := s.closed
 	client := s.client
+	reason := s.reapReason[i] // reaper's "why" wins over the resulting read error
+	s.reapReason[i] = ""
 	s.mu.Unlock()
 	_ = l.conn.Close()
+	if reason == "" {
+		if readErr != nil {
+			reason = readErr.Error()
+		} else {
+			reason = "link closed"
+		}
+	}
+	if !closing {
+		s.markDown(i, reason)
+	}
 	if !closing && client {
 		go s.connectLink(s.ctx, i, false)
 	}
@@ -669,6 +804,7 @@ func (s *RedundantStream) keepaliveLoop() {
 			if now.Sub(s.lastSeen[i]) > s.opt.DeadAfter {
 				toReap = append(toReap, reap{i, l})
 				s.links[i] = nil
+				s.reapReason[i] = "no data for " + s.opt.DeadAfter.String()
 			} else {
 				toPing = append(toPing, l)
 			}

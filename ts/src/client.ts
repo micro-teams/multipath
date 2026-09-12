@@ -7,7 +7,7 @@
 
 import { Header, StreamKind, encodeHeader } from './header.js';
 import { MuxSession, MuxStream } from './mux.js';
-import { RedundantOptions, RedundantStream } from './redundant.js';
+import { LinkStat, RedundantOptions, RedundantStream } from './redundant.js';
 
 export interface ClientOptions extends Omit<RedundantOptions, 'urls'> {
   // The WebSocket upgrade path the origin's link acceptor listens on; joined to each line. Defaults
@@ -58,6 +58,16 @@ export class Client {
     await st.write(await serializeRequest(request));
     const bytes = await readToEnd(st);
     return parseResponse(bytes);
+  }
+
+  /**
+   * A snapshot of every underlying line's health (up/connecting/down, last byte seen, reconnect
+   * count, last drop reason). A status view reads this; to react to changes as they happen, pass
+   * onLinkState in ClientOptions. Redundancy hides line failure from the data path on purpose — this
+   * is how a caller sees the failures it is surviving.
+   */
+  stats(): LinkStat[] {
+    return this.rs.stats();
   }
 
   close(): void {
