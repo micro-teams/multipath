@@ -6,7 +6,10 @@
  * one-shot HTTP reply, "ws-echo" a real WebSocket server that echoes whole messages back —
  * exercising a client's application-level WebSocket-over-the-substrate, not just a byte pipe.
  *
- * Args: <n>. Prints "LISTENING <port>" once ready, then serves.
+ * Args: <n> [port]. Prints "LISTENING <port>" once ready, then serves. [port] is normally omitted
+ * (an ephemeral port); it exists only so the browser-Dart e2e leg (a page can't read a port off this
+ * process's stdout the way the other clients do, since it can't spawn this process itself) can pin a
+ * known port ahead of time — see testbed/run.sh.
  */
 package app.microteams.multipath
 
@@ -18,6 +21,7 @@ object OriginMain {
     @JvmStatic
     fun main(args: Array<String>) {
         val n = args[0].toInt()
+        val port = args.getOrNull(1)?.toInt() ?: 0
 
         // Internal echo target for tunnel streams.
         val echo = ServerSocket(0)
@@ -62,7 +66,7 @@ object OriginMain {
                 deadAfterMs = 100,
                 ackIntervalMs = 8,
             )
-        val origin = Origin(ServerSocket(0), opt)
+        val origin = Origin(ServerSocket(port), opt)
         val services =
             mapOf(
                 "echo" to Origin.dialService("127.0.0.1", echo.localPort),

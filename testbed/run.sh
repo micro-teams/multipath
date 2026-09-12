@@ -45,31 +45,33 @@ echo "==> running the Dart WEB cross-language e2e (browser-native link_web.dart,
 # The native leg above proves link_io.dart; this proves link_web.dart the same way the TS leg proves
 # the browser client — except this one runs in an actual browser (dart test -p chrome), not Node,
 # because link_web.dart is package:web/dart:js_interop code a JS runtime alone can't exercise. A
-# browser page can't spawn the JVM origin itself, so it's started here and the port handed in via
-# --dart-define.
+# browser page can't spawn the JVM origin itself, so it's started here on a fixed port
+# (test/client_web_xlang_test.dart's _originPort — `dart test` has no supported way to pass a
+# compile-time define through to a browser suite, so both sides just agree on a constant).
+web_origin_port=47653
 if command -v dart >/dev/null 2>&1 &&
   { command -v google-chrome-stable >/dev/null 2>&1 || command -v google-chrome >/dev/null 2>&1 ||
     command -v chromium-browser >/dev/null 2>&1 || command -v chromium >/dev/null 2>&1; }; then
   origin_log="$(mktemp)"
-  java -cp "$MP_JVM_CP" app.microteams.multipath.OriginMain 3 >"$origin_log" 2>&1 &
+  java -cp "$MP_JVM_CP" app.microteams.multipath.OriginMain 3 "$web_origin_port" >"$origin_log" 2>&1 &
   origin_pid=$!
   cleanup_web_origin() { kill "$origin_pid" >/dev/null 2>&1 || true; }
   trap cleanup_web_origin EXIT
-  origin_port=""
+  ready=""
   for _ in $(seq 1 100); do
-    if grep -q '^LISTENING ' "$origin_log" 2>/dev/null; then
-      origin_port="$(grep '^LISTENING ' "$origin_log" | head -1 | awk '{print $2}')"
+    if grep -q "^LISTENING $web_origin_port\$" "$origin_log" 2>/dev/null; then
+      ready=1
       break
     fi
     sleep 0.1
   done
-  if [ -z "$origin_port" ]; then
-    echo "  origin never printed LISTENING; see $origin_log" >&2
+  if [ -z "$ready" ]; then
+    echo "  origin never printed LISTENING $web_origin_port; see $origin_log" >&2
     cat "$origin_log" >&2
     exit 1
   fi
   (cd "$dart_dir" && dart pub get >/dev/null &&
-    dart test -p chrome --dart-define=MP_ORIGIN_PORT="$origin_port" test/client_web_xlang_test.dart)
+    dart test -p chrome test/client_web_xlang_test.dart)
   cleanup_web_origin
   trap - EXIT
 else

@@ -7,18 +7,20 @@ import 'package:test/test.dart';
 // Cross-language proof for the Dart client compiled for the WEB target: run under a real browser
 // (`dart test -p chrome`), so this is what actually proves link_web.dart — the package:web L2 link —
 // works against a real WebSocket server, not just that it compiles. No dart:io here: a browser page
-// can't spawn the JVM origin itself, so testbed/run.sh starts it and passes the port in via
-// --dart-define=MP_ORIGIN_PORT=<port>. Skipped (both here and by run.sh) when that isn't set, e.g.
-// when running `dart test` directly without going through the testbed script, or when no browser is
-// available to run it against.
-const _port = int.fromEnvironment('MP_ORIGIN_PORT', defaultValue: 0);
+// can't spawn the JVM origin itself, so testbed/run.sh starts one ahead of time on this fixed port
+// (`dart test` has no supported way to pass a compile-time define or runtime arg through to a
+// browser suite, so a shared constant is simpler than fighting that). This test is only meaningful
+// run via testbed/run.sh; run standalone (no origin listening on this port), it fails outright
+// rather than skipping — there's no cheap way to detect "no origin" from inside a browser page
+// without first attempting and timing out the very connection this test exists to prove works.
+const _originPort = 47653;
 
 void main() {
   test(
       'web: tunnels and round-trips HTTP+WebSocket through a JVM origin over browser-native links',
       () async {
     final n = 3;
-    final lines = List.generate(n, (_) => 'ws://127.0.0.1:$_port');
+    final lines = List.generate(n, (_) => 'ws://127.0.0.1:$_originPort');
     final linkEvents = <LinkState>[];
     final client = await Client.dial(
       lines,
@@ -73,6 +75,5 @@ void main() {
 
     client.close();
   },
-      timeout: const Timeout(Duration(seconds: 40)),
-      skip: _port == 0 ? 'set --dart-define=MP_ORIGIN_PORT=<port>' : false);
+      timeout: const Timeout(Duration(seconds: 40)));
 }
