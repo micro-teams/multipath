@@ -9,6 +9,13 @@
 //	ACK   0x02 | cumulative:u64
 //	PING  0x03 | nonce:u64
 //	PONG  0x04 | nonce:u64
+//	REJECT 0x06 | reasonLen:u16 | reason[reasonLen]
+//
+// REJECT is the one frame that flows server→client: the origin refuses a link (e.g. a HELLO link
+// index out of range) and says why, in UTF-8, before closing. Without it a refused link is
+// indistinguishable from a flaky network — the client would back off, reconnect, be closed again,
+// forever, while Dial reported success (it only wrote HELLO) and every request hung. With it the
+// client surfaces the reason and stops retrying a link that will never be accepted.
 //
 // HELLO is the first frame a client sends on every link (initial dial and every reconnect). It lets
 // a server that accepts many independent TCP connections group them: all links carrying the same
@@ -30,6 +37,21 @@ type frame struct {
 	nonce   uint64   // PING / PONG
 	connID  [16]byte // HELLO
 	linkIdx uint16   // HELLO
+	reason  string   // REJECT
+}
+
+// encodeReject frames a server→client refusal carrying a UTF-8 reason. The reason is bounded so a
+// hostile length cannot force a large allocation on the client.
+func encodeReject(reason string) []byte {
+	r := []byte(reason)
+	if len(r) > maxSegment {
+		r = r[:maxSegment]
+	}
+	b := make([]byte, 1+2+len(r))
+	b[0] = frameReject
+	binary.BigEndian.PutUint16(b[1:], uint16(len(r)))
+	copy(b[3:], r)
+	return b
 }
 
 func encodeHello(connID [16]byte, linkIdx uint16) []byte {
@@ -121,6 +143,20 @@ func (r *frameReader) next() (frame, error) {
 			return frame{}, err
 		}
 		return frame{typ: t[0], nonce: binary.BigEndian.Uint64(b[:])}, nil
+	case frameReject:
+		var l [2]byte
+		if _, err := io.ReadFull(r.conn, l[:]); err != nil {
+			return frame{}, err
+		}
+		n := binary.BigEndian.Uint16(l[:])
+		if n > maxSegment {
+			return frame{}, errCorruptFrame
+		}
+		buf := make([]byte, n)
+		if _, err := io.ReadFull(r.conn, buf); err != nil {
+			return frame{}, err
+		}
+		return frame{typ: frameReject, reason: string(buf)}, nil
 	default:
 		return frame{}, errCorruptFrame
 	}

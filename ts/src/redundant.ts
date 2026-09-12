@@ -57,6 +57,7 @@ interface LinkSlot {
   reconnects: number;
   reason: string;
   reapReason: string; // "why" stamped by the reaper before it closes a silent link
+  rejected: boolean; // origin refused this link (REJECT) — never retry it
 }
 
 export class RedundantStream {
@@ -81,6 +82,12 @@ export class RedundantStream {
 
   /** Delivered, in-order bytes. Set by the mux above before any traffic flows. */
   onDeliver: (bytes: Uint8Array) => void = () => {};
+
+  /** Called when the stream closes; err is set when it closed with a cause (e.g. all links
+   * rejected). The mux above uses it to fail its streams so reads/writes don't hang. */
+  onClose: (err?: Error) => void = () => {};
+
+  private closeErr: Error | null = null;
 
   constructor(opt: RedundantOptions) {
     this.opt = {
@@ -107,6 +114,7 @@ export class RedundantStream {
       reconnects: 0,
       reason: '',
       reapReason: '',
+      rejected: false,
     }));
     this.openPromise = new Promise((resolve) => (this.onOpenResolve = resolve));
   }
@@ -174,10 +182,11 @@ export class RedundantStream {
         },
         onFrame: (frame) => {
           slot.lastSeen = this.now();
-          this.onFrame(frame, slot);
+          this.onFrame(frame, slot, i);
         },
         onClose: () => {
           slot.link = null;
+          if (slot.rejected) return; // refused by origin; already marked down, never retry
           this.markDown(i, slot.reapReason || 'connection closed');
           slot.reapReason = '';
           this.scheduleReconnect(i);
@@ -205,10 +214,25 @@ export class RedundantStream {
       payload?: Uint8Array;
       cumulative?: bigint;
       nonce?: bigint;
+      reason?: string;
     },
     slot: LinkSlot,
+    i: number,
   ): void {
     switch (frame.type) {
+      case FrameType.Reject: {
+        // The origin refused this link and said why. Mark it down, never retry it, and if every
+        // link is refused, close the stream with the reason so reads/writes fail fast.
+        const reason = frame.reason ?? '';
+        slot.rejected = true;
+        this.markDown(i, 'origin rejected: ' + reason);
+        slot.link?.close();
+        slot.link = null;
+        if (this.slots.every((s) => s.rejected)) {
+          this.closeWithError(new Error('multipath: all links rejected by origin: ' + reason));
+        }
+        return;
+      }
       case FrameType.Data: {
         const offset = frame.offset!;
         const payload = frame.payload!;
@@ -241,11 +265,11 @@ export class RedundantStream {
 
   /** Writes bytes, awaiting the send window when it is full. */
   async write(bytes: Uint8Array): Promise<void> {
-    if (this.closed) throw new Error('multipath: redundant stream closed');
+    if (this.closed) throw this.closeErr ?? new Error('multipath: redundant stream closed');
     let sent = 0;
     while (sent < bytes.length) {
       await this.awaitWindow();
-      if (this.closed) throw new Error('multipath: redundant stream closed');
+      if (this.closed) throw this.closeErr ?? new Error('multipath: redundant stream closed');
       const room = this.opt.window - this.inFlight();
       const n = Math.min(bytes.length - sent, room);
       const chunk = bytes.subarray(sent, sent + n);
@@ -326,6 +350,14 @@ export class RedundantStream {
     }
   }
 
+  // closeWithError records a cause then closes, so the mux above (via onClose) fails its streams
+  // with it and blocked/subsequent reads and writes surface the reason instead of hanging.
+  private closeWithError(err: Error): void {
+    if (this.closed) return;
+    this.closeErr = err;
+    this.close();
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -336,5 +368,6 @@ export class RedundantStream {
     }
     this.wakeWriters();
     this.onOpenResolve?.();
+    this.onClose(this.closeErr ?? undefined);
   }
 }

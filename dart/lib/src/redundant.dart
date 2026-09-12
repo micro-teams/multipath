@@ -71,6 +71,7 @@ class _Slot {
   int reconnects = 0;
   String reason = '';
   String reapReason = '';
+  bool rejected = false; // origin refused this link (REJECT) — never retry it
   _Slot(this.lastSeen, this.backoffMs) : sinceMs = lastSeen;
 }
 
@@ -92,6 +93,12 @@ class RedundantStream {
   final Completer<void> _openCompleter = Completer<void>();
 
   void Function(Uint8List) onDeliver = (_) {};
+
+  /// Called when the stream closes; [err] is set when it closed with a cause (e.g. all links
+  /// rejected). The mux above uses it to fail its streams so reads/writes don't hang.
+  void Function(Object? err) onClose = (_) {};
+
+  Object? _closeErr;
 
   RedundantStream(this.opt)
       : connId = _randomConnId(),
@@ -168,10 +175,12 @@ class RedundantStream {
         },
         onFrame: (frame) {
           slot.lastSeen = _nowMs;
-          _onFrame(frame, slot);
+          _onFrame(frame, slot, i);
         },
         onClose: () {
           slot.link = null;
+          if (slot.rejected)
+            return; // refused by origin; already down, never retry
           _markDown(
               i,
               slot.reapReason.isNotEmpty
@@ -205,8 +214,20 @@ class RedundantStream {
     });
   }
 
-  void _onFrame(Frame frame, _Slot slot) {
+  void _onFrame(Frame frame, _Slot slot, int i) {
     switch (frame.type) {
+      case frameReject:
+        // The origin refused this link and said why. Mark it down, never retry it, and if every
+        // link is refused, close the stream with the reason so reads/writes fail fast.
+        slot.rejected = true;
+        _markDown(i, 'origin rejected: ${frame.reason}');
+        slot.link?.close();
+        slot.link = null;
+        if (_slots.every((s) => s.rejected)) {
+          _closeWithError(StateError(
+              'multipath: all links rejected by origin: ${frame.reason}'));
+        }
+        return;
       case frameData:
         final offset = frame.offset;
         final payload = frame.payload!;
@@ -236,11 +257,13 @@ class RedundantStream {
   }
 
   Future<void> write(Uint8List bytes) async {
-    if (_closed) throw StateError('multipath: redundant stream closed');
+    if (_closed)
+      throw _closeErr ?? StateError('multipath: redundant stream closed');
     var sent = 0;
     while (sent < bytes.length) {
       await _awaitWindow();
-      if (_closed) throw StateError('multipath: redundant stream closed');
+      if (_closed)
+        throw _closeErr ?? StateError('multipath: redundant stream closed');
       final room = opt.window - _inFlight;
       final n = min(bytes.length - sent, room);
       final chunk = Uint8List.sublistView(bytes, sent, sent + n);
@@ -324,6 +347,14 @@ class RedundantStream {
     }
   }
 
+  // _closeWithError records a cause then closes, so the mux above (via onClose) fails its streams
+  // with it and blocked/subsequent reads and writes surface the reason instead of hanging.
+  void _closeWithError(Object err) {
+    if (_closed) return;
+    _closeErr = err;
+    close();
+  }
+
   void close() {
     if (_closed) return;
     _closed = true;
@@ -334,5 +365,6 @@ class RedundantStream {
     }
     _wakeWriters();
     if (!_openCompleter.isCompleted) _openCompleter.complete();
+    onClose(_closeErr);
   }
 }

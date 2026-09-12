@@ -38,7 +38,9 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -50,11 +52,12 @@ var errCorruptFrame = errors.New("multipath: corrupt frame")
 
 // Frame type tags.
 const (
-	frameData  = 0x01
-	frameAck   = 0x02
-	framePing  = 0x03
-	framePong  = 0x04
-	frameHello = 0x05
+	frameData   = 0x01
+	frameAck    = 0x02
+	framePing   = 0x03
+	framePong   = 0x04
+	frameHello  = 0x05
+	frameReject = 0x06 // server→client: this link is refused, with a human reason; do not retry it
 )
 
 const (
@@ -175,11 +178,12 @@ type RedundantStream struct {
 	lastSeen []time.Time // per-link time of last inbound frame; drives the keepalive reaper
 
 	// Per-link observability (see LinkState/LinkStat). state ∈ {"up","connecting","down"}.
-	linkState  []string
-	linkSince  []time.Time // when the current state was entered (for Duration)
-	linkReconn []int       // count of recoveries after a drop
-	linkReason []string    // last drop/dial cause
-	reapReason []string    // pending "why" set by the reaper before it closes a silent link
+	linkState    []string
+	linkSince    []time.Time // when the current state was entered (for Duration)
+	linkReconn   []int       // count of recoveries after a drop
+	linkReason   []string    // last drop/dial cause
+	reapReason   []string    // pending "why" set by the reaper before it closes a silent link
+	linkRejected []bool      // link was refused by the origin (REJECT) — never retry it
 
 	closed   bool
 	closeErr error
@@ -194,6 +198,7 @@ func (s *RedundantStream) initObserve(now time.Time) {
 	s.linkReconn = make([]int, n)
 	s.linkReason = make([]string, n)
 	s.reapReason = make([]string, n)
+	s.linkRejected = make([]bool, n)
 	for i := 0; i < n; i++ {
 		s.linkState[i] = "connecting"
 		s.linkSince[i] = now
@@ -415,6 +420,11 @@ func (a *Acceptor) onLink(c net.Conn) {
 	_ = c.SetReadDeadline(time.Time{})
 	idx := int(f.linkIdx)
 	if idx < 0 || idx >= a.opt.N {
+		// Tell the client why before closing, and log it — a silent close here is indistinguishable
+		// from a flaky network and sends the client into an endless reconnect loop.
+		reason := fmt.Sprintf("link index %d out of range (n=%d)", idx, a.opt.N)
+		_, _ = c.Write(encodeReject(reason))
+		log.Printf("multipath: rejecting link from %v: %s", c.RemoteAddr(), reason)
 		_ = c.Close()
 		return
 	}
@@ -549,6 +559,8 @@ func (s *RedundantStream) snapshotUnackedLocked() [][]byte {
 func (s *RedundantStream) readLoop(i int, l *redundantLink) {
 	r := &frameReader{conn: l.conn}
 	var readErr error
+	var rejected bool
+	var rejectReason string
 	for {
 		f, err := r.next()
 		if err != nil {
@@ -566,10 +578,18 @@ func (s *RedundantStream) readLoop(i int, l *redundantLink) {
 			// liveness only
 		case frameHello:
 			// A server reads HELLO in the listener before attaching; a stray HELLO here is ignored.
+		case frameReject:
+			// The origin refused this link and said why. Stop reading; do not retry it.
+			rejected = true
+			rejectReason = f.reason
 		}
 		s.touch(i)
+		if rejected {
+			break
+		}
 	}
-	// Link i died. Drop it; the client reconnects, the server waits for re-accept.
+	// Link i died. Drop it; the client reconnects a transient drop, waits for re-accept on the server,
+	// but never retries a link the origin explicitly rejected.
 	s.mu.Lock()
 	if s.links[i] == l {
 		s.links[i] = nil
@@ -578,9 +598,23 @@ func (s *RedundantStream) readLoop(i int, l *redundantLink) {
 	client := s.client
 	reason := s.reapReason[i] // reaper's "why" wins over the resulting read error
 	s.reapReason[i] = ""
+	if rejected {
+		s.linkRejected[i] = true
+	}
+	allRejected := rejected
+	if rejected {
+		for _, rj := range s.linkRejected {
+			if !rj {
+				allRejected = false
+				break
+			}
+		}
+	}
 	s.mu.Unlock()
 	_ = l.conn.Close()
-	if reason == "" {
+	if rejected {
+		reason = "origin rejected: " + rejectReason
+	} else if reason == "" {
 		if readErr != nil {
 			reason = readErr.Error()
 		} else {
@@ -590,9 +624,30 @@ func (s *RedundantStream) readLoop(i int, l *redundantLink) {
 	if !closing {
 		s.markDown(i, reason)
 	}
+	if rejected {
+		// Every link refused → the stream can never work; close it with the reason so a Dial that
+		// already returned success now fails its reads/writes fast instead of hanging forever.
+		if allRejected && !closing {
+			s.closeWithError(errors.New("multipath: all links rejected by origin: " + rejectReason))
+		}
+		return
+	}
 	if !closing && client {
 		go s.connectLink(s.ctx, i, false)
 	}
+}
+
+// closeWithError tears the stream down like Close but records err as the cause, so blocked or
+// subsequent Read/Write calls return it instead of the generic closed error.
+func (s *RedundantStream) closeWithError(err error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closeErr = err
+	s.mu.Unlock()
+	_ = s.Close()
 }
 
 // touch records recent liveness on link i (any inbound frame). Used by the keepalive reaper.
@@ -693,8 +748,12 @@ func (s *RedundantStream) Write(p []byte) (int, error) {
 			s.writable.Wait()
 		}
 		if s.closed {
+			err := s.closeErr
 			s.mu.Unlock()
-			return total, ErrStreamClosed
+			if err == nil {
+				err = ErrStreamClosed
+			}
+			return total, err
 		}
 		room := s.opt.Window - len(s.sendBuf)
 		n := len(p)

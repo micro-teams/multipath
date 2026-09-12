@@ -24,6 +24,9 @@ export class MuxSession {
   ) {
     this.nextId = client ? 1 : 2;
     transport.onDeliver = (bytes) => this.onBytes(bytes);
+    // When the transport closes (e.g. every line rejected by the origin), fail the streams with its
+    // reason so a pending read/write returns fast instead of hanging.
+    transport.onClose = (err) => this.failAll(err ?? new Error('multipath: transport closed'));
   }
 
   static client(transport: RedundantStream): MuxSession {

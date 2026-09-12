@@ -165,6 +165,8 @@ internal constructor(
     private val linkReason = arrayOfNulls<String>(opt.n)
     private val lastByteMs = LongArray(opt.n)
     private val reapReason = arrayOfNulls<String>(opt.n)
+    private val linkRejected = BooleanArray(opt.n) // link refused by origin (REJECT) — never retry
+    private var closeErr: String? = null // set when closed with a cause (e.g. all links rejected)
 
     // markUp records link i as connected, firing onLinkState on a real transition. Must not hold
     // lock.
@@ -279,8 +281,10 @@ internal constructor(
     private fun readLoop(i: Int, conn: LinkConn) {
         val r = FrameReader(conn.input)
         var readErr: String? = null
+        var rejected = false
+        var rejectReason = ""
         try {
-            while (true) {
+            loop@ while (true) {
                 val f = r.next()
                 when (f.type) {
                     FRAME_DATA -> onData(f.offset, f.payload!!)
@@ -288,8 +292,13 @@ internal constructor(
                     FRAME_PING -> conn.write(encodeNonce(FRAME_PONG, f.nonce))
                     FRAME_PONG -> {}
                     FRAME_HELLO -> {}
+                    FRAME_REJECT -> {
+                        rejected = true
+                        rejectReason = f.reason
+                    }
                 }
                 touch(i)
+                if (rejected) break@loop
             }
         } catch (e: Exception) {
             readErr = e.message ?: e.javaClass.simpleName
@@ -297,15 +306,31 @@ internal constructor(
         val reconnect: Boolean
         val closing: Boolean
         val hint: String?
+        var allRejected = false
         lock.withLock {
             if (links[i] === conn) links[i] = null
             closing = closed
-            reconnect = !closed && client
+            reconnect = !closed && client && !rejected
             hint = reapReason[i]
             reapReason[i] = null
+            if (rejected) {
+                linkRejected[i] = true
+                allRejected = linkRejected.all { it }
+            }
         }
         conn.close()
-        if (!closing) markDown(i, hint ?: readErr ?: "link closed")
+        val reason =
+            if (rejected) "origin rejected: $rejectReason" else hint ?: readErr ?: "link closed"
+        if (!closing) markDown(i, reason)
+        if (rejected) {
+            // Every link refused → the stream can never work; close it with the reason so a dial
+            // that
+            // already returned now fails read/write fast instead of hanging forever.
+            if (allRejected && !closing) {
+                closeWithError("multipath: all links rejected by origin: $rejectReason")
+            }
+            return
+        }
         if (reconnect)
             thread(isDaemon = true, name = "mp-reconnect-$i") { connectLink(i, firstTry = false) }
     }
@@ -387,7 +412,8 @@ internal constructor(
             val live = ArrayList<LinkConn>(opt.n)
             lock.withLock {
                 while (!closed && sendBuf.size >= opt.window) writable.await()
-                if (closed) throw java.io.IOException("multipath: redundant stream closed")
+                if (closed)
+                    throw java.io.IOException(closeErr ?: "multipath: redundant stream closed")
                 val room = opt.window - sendBuf.size
                 val n = (p.size - pos).coerceAtMost(room).coerceAtMost(MAX_SEGMENT)
                 val off = sendNext
@@ -407,9 +433,21 @@ internal constructor(
     fun read(dst: ByteArray, off: Int, len: Int): Int {
         lock.withLock {
             while (inbox.size == 0 && !closed) readable.await()
-            if (inbox.size == 0 && closed) return -1
+            if (inbox.size == 0 && closed) {
+                val e =
+                    closeErr ?: return -1 // clean close is EOF; a caused close surfaces the reason
+                throw java.io.IOException(e)
+            }
             return inbox.drain(dst, off, len)
         }
+    }
+
+    // closeWithError records a cause then tears the stream down, so blocked/subsequent read and
+    // write
+    // return it instead of a clean EOF or the generic closed error.
+    fun closeWithError(reason: String) {
+        lock.withLock { if (!closed && closeErr == null) closeErr = reason }
+        close()
     }
 
     override fun close() {
@@ -566,6 +604,13 @@ class RedundantServer(
             sock.soTimeout = 0
             val idx = hello.linkIdx
             if (idx < 0 || idx >= opt.n) {
+                // Say why before closing, and log it — a silent close is indistinguishable from a
+                // flaky network and sends the client into an endless reconnect loop.
+                val reason = "link index $idx out of range (n=${opt.n})"
+                conn.write(encodeReject(reason))
+                System.err.println(
+                    "multipath: rejecting link from ${sock.remoteSocketAddress}: $reason"
+                )
                 conn.close()
                 return
             }
