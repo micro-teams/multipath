@@ -27,7 +27,7 @@ and hard-disconnects it on a random schedule. The substrate has to deliver corre
 | | |
 |---|---|
 | origin | `app.microteams.multipath` (the `jvm/` package), run from `OriginMain`: accepts redundant streams, demuxes, reads the one-line header, splices a normal stream to a local app and a tunnel to its target. |
-| client | The Go `Client` (`go/`): `Dial` once over all links, then `OpenTunnel` / `RoundTrip`. The connector's language; the browser clients join the same origin and scenario when they land. |
+| client | The Go `Client` (`go/`): `Dial` once over all links, then `OpenTunnel` / `RoundTrip`. The connector's language. The TS and Dart clients drive the same origin and scenario too — TS under Node (`npx vitest run xlang`), Dart both natively (`link_io.dart`) and inside a real headless Chrome (`dart test -p chrome`, `link_web.dart` — the only way to actually exercise the browser-native L2 link rather than just compile it). |
 | middlebox | One fault-injecting per-link TCP cutter (in the Go test package), the single implementation every client routes through. |
 | scenario | One flow each client drives: open a tunnel and echo bytes, open a normal stream and round-trip HTTP. |
 
