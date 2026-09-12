@@ -43,7 +43,8 @@ void main() {
       );
 
       // Tunnel: write, half-close, read the echo back to EOF.
-      final st = client.openTunnel('echo:0', ticket: utf8.encode('ticket'));
+      final st = client.open('echo',
+          ticket: Uint8List.fromList(utf8.encode('ticket')));
       final msg = Uint8List.fromList(
           List.generate(20 * 1024, (i) => (i * 7 + 3) & 0xff));
       await st.write(msg);
@@ -58,8 +59,8 @@ void main() {
 
       // Normal: an HTTP round trip via the client's roundTrip helper — the library serializes the
       // request and parses the response (status/headers/body), so the caller writes no HTTP by hand.
-      final resp = await client
-          .roundTrip(MultipathRequest('GET', Uri.parse('http://origin/xlang')));
+      final resp = await client.roundTrip(
+          'greeter', MultipathRequest('GET', Uri.parse('http://origin/xlang')));
       expect(resp.statusCode, 200);
       expect(utf8.decode(resp.body), endsWith('hello /xlang'));
 

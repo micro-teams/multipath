@@ -50,14 +50,14 @@ object OriginMain {
                 ackIntervalMs = 8,
             )
         val origin = Origin(ServerSocket(0), opt)
-        val route =
-            Origin.route(
-                local = { Socket("127.0.0.1", app.localPort) },
-                egress = { _, _ -> Socket("127.0.0.1", echo.localPort) },
+        val services =
+            mapOf(
+                "echo" to Origin.dialService("127.0.0.1", echo.localPort),
+                "greeter" to Origin.dialService("127.0.0.1", app.localPort),
             )
         println("LISTENING ${origin.port}")
         System.out.flush()
-        origin.serve(route)
+        origin.serve(services)
     }
 
     /** Reads one HTTP request off c, replies "hello <path>", and closes. */

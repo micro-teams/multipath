@@ -1,11 +1,17 @@
 // The origin end of the substrate: accept redundant streams over every line, demultiplex each into
-// logical streams, read the one-line header off each, and splice it to where it belongs.
+// logical streams, read the one-line header off each, and hand it to the named service it asked for.
 //
-// The whole server is "demux, then splice". A normal stream is spliced to the origin's own service
-// on loopback — the application stays an ordinary server that never learns a line existed. A tunnel
-// stream is authorised by the consumer's policy (ticket + destination) and, if allowed, spliced to
-// its target. There is no request middleware, no idempotency, no coalescing: the redundant layer
-// already delivered each byte exactly once, so the origin sees each request exactly once.
+// The whole server is "demux, then dispatch". Every stream names a service the origin registered;
+// the origin looks the name up and hands the stream to that service's handler. A name it did not
+// register is refused with a reason. There is no "main service" and no client-chosen address, so a
+// client can only ever reach a service the origin put in its registry — the open-relay/SSRF surface
+// is gone by construction. There is no request middleware, no idempotency, no coalescing either: the
+// redundant layer already delivered each byte exactly once, so a handler sees each request once.
+//
+// A service handler owns the stream it is given. It may serve it in process (read and write the
+// stream directly, no listening port anywhere) or, with the DialService convenience, splice it to a
+// real backend address. In-process is preferred: a loopback port is attack surface a named,
+// in-process service does not have.
 
 package multipath
 
@@ -32,13 +38,19 @@ type ServerOptions struct {
 	LinkPath string
 }
 
-// StreamRouter decides what an accepted stream does, given its header. It owns closing the stream.
-type StreamRouter func(h Header, st *MuxStream)
+// ServiceHandler serves one accepted stream for a registered service. It owns the stream: it must
+// read/write and eventually close or reset it. ticket is the opaque capability the client sent; the
+// handler decides what it means (this library does not interpret it).
+type ServiceHandler func(st *MuxStream, ticket []byte)
 
-// Serve accepts redundant streams off raw and serves each client's streams through router until raw
-// is closed. raw yields ordinary transport conns (a net.Listener on a TCP or TLS port); this
-// function does the per-line decapsulation, the connID grouping, and the mux.
-func Serve(raw net.Listener, opt ServerOptions, router StreamRouter) error {
+// Services is the origin's registry: the set of named services a client may open. A name absent from
+// the map is refused. Build it before Serve; it is read-only once serving.
+type Services map[string]ServiceHandler
+
+// Serve accepts redundant streams off raw and dispatches each client's streams to services until raw
+// is closed. raw yields ordinary transport conns (a net.Listener on a TCP or TLS port); this function
+// does the per-line decapsulation, the connID grouping, and the mux.
+func Serve(raw net.Listener, opt ServerOptions, services Services) error {
 	if opt.MaxLinks == 0 {
 		opt.MaxLinks = 8
 	}
@@ -52,11 +64,11 @@ func Serve(raw net.Listener, opt ServerOptions, router StreamRouter) error {
 		if err != nil {
 			return err
 		}
-		go serveClient(rs, router)
+		go serveClient(rs, services)
 	}
 }
 
-func serveClient(rs *RedundantStream, router StreamRouter) {
+func serveClient(rs *RedundantStream, services Services) {
 	sess := NewServerSession(rs)
 	defer sess.Close()
 	for {
@@ -70,46 +82,30 @@ func serveClient(rs *RedundantStream, router StreamRouter) {
 				_ = st.Reset()
 				return
 			}
-			router(h, st)
+			handler, ok := services[h.Service]
+			if !ok {
+				// Say why: an unknown service is refused with a reason the client surfaces on read,
+				// not a bare reset indistinguishable from a network drop.
+				_ = st.ResetWithReason(fmt.Sprintf("unknown service: %q", h.Service))
+				return
+			}
+			handler(st, h.Ticket)
 		}()
 	}
 }
 
-// Router builds the standard StreamRouter: normal streams go to the origin's own service via local,
-// tunnel streams are authorised and dialled by egress. Either may be nil to refuse that kind.
-func Router(local func() (net.Conn, error), egress func(target string, ticket []byte) (net.Conn, error)) StreamRouter {
-	return func(h Header, st *MuxStream) {
-		var up net.Conn
-		var err error
-		switch h.Kind {
-		case KindNormal:
-			if local == nil {
-				_ = st.Reset()
-				return
-			}
-			up, err = local()
-		case KindTunnel:
-			if egress == nil {
-				_ = st.Reset()
-				return
-			}
-			up, err = egress(h.Target, h.Ticket)
-		default:
-			_ = st.Reset()
-			return
-		}
+// DialService returns a ServiceHandler that dials addr and splices the stream to it — the convenience
+// for a service that really is a backend TCP address. Prefer an in-process handler where you can:
+// this exists for backends you do not control.
+func DialService(addr string) ServiceHandler {
+	return func(st *MuxStream, _ []byte) {
+		c, err := net.Dial("tcp", addr)
 		if err != nil {
-			_ = st.Reset()
+			_ = st.ResetWithReason(fmt.Sprintf("dial %s: %v", addr, err))
 			return
 		}
-		spliceStreamConn(st, up)
+		spliceStreamConn(st, c)
 	}
-}
-
-// DialLocal returns a local function for Router that dials the origin's own service at addr each
-// time — the loopback reverse-proxy for normal application traffic.
-func DialLocal(addr string) func() (net.Conn, error) {
-	return func() (net.Conn, error) { return net.Dial("tcp", addr) }
 }
 
 // linkListener decapsulates each accepted conn — raw TLS, a WebSocket, or plaintext — so the

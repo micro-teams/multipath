@@ -4,6 +4,7 @@
 // RST so a graceful close never discards the peer's buffered bytes.
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'redundant.dart';
@@ -104,7 +105,12 @@ class MuxSession {
         break;
       case _muxRst:
         if (st != null) {
-          st._onReset();
+          // A non-empty RST payload is a UTF-8 reason (e.g. "unknown service") the origin sent so
+          // the client's read throws it instead of a bare, cause-less reset.
+          final reason = payload.isNotEmpty ? utf8.decode(payload) : '';
+          st._onReset(reason.isEmpty
+              ? null
+              : StateError('multipath: stream reset: $reason'));
           _streams.remove(id);
         }
         break;
@@ -193,8 +199,8 @@ class MuxStream {
     _cleanupIfClosed();
   }
 
-  void _onReset() {
-    _err ??= StateError('multipath: stream reset');
+  void _onReset([Object? err]) {
+    _err ??= err ?? StateError('multipath: stream reset');
     _wakeReaders();
     _wakeWriters();
   }

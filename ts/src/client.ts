@@ -1,11 +1,11 @@
 // The client end of the substrate for the browser: one redundant mux to the origin over every line,
 // then each exchange a mux stream on top. There is no line-picking and no per-request strategy — a
 // request is a stream over the one redundant transport, and the redundancy is underneath, in the
-// bytes. A caller opens a tunnel to a target, opens a normal stream to the origin's own service, or
-// uses fetch(), which carries one HTTP exchange over a normal stream (the drop-in the service worker
-// routes intercepted requests through).
+// bytes. Every stream names a service the origin registered (there is no "main service" and no
+// client-chosen address): a caller opens a service by name, or uses fetch(service, request), which
+// carries one HTTP exchange over such a stream (the drop-in the service worker routes through).
 
-import { Header, StreamKind, encodeHeader } from './header.js';
+import { encodeHeader } from './header.js';
 import { MuxSession, MuxStream } from './mux.js';
 import { LinkStat, RedundantOptions, RedundantStream } from './redundant.js';
 
@@ -32,29 +32,24 @@ export class Client {
     return new Client(rs, sess);
   }
 
-  /** Opens an opaque tunnel to target, carrying ticket for the origin to authorise egress. */
-  openTunnel(target: string, ticket?: Uint8Array): MuxStream {
-    return this.open({ kind: StreamKind.Tunnel, target, ticket });
-  }
-
-  /** Opens a stream bound for the origin's own service. */
-  openNormal(): MuxStream {
-    return this.open({ kind: StreamKind.Normal });
-  }
-
-  private open(header: Header): MuxStream {
+  /**
+   * Opens a stream to the named service, carrying ticket for the origin's handler to authorise it.
+   * If the origin has not registered the name it resets the stream with a reason, which surfaces as
+   * an error on the first read.
+   */
+  open(service: string, ticket?: Uint8Array): MuxStream {
     const st = this.sess.openStream();
-    void st.write(encodeHeader(header));
+    void st.write(encodeHeader({ service, ticket }));
     return st;
   }
 
   /**
-   * Carries one HTTP exchange over a normal stream: the request is serialized to HTTP/1.1, written to
-   * a fresh stream, and the response read back and parsed. Line redundancy happens underneath without
-   * the caller knowing more than one path exists.
+   * Carries one HTTP exchange over a stream to the named service: the request is serialized to
+   * HTTP/1.1, written to a fresh stream, and the response read back and parsed. Line redundancy
+   * happens underneath without the caller knowing more than one path exists.
    */
-  async fetch(request: Request): Promise<Response> {
-    const st = this.openNormal();
+  async fetch(service: string, request: Request, ticket?: Uint8Array): Promise<Response> {
+    const st = this.open(service, ticket);
     await st.write(await serializeRequest(request));
     const bytes = await readToEnd(st);
     return parseResponse(bytes);

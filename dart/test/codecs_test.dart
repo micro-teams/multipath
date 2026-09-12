@@ -62,17 +62,15 @@ void main() {
 
   test('L5 header round-trips and stops at the boundary', () {
     for (final h in [
-      Header(kindNormal),
-      Header(kindTunnel, target: 'api.anthropic.com:443'),
-      Header(kindTunnel,
-          target: '10.0.0.1:8080', ticket: Uint8List.fromList([9, 8, 7])),
+      Header('anthropic'),
+      Header('greeter', ticket: Uint8List.fromList([9, 8, 7])),
     ]) {
       final b = BytesBuilder()
         ..add(encodeHeader(h))
         ..addByte(0x58);
       final out = readHeader(b.takeBytes())!;
-      expect(out.header.kind, h.kind);
-      expect(out.header.target, h.target);
+      expect(out.header.service, h.service);
+      expect(out.header.ticket, h.ticket);
     }
   });
 }

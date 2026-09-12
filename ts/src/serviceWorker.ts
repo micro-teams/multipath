@@ -18,6 +18,11 @@ export interface FetchScope {
 }
 
 export interface RouterOptions extends ClientOptions {
+  // The registered service name intercepted requests are routed to. The origin must have registered
+  // it (e.g. the app's own HTTP service). Default "app".
+  service?: string;
+  // An opaque ticket sent with each routed request for the origin's handler to authorise.
+  ticket?: Uint8Array;
   // Decide per request whether to route it over multipath; return false to let it hit the network
   // untouched. Default: route everything.
   shouldRoute?: (request: Request) => boolean;
@@ -34,6 +39,7 @@ export function installFetchRouter(
   opts: RouterOptions = {},
 ): void {
   const dial = opts.dial ?? Client.dial;
+  const service = opts.service ?? 'app';
   let pending: Promise<Client> | null = null;
   const client = (): Promise<Client> => {
     if (pending === null) {
@@ -47,6 +53,6 @@ export function installFetchRouter(
 
   scope.addEventListener('fetch', (event) => {
     if (opts.shouldRoute && !opts.shouldRoute(event.request)) return;
-    event.respondWith(client().then((c) => c.fetch(event.request)));
+    event.respondWith(client().then((c) => c.fetch(service, event.request, opts.ticket)));
   });
 }

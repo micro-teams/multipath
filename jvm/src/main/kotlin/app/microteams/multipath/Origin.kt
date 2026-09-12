@@ -1,12 +1,14 @@
 /*
  * The origin end of the substrate: accept redundant streams over every line, demultiplex each into
- * logical streams, read the one-line header off each, and splice it where it belongs.
+ * logical streams, read the one-line header off each, and hand it to the named service it asked for.
  *
- * The whole origin is "demux, then splice". A normal stream is spliced to the origin's own service
- * on loopback — the application stays an ordinary server that never learns a line existed. A tunnel
- * stream is authorised by the consumer's policy (ticket + destination) and, if allowed, spliced to
- * its target. There is no request middleware, no idempotency, no coalescing: the redundant layer
- * already delivered each byte exactly once, so the origin sees each request exactly once.
+ * The whole origin is "demux, then dispatch". Every stream names a service the origin registered; the
+ * origin looks the name up and hands the stream to that service's handler. A name it did not register
+ * is refused with a reason. There is no "main service" and no client-chosen address, so a client can
+ * only reach a service the origin put in its registry — the open-relay/SSRF surface is gone by
+ * construction. A handler owns its stream and may serve it in process (no listening port anywhere) or,
+ * with the dialService convenience, splice it to a real backend address; in-process is preferred,
+ * because a loopback port is attack surface a named in-process service does not have.
  *
  * Mirror of the Go peer (server.go). Java is the origin; Go is the client.
  */
@@ -22,15 +24,15 @@ import java.net.ServerSocket
 import java.net.Socket
 
 /**
- * Opens the upstream a stream should be spliced to, given its header, or throws to refuse it. The
- * returned socket is owned by the splice and closed with the stream.
+ * Serves one accepted stream for a registered service. The handler owns the stream: it must read
+ * and write it and eventually close or reset it. [ticket] is the opaque capability the client sent.
  */
-fun interface Route {
-    fun open(header: Header): Socket
+fun interface ServiceHandler {
+    fun serve(st: MuxStream, ticket: ByteArray)
 }
 
 /**
- * The origin server: accept redundant streams and serve each client's streams through a [Route].
+ * The origin server: accept redundant streams and dispatch each client's streams to named services.
  */
 class Origin(
     private val serverSocket: ServerSocket,
@@ -47,9 +49,10 @@ class Origin(
         get() = serverSocket.localPort
 
     /**
-     * Serves until the socket is closed. Each client and each stream gets its own daemon thread.
+     * Serves until the socket is closed, dispatching streams to [services] by name. Each client and
+     * each stream gets its own daemon thread.
      */
-    fun serve(route: Route) {
+    fun serve(services: Map<String, ServiceHandler>) {
         while (true) {
             val rs =
                 try {
@@ -57,11 +60,11 @@ class Origin(
                 } catch (_: Exception) {
                     return
                 }
-            thread { serveClient(MuxSession.server(rs.asMuxTransport()), route) }
+            thread { serveClient(MuxSession.server(rs.asMuxTransport()), services) }
         }
     }
 
-    private fun serveClient(session: MuxSession, route: Route) {
+    private fun serveClient(session: MuxSession, services: Map<String, ServiceHandler>) {
         while (true) {
             val st =
                 try {
@@ -77,14 +80,14 @@ class Origin(
                         st.reset()
                         return@thread
                     }
-                val up =
-                    try {
-                        route.open(header)
-                    } catch (_: Exception) {
-                        st.reset()
-                        return@thread
-                    }
-                splice(st, up)
+                val handler = services[header.service]
+                if (handler == null) {
+                    // Say why: an unknown service is refused with a reason the client surfaces on
+                    // read, not a bare reset indistinguishable from a network drop.
+                    st.resetWithReason("unknown service: \"${header.service}\"")
+                    return@thread
+                }
+                handler.serve(st, header.ticket)
             }
         }
     }
@@ -93,26 +96,20 @@ class Origin(
 
     companion object {
         /**
-         * The standard route: a normal stream goes to [local], a tunnel to [egress]. Either may be
-         * null to refuse that kind.
+         * A [ServiceHandler] that dials host:port and splices the stream to it — the convenience
+         * for a service that really is a backend address. Prefer an in-process handler where you
+         * can.
          */
-        fun route(
-            local: (() -> Socket)?,
-            egress: ((target: String, ticket: ByteArray) -> Socket)?,
-        ): Route = Route { header ->
-            when (header.kind) {
-                StreamKind.NORMAL ->
-                    (local ?: throw IllegalStateException("normal streams refused")).invoke()
-                StreamKind.TUNNEL ->
-                    (egress ?: throw IllegalStateException("tunnels refused")).invoke(
-                        header.target,
-                        header.ticket,
-                    )
-            }
+        fun dialService(host: String, port: Int): ServiceHandler = ServiceHandler { st, _ ->
+            val up =
+                try {
+                    Socket(host, port)
+                } catch (e: Exception) {
+                    st.resetWithReason("dial $host:$port: ${e.message}")
+                    return@ServiceHandler
+                }
+            splice(st, up)
         }
-
-        /** A [local] that dials the origin's own service at host:port each time. */
-        fun dialLocal(host: String, port: Int): () -> Socket = { Socket(host, port) }
     }
 }
 
@@ -122,7 +119,7 @@ class Origin(
  * socket) rather than aborting, so a request-then-EOF still gets its reply. Both ends are torn down
  * once both directions end.
  */
-private fun splice(st: MuxStream, up: Socket) {
+internal fun splice(st: MuxStream, up: Socket) {
     val fault = java.util.concurrent.atomic.AtomicBoolean(false)
     val upToStream = thread {
         try {

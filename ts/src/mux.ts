@@ -7,6 +7,7 @@
 import { RedundantStream } from './redundant.js';
 
 const Mux = { Syn: 0x01, Data: 0x02, Fin: 0x03, Rst: 0x04, Window: 0x05 } as const;
+const rstDecoder = new TextDecoder();
 const MUX_HDR = 9;
 const MUX_MAX_CHUNK = 16 * 1024;
 const STREAM_WINDOW = 256 * 1024;
@@ -96,7 +97,10 @@ export class MuxSession {
         break;
       case Mux.Rst:
         if (st) {
-          st.onReset();
+          // A non-empty RST payload is a UTF-8 reason (e.g. "unknown service") the origin sent so
+          // the client's read throws it instead of a bare, cause-less reset.
+          const reason = payload.length > 0 ? rstDecoder.decode(payload) : '';
+          st.onReset(reason ? new Error(`multipath: stream reset: ${reason}`) : undefined);
           this.streams.delete(id);
         }
         break;

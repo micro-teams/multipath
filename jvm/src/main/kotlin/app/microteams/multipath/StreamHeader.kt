@@ -1,14 +1,15 @@
 /*
- * L5 — the one thing said at the start of a mux stream: what it is and, for a tunnel, where it goes.
+ * L5 — the one thing said at the start of a mux stream: which named service it wants.
  *
  * A mux stream is an opaque duplex once open, but the origin has to know what to do with a freshly
- * accepted one before any payload flows. That needs at most three things: the kind of stream, a
- * target address when it is a tunnel, and an opaque ticket the consumer (not this library) uses to
- * authorise egress. So the header is those three, sent once, ahead of the bytes — a SOCKS request
- * line with no round trip.
+ * accepted one before any payload flows. In this substrate every stream is a request for a named
+ * service the origin registered — there is no "main service" and no client-chosen address. The header
+ * is therefore just the service name and an opaque ticket its handler interprets, sent once ahead of
+ * the bytes. A name the origin has not registered is refused, so a client can never reach an address
+ * of its own choosing.
  *
- * Wire-identical to the Go peer (header.go): version:u8 | kind:u8 | targetLen:u16 | target |
- * ticketLen:u16 | ticket, big-endian.
+ * Wire-identical to the Go peer (header.go): version:u8 | serviceLen:u16 | service | ticketLen:u16 |
+ * ticket, big-endian.
  */
 package app.microteams.multipath
 
@@ -17,53 +18,32 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 
-/** What an accepted mux stream carries. */
-enum class StreamKind(val code: Int) {
-    /** Application traffic bound for the origin's own service; the address is empty. */
-    NORMAL(0),
-
-    /** An opaque tunnel to [Header.target], authorised by the consumer's policy. */
-    TUNNEL(1);
-
-    companion object {
-        fun of(code: Int): StreamKind =
-            entries.firstOrNull { it.code == code }
-                ?: throw IOException("multipath: unknown stream kind $code")
-    }
-}
-
-/** What a client says at the start of a mux stream. */
+/** What a client says at the start of a mux stream: the registered service it wants. */
 data class Header(
-    val kind: StreamKind,
-    /** "host:port" for a tunnel, empty for a normal stream. */
-    val target: String = "",
-    /** An opaque egress capability the origin's handler interprets; the library does not. */
+    /** The registered service name the stream is for; the origin refuses an unknown name. */
+    val service: String,
+    /** An opaque capability the service's handler interprets; the library does not. */
     val ticket: ByteArray = ByteArray(0),
 ) {
     override fun equals(other: Any?): Boolean =
-        other is Header &&
-            kind == other.kind &&
-            target == other.target &&
-            ticket.contentEquals(other.ticket)
+        other is Header && service == other.service && ticket.contentEquals(other.ticket)
 
-    override fun hashCode(): Int =
-        (kind.hashCode() * 31 + target.hashCode()) * 31 + ticket.contentHashCode()
+    override fun hashCode(): Int = service.hashCode() * 31 + ticket.contentHashCode()
 }
 
 /** Reads and writes [Header] on the wire, matching the Go peer byte for byte. */
 object StreamHeader {
-    private const val VERSION = 1
+    private const val VERSION = 2
     private const val MAX_FIELD = 4096
 
     fun write(out: OutputStream, h: Header) {
-        val target = h.target.toByteArray(Charsets.UTF_8)
-        require(target.size <= MAX_FIELD && h.ticket.size <= MAX_FIELD) {
+        val service = h.service.toByteArray(Charsets.UTF_8)
+        require(service.size <= MAX_FIELD && h.ticket.size <= MAX_FIELD) {
             "multipath: stream header field exceeds $MAX_FIELD bytes"
         }
-        val buf = java.io.ByteArrayOutputStream(6 + target.size + h.ticket.size)
+        val buf = java.io.ByteArrayOutputStream(5 + service.size + h.ticket.size)
         buf.write(VERSION)
-        buf.write(h.kind.code)
-        writeField(buf, target)
+        writeField(buf, service)
         writeField(buf, h.ticket)
         out.write(buf.toByteArray())
         out.flush()
@@ -73,10 +53,9 @@ object StreamHeader {
         val version = readByte(inp)
         if (version != VERSION)
             throw IOException("multipath: unsupported stream header version $version")
-        val kind = StreamKind.of(readByte(inp))
-        val target = String(readField(inp), Charsets.UTF_8)
+        val service = String(readField(inp), Charsets.UTF_8)
         val ticket = readField(inp)
-        return Header(kind, target, ticket)
+        return Header(service, ticket)
     }
 
     private fun writeField(out: OutputStream, field: ByteArray) {
