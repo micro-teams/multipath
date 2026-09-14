@@ -22,6 +22,9 @@ internal const val FRAME_PING = 0x03
 internal const val FRAME_PONG = 0x04
 internal const val FRAME_HELLO = 0x05
 internal const val FRAME_REJECT = 0x06 // server→client: link refused, with a reason; do not retry
+// HELLO plus one byte: whether the client has used this connID before. See go/redundant_frame.go's
+// header for why — a plain HELLO carries no such claim and keeps the old, permissive behavior.
+internal const val FRAME_HELLO2 = 0x07
 
 internal const val MAX_SEGMENT = 32 * 1024
 internal const val DATA_HDR_LEN = 1 + 8 + 2 + 4
@@ -35,9 +38,10 @@ internal class Frame(
     val offset: Long = 0, // DATA offset, or ACK cumulative
     val payload: ByteArray? = null, // DATA
     val nonce: Long = 0, // PING/PONG
-    val connId: ByteArray? = null, // HELLO (16 bytes)
-    val linkIdx: Int = 0, // HELLO
+    val connId: ByteArray? = null, // HELLO / HELLO2 (16 bytes)
+    val linkIdx: Int = 0, // HELLO / HELLO2
     val reason: String = "", // REJECT
+    val reconnect: Boolean = false, // HELLO2 only; false (legacy, permissive) for a plain HELLO
 )
 
 internal fun crc32(b: ByteArray): Long {
@@ -83,6 +87,16 @@ internal fun encodeHello(connId: ByteArray, linkIdx: Int): ByteArray {
     b[0] = FRAME_HELLO.toByte()
     System.arraycopy(connId, 0, b, 1, 16)
     putU16(b, 17, linkIdx)
+    return b
+}
+
+internal fun encodeHello2(connId: ByteArray, linkIdx: Int, reconnect: Boolean): ByteArray {
+    require(connId.size == 16)
+    val b = ByteArray(1 + 16 + 2 + 1)
+    b[0] = FRAME_HELLO2.toByte()
+    System.arraycopy(connId, 0, b, 1, 16)
+    putU16(b, 17, linkIdx)
+    b[19] = if (reconnect) 1 else 0
     return b
 }
 
@@ -143,6 +157,16 @@ internal class FrameReader(private val input: InputStream) {
                 val b = ByteArray(18)
                 readFully(b)
                 Frame(FRAME_HELLO, connId = b.copyOfRange(0, 16), linkIdx = u16(b, 16))
+            }
+            FRAME_HELLO2 -> {
+                val b = ByteArray(19)
+                readFully(b)
+                Frame(
+                    FRAME_HELLO2,
+                    connId = b.copyOfRange(0, 16),
+                    linkIdx = u16(b, 16),
+                    reconnect = b[18].toInt() != 0,
+                )
             }
             FRAME_DATA -> {
                 val h = ByteArray(DATA_HDR_LEN - 1)

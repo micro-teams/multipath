@@ -43,6 +43,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -58,6 +59,11 @@ const (
 	framePong   = 0x04
 	frameHello  = 0x05
 	frameReject = 0x06 // server→client: this link is refused, with a human reason; do not retry it
+	// frameHello2 is HELLO plus one byte: whether this connID has ever had a link accepted before
+	// (by ANY origin, not just this one). A legacy HELLO (still accepted, for an old peer on either
+	// end) carries no such claim, so it gets the old, permissive treatment — see connectLink and
+	// the server's onLink for what an origin does differently once it knows.
+	frameHello2 = 0x07
 )
 
 const (
@@ -159,6 +165,17 @@ type RedundantStream struct {
 
 	client bool     // true if this end dials + reconnects; false if it accepts links (server)
 	connID [16]byte // identifies this logical stream across its links (set by the client)
+
+	// established becomes true the first time any origin confirms this connID by responding to a
+	// link with anything other than REJECT — see connectLink and the read loop. It is what HELLO2
+	// tells an origin: "I have used this connID before", so an origin that does not recognize it
+	// anymore (it restarted and lost its connID table) can REJECT rather than silently accepting a
+	// stale reconnect as a brand-new stream. Deliberately NOT set at dial/write time: multiple
+	// links can race to be this stream's very first attach, and every one of them must still claim
+	// "never used before" — flipping only on a genuine server response means it cannot flip before
+	// the origin that will receive it has already durably recorded the connID, so a hello sent
+	// after the flip can never race ahead of the registration that makes it true.
+	established atomic.Bool
 
 	mu       sync.Mutex
 	readable *sync.Cond // signalled when delivered bytes are available or the stream closes
@@ -413,7 +430,7 @@ func (a *Acceptor) onLink(c net.Conn) {
 	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
 	r := &frameReader{conn: c}
 	f, err := r.next()
-	if err != nil || f.typ != frameHello {
+	if err != nil || (f.typ != frameHello && f.typ != frameHello2) {
 		_ = c.Close()
 		return
 	}
@@ -430,6 +447,22 @@ func (a *Acceptor) onLink(c net.Conn) {
 	}
 	a.mu.Lock()
 	s, known := a.streams[f.connID]
+	if !known && f.reconnect {
+		// f.reconnect only arrives on a HELLO2 — a legacy HELLO decodes to false and keeps the old,
+		// permissive behavior below. This client is telling us it has used this connID before, and
+		// we have never heard of it: this process forgot every stream it ever knew, almost always
+		// because it just restarted. Accepting it as new would silently start a fresh server-side
+		// stream at offset 0 underneath a client that is not at offset 0, wedging the connection
+		// with no error on either side — see the connID field's doc. Refusing it here instead sends
+		// the client down the path it already has for a stream that can never work: every link gets
+		// rejected in turn, the whole stream closes with an error, and the caller throws it away and
+		// dials a fresh one with a new connID.
+		a.mu.Unlock()
+		reason := "unknown connID (origin restarted or never held this stream)"
+		_, _ = c.Write(encodeReject(reason))
+		_ = c.Close()
+		return
+	}
 	if !known {
 		s = newServerStream(a.opt, f.connID)
 		a.streams[f.connID] = s
@@ -479,7 +512,8 @@ func (s *RedundantStream) connectLink(dialCtx context.Context, i int, firstTry b
 		conn, err := s.opt.Dial(dialCtx, i)
 		if err == nil {
 			// HELLO first so the server can group this link (and a reconnect re-attaches).
-			if _, werr := conn.Write(encodeHello(s.connID, uint16(i))); werr != nil {
+			hello := encodeHello2(s.connID, uint16(i), s.established.Load())
+			if _, werr := conn.Write(hello); werr != nil {
 				_ = conn.Close()
 				s.markDown(i, "hello write: "+werr.Error())
 			} else if s.attachLink(i, conn) {
@@ -576,8 +610,9 @@ func (s *RedundantStream) readLoop(i int, l *redundantLink) {
 			_ = l.write(encodePong(f.nonce))
 		case framePong:
 			// liveness only
-		case frameHello:
-			// A server reads HELLO in the listener before attaching; a stray HELLO here is ignored.
+		case frameHello, frameHello2:
+			// A server reads HELLO/HELLO2 in the listener before attaching; a stray one here is
+			// ignored.
 		case frameReject:
 			// The origin refused this link and said why. Stop reading; do not retry it.
 			rejected = true
@@ -586,6 +621,12 @@ func (s *RedundantStream) readLoop(i int, l *redundantLink) {
 		s.touch(i)
 		if rejected {
 			break
+		}
+		// The origin responded with something other than REJECT, so it durably knows this connID —
+		// see the established field's doc. Every subsequent HELLO2, on any link, now truthfully
+		// claims "I have used this connID before".
+		if s.client {
+			s.established.Store(true)
 		}
 	}
 	// Link i died. Drop it; the client reconnects a transient drop, waits for re-accept on the server,

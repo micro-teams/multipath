@@ -168,6 +168,17 @@ internal constructor(
     private val linkRejected = BooleanArray(opt.n) // link refused by origin (REJECT) — never retry
     private var closeErr: String? = null // set when closed with a cause (e.g. all links rejected)
 
+    // established becomes true the first time any origin confirms this connID by responding to a
+    // link with anything other than REJECT (see the read loop below). It is what HELLO2 tells an
+    // origin: "I have used this connID before", so an origin that no longer recognizes it (it
+    // restarted and lost its connID table) can REJECT rather than silently accepting a stale
+    // reconnect as a brand-new stream — see go/redundant_frame.go's header for the full story.
+    // Deliberately NOT set at dial/write time: multiple links can race to be this stream's very
+    // first attach, and every one of them must still claim "never used before" — flipping only on a
+    // genuine server response means it cannot flip before the origin that will receive it has
+    // already durably recorded the connID.
+    private val established = java.util.concurrent.atomic.AtomicBoolean(false)
+
     // markUp records link i as connected, firing onLinkState on a real transition. Must not hold
     // lock.
     private fun markUp(i: Int) {
@@ -236,7 +247,8 @@ internal constructor(
                     null
                 }
             if (conn != null) {
-                if (conn.write(encodeHello(connId, i)) && attachLink(i, conn)) return
+                val hello = encodeHello2(connId, i, established.get())
+                if (conn.write(hello) && attachLink(i, conn)) return
                 if (isClosed()) return
             } else {
                 markDown(i, linkReason[i] ?: "dial failed")
@@ -291,7 +303,8 @@ internal constructor(
                     FRAME_ACK -> onAck(f.offset)
                     FRAME_PING -> conn.write(encodeNonce(FRAME_PONG, f.nonce))
                     FRAME_PONG -> {}
-                    FRAME_HELLO -> {}
+                    FRAME_HELLO,
+                    FRAME_HELLO2 -> {}
                     FRAME_REJECT -> {
                         rejected = true
                         rejectReason = f.reason
@@ -299,6 +312,10 @@ internal constructor(
                 }
                 touch(i)
                 if (rejected) break@loop
+                // The origin responded with something other than REJECT, so it durably knows this
+                // connID — see `established`'s doc. Every subsequent HELLO2, on any link, now
+                // truthfully claims "I have used this connID before".
+                if (client) established.set(true)
             }
         } catch (e: Exception) {
             readErr = e.message ?: e.javaClass.simpleName
@@ -597,7 +614,7 @@ class RedundantServer(
             val conn = decap(sock)
             val reader = FrameReader(conn.input)
             val hello = reader.next()
-            if (hello.type != FRAME_HELLO) {
+            if (hello.type != FRAME_HELLO && hello.type != FRAME_HELLO2) {
                 conn.close()
                 return
             }
@@ -616,15 +633,40 @@ class RedundantServer(
             }
             val key = hello.connId!!.joinToString("") { "%02x".format(it) }
             var isNew = false
+            var reject = false
             val stream =
                 lock.withLock {
-                    streams.getOrPut(key) {
-                        isNew = true
-                        RedundantStream.server(opt, hello.connId!!)
+                    val known = streams[key]
+                    if (known == null && hello.reconnect) {
+                        // hello.reconnect only arrives on a HELLO2 — a legacy HELLO decodes to
+                        // false and keeps the old, permissive behavior below. This client is
+                        // telling us it has used this connID before, and we have never heard of
+                        // it: this process forgot every stream it ever knew, almost always because
+                        // it just restarted. Accepting it as new would silently start a fresh
+                        // server-side stream at offset 0 underneath a client that is not at offset
+                        // 0, wedging the connection with no error on either side. REJECTing it
+                        // instead sends the client down the path it already has for a stream that
+                        // can never work: every link gets rejected in turn, the whole stream closes
+                        // with an error, and the caller throws it away and dials a fresh one with a
+                        // new connID.
+                        reject = true
+                        null
+                    } else {
+                        known
+                            ?: RedundantStream.server(opt, hello.connId!!).also {
+                                isNew = true
+                                streams[key] = it
+                            }
                     }
                 }
-            if (isNew) handoff.put(stream)
-            if (!stream.attachLink(idx, conn)) {
+            if (reject) {
+                val reason = "unknown connID (origin restarted or never held this stream)"
+                conn.write(encodeReject(reason))
+                conn.close()
+                return
+            }
+            if (isNew) handoff.put(stream!!)
+            if (!stream!!.attachLink(idx, conn)) {
                 lock.withLock { streams.remove(key) }
             }
         } catch (_: Exception) {

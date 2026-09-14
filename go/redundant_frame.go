@@ -10,6 +10,7 @@
 //	PING  0x03 | nonce:u64
 //	PONG  0x04 | nonce:u64
 //	REJECT 0x06 | reasonLen:u16 | reason[reasonLen]
+//	HELLO2 0x07 | connID[16] | linkIndex:u16 | reconnect:u8 (0 or 1)
 //
 // REJECT is the one frame that flows server→client: the origin refuses a link (e.g. a HELLO link
 // index out of range) and says why, in UTF-8, before closing. Without it a refused link is
@@ -20,6 +21,20 @@
 // HELLO is the first frame a client sends on every link (initial dial and every reconnect). It lets
 // a server that accepts many independent TCP connections group them: all links carrying the same
 // connID are the same logical stream, and a reconnecting link re-attaches to it.
+//
+// HELLO2 is HELLO plus a `reconnect` bit: whether the CLIENT believes this connID has already been
+// accepted once before (by any origin), as opposed to a connID freshly minted for a brand-new
+// stream. It exists because a plain HELLO gives a restarted origin no way to tell those two cases
+// apart — an origin that just lost every connID it ever knew (a process restart, not a network
+// blip) used to accept a stale reconnect as if it were brand new, silently building a server-side
+// stream whose byte offsets start at 0 while the client's side does not, wedging the logical stream
+// with no error either side would ever see: nothing to reconnect from, because nothing failed. An
+// origin that gets HELLO2 with reconnect=true for a connID it does not have now REJECTs it instead,
+// which is a case the client already knows how to recover from (see RedundantStream.connectLink:
+// once every link of a stream has been rejected, the whole stream closes with an error, and the
+// caller — here, the connector's control-link dialer — throws it away and dials a fresh one with a
+// new connID). A legacy HELLO carries no such claim and keeps the old, permissive behavior, so
+// nothing that has not been rebuilt against this needs to change first.
 
 package multipath
 
@@ -31,13 +46,14 @@ import (
 
 // frame is one decoded frame. Only the fields relevant to typ are set.
 type frame struct {
-	typ     byte
-	offset  uint64   // DATA offset, or ACK cumulative
-	payload []byte   // DATA
-	nonce   uint64   // PING / PONG
-	connID  [16]byte // HELLO
-	linkIdx uint16   // HELLO
-	reason  string   // REJECT
+	typ       byte
+	offset    uint64   // DATA offset, or ACK cumulative
+	payload   []byte   // DATA
+	nonce     uint64   // PING / PONG
+	connID    [16]byte // HELLO / HELLO2
+	linkIdx   uint16   // HELLO / HELLO2
+	reason    string   // REJECT
+	reconnect bool     // HELLO2 only; false (legacy, permissive) for a plain HELLO
 }
 
 // encodeReject frames a server→client refusal carrying a UTF-8 reason. The reason is bounded so a
@@ -59,6 +75,17 @@ func encodeHello(connID [16]byte, linkIdx uint16) []byte {
 	b[0] = frameHello
 	copy(b[1:], connID[:])
 	binary.BigEndian.PutUint16(b[17:], linkIdx)
+	return b
+}
+
+func encodeHello2(connID [16]byte, linkIdx uint16, reconnect bool) []byte {
+	b := make([]byte, 1+16+2+1)
+	b[0] = frameHello2
+	copy(b[1:], connID[:])
+	binary.BigEndian.PutUint16(b[17:], linkIdx)
+	if reconnect {
+		b[19] = 1
+	}
 	return b
 }
 
@@ -111,6 +138,18 @@ func (r *frameReader) next() (frame, error) {
 			return frame{}, err
 		}
 		f := frame{typ: frameHello, linkIdx: binary.BigEndian.Uint16(b[16:])}
+		copy(f.connID[:], b[:16])
+		return f, nil
+	case frameHello2:
+		var b [19]byte
+		if _, err := io.ReadFull(r.conn, b[:]); err != nil {
+			return frame{}, err
+		}
+		f := frame{
+			typ:       frameHello2,
+			linkIdx:   binary.BigEndian.Uint16(b[16:18]),
+			reconnect: b[18] != 0,
+		}
 		copy(f.connID[:], b[:16])
 		return f, nil
 	case frameData:
