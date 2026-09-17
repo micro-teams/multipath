@@ -24,7 +24,11 @@ type Line struct {
 	ID string `json:"id"`
 	// Absolute origin for this line, or "" meaning "same origin as the caller's default".
 	URL string `json:"url"`
-	// Free-form transport label, for diagnosis only.
+	// How the Go client encapsulates its link to this line: "tls"/"wss"/"tcp"/"ws", or "" to infer
+	// one from the URL scheme (see resolveTransport in link.go for exactly how). NOT free-form —
+	// a value that isn't one of those four strings is a configuration error the Go client rejects
+	// at dial time, not a label it looks past. (The TS/browser client, which can only ever open a
+	// WebSocket, never reads this field, so it can look free-form from that side; it isn't.)
 	Transport string `json:"transport,omitempty"`
 	// Static preference, higher is better. Only breaks ties between indistinguishable latencies;
 	// measurement outranks it, because a hand-set weight goes stale and an EWMA does not.
