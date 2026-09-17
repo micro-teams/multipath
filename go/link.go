@@ -59,32 +59,58 @@ type LinkOptions struct {
 
 const defaultLinkPath = "/mt/link"
 
-// resolveTransport picks the encapsulation for a line: the line's explicit transport if it set one,
-// otherwise the obvious default for its URL scheme.
+// resolveTransport picks the encapsulation for a line: the line's explicit transport if it named
+// one of the four encapsulations this package understands, otherwise a default inferred from the
+// URL scheme and whether the line bothered to set a transport at all.
+//
+// The registry's `transport` field is documented (Line.Transport, and the API's LineDTO) as a
+// free-form, diagnostic-only label — "frp", "cloudflare", "rucnet", whatever a human finds
+// legible — carrying no operational meaning. Treating anything other than the four canonical
+// strings as a hard error (as this used to) violated that contract: a real deployment's own line
+// registry (ccproxy's `ccproxy.multipath.lines`, 2026-09-17) used exactly such labels and every
+// single line failed to dial with "unknown transport", because a name a human found descriptive
+// happened to not spell "wss".
+//
+// An UNLABELLED line (transport == "") is assumed to reach the origin's own listener directly —
+// the plain, no-fronting case — so it keeps inferring the raw encapsulation from scheme (https ->
+// TLS, http -> TCP), exactly as before.
+//
+// A line someone bothered to LABEL, with anything that isn't one of the four canonical strings, is
+// assumed to be exactly the kind of line worth labelling in the first place: a named, fronted path
+// (a CDN, a tunnel, a relay) rather than a bare socket straight to the origin process. Those only
+// survive as an HTTP(S) WebSocket upgrade — a raw TLS/TCP socket does not survive an edge that
+// speaks only HTTP — so an unrecognised non-empty label infers the WS-encapsulated variant instead
+// of the raw one. A line that genuinely does reach the origin's own listener directly, and wants a
+// human-readable label anyway, opts back into the raw socket by literally setting transport="tls"
+// (or "tcp") — one of the four strings this function still honours verbatim.
 func resolveTransport(line Line) (Transport, error) {
 	switch Transport(line.Transport) {
 	case TransportTLS, TransportWSS, TransportTCP, TransportWS:
 		return Transport(line.Transport), nil
-	case "":
-		// Inferred from the scheme. A same-origin line ("") has no scheme of its own here; a link
-		// needs a concrete host, so that case is the caller's to resolve before dialling.
-		if line.URL == "" {
-			return "", fmt.Errorf("multipath: line %q is same-origin; a link needs a concrete URL", line.ID)
+	}
+	// Same-origin ("") has no scheme of its own here; a link needs a concrete host, so that case
+	// is the caller's to resolve before dialling.
+	if line.URL == "" {
+		return "", fmt.Errorf("multipath: line %q is same-origin; a link needs a concrete URL", line.ID)
+	}
+	u, err := url.Parse(line.URL)
+	if err != nil {
+		return "", fmt.Errorf("multipath: line %q has an unparseable url %q: %w", line.ID, line.URL, err)
+	}
+	labelled := line.Transport != ""
+	switch u.Scheme {
+	case "https":
+		if labelled {
+			return TransportWSS, nil
 		}
-		u, err := url.Parse(line.URL)
-		if err != nil {
-			return "", fmt.Errorf("multipath: line %q has an unparseable url %q: %w", line.ID, line.URL, err)
+		return TransportTLS, nil
+	case "http":
+		if labelled {
+			return TransportWS, nil
 		}
-		switch u.Scheme {
-		case "https":
-			return TransportTLS, nil
-		case "http":
-			return TransportTCP, nil
-		default:
-			return "", fmt.Errorf("multipath: line %q url scheme %q is neither http nor https", line.ID, u.Scheme)
-		}
+		return TransportTCP, nil
 	default:
-		return "", fmt.Errorf("multipath: line %q has unknown transport %q", line.ID, line.Transport)
+		return "", fmt.Errorf("multipath: line %q url scheme %q is neither http nor https", line.ID, u.Scheme)
 	}
 }
 
