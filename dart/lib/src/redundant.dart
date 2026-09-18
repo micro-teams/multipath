@@ -100,6 +100,14 @@ class RedundantStream {
 
   Object? _closeErr;
 
+  /// Whether any origin has ever answered this connID with something other than a REJECT.
+  ///
+  /// Once true, a later refusal is a verdict on the whole stream rather than on one link, so the
+  /// stream may be torn down as soon as nothing is carrying it instead of waiting for links that
+  /// are down to agree — the T-092 wedge. Before it, a refusal says nothing about links that have
+  /// not finished connecting yet.
+  bool _established = false;
+
   RedundantStream(this.opt)
       : connId = _randomConnId(),
         _slots = List.generate(
@@ -215,17 +223,37 @@ class RedundantStream {
   }
 
   void _onFrame(Frame frame, _Slot slot, int i) {
+    if (frame.type != frameReject) {
+      // The origin answered with something other than a refusal, so it holds this stream. See
+      // [_established] for what that licenses.
+      _established = true;
+    }
     switch (frame.type) {
       case frameReject:
-        // The origin refused this link and said why. Mark it down, never retry it, and if every
-        // link is refused, close the stream with the reason so reads/writes fail fast.
+        // The origin refused this link and said why. Mark it down, never retry it, and close the
+        // stream if nothing else is still carrying it, so reads/writes fail fast.
+        //
+        // T-092: this used to wait for EVERY link to be refused, which a line that is down never
+        // is — it never gets far enough to be told anything — so one dead line could hold a dead
+        // stream open forever. Who is still attached is the question that decides whether the
+        // stream can work, and a dead line answers it by being absent.
+        //
+        // The [_established] check keeps bring-up honest: links connect concurrently, and a link
+        // refused for its own reasons (an index this origin does not have) can be refused before
+        // any other link has finished attaching. Before the origin has answered anything there is
+        // no stream-wide verdict to act on, so that case keeps the original rule.
         slot.rejected = true;
         _markDown(i, 'origin rejected: ${frame.reason}');
         slot.link?.close();
         slot.link = null;
-        if (_slots.every((s) => s.rejected)) {
+        final otherAttached = _slots
+            .asMap()
+            .entries
+            .any((e) => e.key != i && e.value.link != null);
+        if (!otherAttached &&
+            (_established || _slots.every((s) => s.rejected))) {
           _closeWithError(StateError(
-              'multipath: all links rejected by origin: ${frame.reason}'));
+              'multipath: rejected by origin with no link left: ${frame.reason}'));
         }
         return;
       case frameData:

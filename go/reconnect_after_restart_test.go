@@ -3,6 +3,8 @@ package multipath
 import (
 	"context"
 	"crypto/rand"
+	"errors"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -165,5 +167,82 @@ func TestClientSelfHealsWhenOriginForgetsConnID(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("stream hung instead of failing fast once the origin no longer recognized its connID")
+	}
+}
+
+// TestClientSelfHealsWhenOriginForgetsConnIDWithALineDown is the SAME incident as the test above,
+// with the one detail production had and that one lacks: a second line that is down and stays down.
+//
+// T-092 shipped with the test above passing and the product still wedging, and the whole difference
+// is N. At N=1 a single REJECT is trivially "every link rejected"; at N=2 with a dead line, the
+// origin's verdict on the stream can only ever reach ONE slot, because the dead line never gets far
+// enough to be told anything. Recovery that waits for the dead line's opinion waits forever: no
+// error reaches the caller, nothing is logged, and the machine sits offline until somebody runs
+// `microteams link retest` by hand. That is exactly what ops saw on the clean re-test, on a
+// connector that already carried the T-092 fix.
+func TestClientSelfHealsWhenOriginForgetsConnIDWithALineDown(t *testing.T) {
+	ln1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realAddr := ln1.Addr().String()
+	srv1 := Listen(ln1, fastOpts(2, nil))
+	go func() { _, _ = srv1.Accept() }()
+
+	// Line 1 is the one that is down: its dial never succeeds, so it never writes a HELLO, is never
+	// rejected, and never has an opinion to contribute.
+	copt := fastOpts(2, func(ctx context.Context, i int) (io.ReadWriteCloser, error) {
+		if i == 1 {
+			return nil, errors.New("line down")
+		}
+		return net.Dial("tcp", realAddr)
+	})
+	cli, err := DialRedundant(context.Background(), copt)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer cli.Close()
+
+	waitFor(t, func() bool {
+		for _, s := range cli.Stats() {
+			if s.Index == 0 && s.State == "up" {
+				return true
+			}
+		}
+		return false
+	}, "line 0 established against the original origin")
+	waitFor(t, func() bool {
+		return cli.established.Load()
+	}, "the origin's first reply confirming the connID")
+
+	// Restart the origin, as in the test above: a new Acceptor on the same port with no memory of
+	// any connID, and the established link killed by hand because closing a Listener does not touch
+	// sockets it already accepted.
+	_ = ln1.Close()
+	cli.mu.Lock()
+	if l := cli.links[0]; l != nil {
+		_ = l.conn.Close()
+	}
+	cli.mu.Unlock()
+	ln2, err := net.Listen("tcp", realAddr)
+	if err != nil {
+		t.Skipf("could not rebind %s immediately after close: %v", realAddr, err)
+	}
+	defer ln2.Close()
+	srv2 := Listen(ln2, fastOpts(2, nil))
+	go func() { _, _ = srv2.Accept() }()
+
+	done := make(chan error, 1)
+	go func() {
+		_, e := cli.Read(make([]byte, 16))
+		done <- e
+	}()
+	select {
+	case e := <-done:
+		if e == nil || !strings.Contains(e.Error(), "rejected") {
+			t.Fatalf("want the stream to fail fast with a rejected-by-origin error, got %v", e)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream hung: a down line's missing verdict must not hold the whole stream open")
 	}
 }

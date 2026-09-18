@@ -155,4 +155,90 @@ class ReconnectAfterRestartTest {
         client.close()
         server2.close()
     }
+
+    // The SAME incident as the test above, with the one detail production had and that one lacks: a
+    // second line that is down and stays down.
+    //
+    // T-092 shipped with the test above passing and the product still wedging, and the whole
+    // difference is n. At n=1 a single REJECT is trivially "every link rejected"; at n=2 with a
+    // dead
+    // line the origin's verdict can only ever reach ONE slot, because the dead line never gets far
+    // enough to be told anything. Recovery that waits for the dead line's opinion waits forever: no
+    // error reaches the caller, nothing is logged, and the machine sits offline until somebody runs
+    // `microteams link retest` by hand.
+    @Test
+    fun clientSelfHealsWhenOriginForgetsConnIdWithALineDown() {
+        val srvSock1 = ServerSocket(0)
+        val port = srvSock1.localPort
+        val server1 = RedundantServer(srvSock1, RedundantOptions(n = 2))
+        val accepted1 = java.util.concurrent.CompletableFuture<RedundantStream>()
+        Thread(
+                {
+                    try {
+                        accepted1.complete(server1.accept())
+                    } catch (_: Exception) {}
+                },
+                "accept-1",
+            )
+            .apply {
+                isDaemon = true
+                start()
+            }
+
+        // Line 1 is the one that is down: its dial never succeeds, so it never writes a HELLO, is
+        // never rejected, and never has an opinion to contribute.
+        val dial: (Int) -> LinkConn? = { i ->
+            if (i == 1) throw IOException("line down")
+            val s = Socket("127.0.0.1", port)
+            s.tcpNoDelay = true
+            LinkConn(s.getInputStream(), s.getOutputStream(), s)
+        }
+        val client =
+            RedundantStream.dial(
+                RedundantOptions(
+                    n = 2,
+                    pingIntervalMs = 5,
+                    deadAfterMs = 500,
+                    reconnectDelayMs = 5,
+                    maxDelayMs = 20,
+                ),
+                dial,
+            )
+
+        waitUntil("line 0 established against the original origin") {
+            client.stats()[0].state == "up"
+        }
+        Thread.sleep(200)
+
+        srvSock1.close()
+        accepted1.get(2, java.util.concurrent.TimeUnit.SECONDS).close()
+        val srvSock2 = ServerSocket()
+        srvSock2.reuseAddress = true
+        srvSock2.bind(InetSocketAddress("127.0.0.1", port))
+        val server2 = RedundantServer(srvSock2, RedundantOptions(n = 2))
+        Thread(
+                {
+                    try {
+                        server2.accept()
+                    } catch (_: Exception) {}
+                },
+                "accept-2",
+            )
+            .apply {
+                isDaemon = true
+                start()
+            }
+
+        assertTimeoutPreemptively(Duration.ofSeconds(5)) {
+            val ex = assertThrows(IOException::class.java) { client.read(ByteArray(16), 0, 16) }
+            assertTrue(
+                ex.message!!.contains("rejected"),
+                "a down line's missing verdict must not hold the whole stream open, got: " +
+                    "${ex.message}",
+            )
+        }
+
+        client.close()
+        server2.close()
+    }
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { encodeReject } from '../src/frames.js';
+import { encodeAck, encodeReject } from '../src/frames.js';
 import { RedundantStream } from '../src/redundant.js';
 
 // A fake WebSocket the test drives by hand: open() fires onopen, message(bytes) delivers a frame,
@@ -72,5 +72,45 @@ describe('redundant link rejection', () => {
     await wait(30);
     expect(FakeWS.instances.length).toBe(1);
     expect(rs.stats()[0].reconnects).toBe(0);
+  });
+
+  // T-092: the same refusal, on a stream that HAS been established, where the other line is down.
+  //
+  // Recovery used to wait for every line to be refused. A line that is down is never refused — it
+  // never gets far enough to be told anything — so the stream stayed open with nothing carrying it,
+  // and the caller's reads hung forever with nothing in any log to act on. On the connector that
+  // was a machine sitting offline until a human ran `microteams link retest`.
+  it('closes an established stream when refused with the other line down', async () => {
+    FakeWS.instances = [];
+    let closeErr: Error | undefined;
+    const rs = new RedundantStream({
+      urls: ['ws://up', 'ws://down'],
+      pingIntervalMs: 100_000,
+      deadAfterMs: 100_000,
+      reconnectDelayMs: 100_000, // long enough that the down line never gets a second chance here
+      wsCtor: FakeWS as unknown as typeof WebSocket,
+    });
+    rs.onClose = (e) => {
+      closeErr = e;
+    };
+
+    const dialed = rs.dial();
+    FakeWS.instances[0].open();
+    await dialed;
+    // Line 1 never comes up: its socket closes instead of opening, which is what a dead path does.
+    FakeWS.instances[1].onclose?.();
+
+    // The origin answers line 0 with an ACK, which is what makes the stream established: this
+    // origin has confirmed the connID, so any later refusal is a verdict on the whole stream.
+    FakeWS.instances[0].message(encodeAck(0n));
+    await wait(5);
+
+    FakeWS.instances[0].message(
+      encodeReject('unknown connID (origin restarted or never held this stream)'),
+    );
+    await wait(5);
+
+    expect(closeErr, 'a down line has no verdict to wait for — the stream must close').toBeTruthy();
+    expect(closeErr!.message).toContain('rejected');
   });
 });
