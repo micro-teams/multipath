@@ -82,6 +82,18 @@ drives a real JVM origin through a per-link fault middlebox that black-holes, on
 and hard-disconnects links — so "works" means "works while links are being cut", which is the only
 claim the redundant primitive exists to make. See [`testbed/`](./testbed).
 
+## Releasing
+
+`scripts/version.sh` sets the version across every component at once, and its header is the whole
+release procedure — what the two tags are for, why `go/vX.Y.Z` is not optional, and what publishes
+where. Run it with no arguments to see the current version, check that every component agrees, and
+be told the exact tag commands for it.
+
+```sh
+scripts/version.sh            # what is it now, and does everything agree?
+scripts/version.sh 0.2.0-rc.6 # set it everywhere
+```
+
 ## License
 
 MIT — see [LICENSE](./LICENSE). (The products in this org are AGPL; a library meant to be embedded is

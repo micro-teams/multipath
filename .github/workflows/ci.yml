@@ -236,16 +236,28 @@ jobs:
           server-username: MAVEN_USERNAME
           server-password: MAVEN_PASSWORD
 
-      # A tag that disagrees with either committed version would publish a release nobody asked for,
-      # and an npm version cannot be replaced once taken — so this comes before any publish.
-      - name: Check the tag matches both committed versions
+      # A tag that disagrees with a committed version would publish a release nobody asked for, and
+      # an npm version cannot be replaced once taken — so this comes before any publish.
+      #
+      # EVERY component, not just the two that are published from here. It used to check jvm/pom.xml
+      # and ts/package.json alone, and the ones nothing looked at drifted exactly as you would
+      # expect: rc.4 and rc.5 were both cut by hand and both left dart/pubspec.yaml and the npm
+      # lockfile behind at 0.2.0. scripts/version.sh is what sets them all at once; this is what
+      # makes forgetting to run it impossible.
+      - name: Check the tag matches every committed version
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
+          file="$(tr -d '[:space:]' < VERSION)"
           pom="$(cd jvm && ./mvnw -q -B help:evaluate -Dexpression=project.version -DforceStdout)"
           pkg="$(node -p "require('./ts/package.json').version")"
-          [[ "$tag" == "$pom" ]] || { echo "tag $tag != jvm/pom.xml $pom" >&2; exit 1; }
-          [[ "$tag" == "$pkg" ]] || { echo "tag $tag != ts/package.json $pkg" >&2; exit 1; }
+          lock="$(node -p "require('./ts/package-lock.json').version")"
+          dart="$(sed -n 's/^version: *//p' dart/pubspec.yaml)"
+          for pair in "VERSION:$file" "jvm/pom.xml:$pom" "ts/package.json:$pkg" \
+                      "ts/package-lock.json:$lock" "dart/pubspec.yaml:$dart"; do
+            [[ "$tag" == "${pair#*:}" ]] || { echo "tag $tag != ${pair%%:*} ${pair#*:}" >&2; exit 1; }
+          done
+          echo "tag $tag agrees with every component"
 
       - name: Publish the browser package
         working-directory: ts
