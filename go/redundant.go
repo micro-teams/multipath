@@ -195,12 +195,17 @@ type RedundantStream struct {
 	lastSeen []time.Time // per-link time of last inbound frame; drives the keepalive reaper
 
 	// Per-link observability (see LinkState/LinkStat). state ∈ {"up","connecting","down"}.
-	linkState    []string
-	linkSince    []time.Time // when the current state was entered (for Duration)
-	linkReconn   []int       // count of recoveries after a drop
-	linkReason   []string    // last drop/dial cause
-	reapReason   []string    // pending "why" set by the reaper before it closes a silent link
-	linkRejected []bool      // link was refused by the origin (REJECT) — never retry it
+	linkState  []string
+	linkSince  []time.Time // when the current state was entered (for Duration)
+	linkReconn []int       // count of recoveries after a drop
+	linkReason []string    // last drop/dial cause
+	reapReason []string    // pending "why" set by the reaper before it closes a silent link
+
+	// linkRejected[i] is set once the origin has explicitly refused link i. It is consulted ONLY
+	// while the stream has never been established: before the origin has confirmed the connID even
+	// once, "nobody is attached" cannot tell a doomed stream from one still being brought up, so
+	// that case still needs every link to have been refused before giving up. See readLoop.
+	linkRejected []bool
 
 	closed   bool
 	closeErr error
@@ -639,11 +644,30 @@ func (s *RedundantStream) readLoop(i int, l *redundantLink) {
 	client := s.client
 	reason := s.reapReason[i] // reaper's "why" wins over the resulting read error
 	s.reapReason[i] = ""
-	if rejected {
-		s.linkRejected[i] = true
-	}
+	// Who else is still carrying this stream? Asked instead of "has every link been rejected?",
+	// which is what T-092 shipped and what still left machines offline until a human ran
+	// `link retest`.
+	//
+	// A REJECT for an established stream is the origin's verdict on the WHOLE stream — it no longer
+	// holds this connID — but it can only ever be delivered to links that get far enough to be
+	// told. A line that is down (dial failing, or asleep in connectLink's backoff) is never told
+	// anything, so waiting for its agreement waits forever. Who is still ATTACHED is the question
+	// that actually decides whether the stream can still work, and a dead line answers it correctly
+	// by being absent.
+	//
+	// Erring toward closing is deliberate: closing too eagerly costs one redial with a fresh
+	// connID, which the caller above already does; closing too late strands a machine off the
+	// platform with nothing in any log to act on.
+	otherAttached := false
 	allRejected := rejected
 	if rejected {
+		s.linkRejected[i] = true
+		for j, other := range s.links {
+			if j != i && other != nil {
+				otherAttached = true
+				break
+			}
+		}
 		for _, rj := range s.linkRejected {
 			if !rj {
 				allRejected = false
@@ -666,10 +690,20 @@ func (s *RedundantStream) readLoop(i int, l *redundantLink) {
 		s.markDown(i, reason)
 	}
 	if rejected {
-		// Every link refused → the stream can never work; close it with the reason so a Dial that
-		// already returned success now fails its reads/writes fast instead of hanging forever.
-		if allRejected && !closing {
-			s.closeWithError(errors.New("multipath: all links rejected by origin: " + rejectReason))
+		// Refused with nothing else carrying the stream → it can never work; close it with the
+		// reason so a Dial that already returned success now fails its reads/writes fast instead of
+		// hanging forever.
+		//
+		// The established check is what keeps bring-up honest. All N links dial CONCURRENTLY, and
+		// attaching is local (dial + write HELLO) while being rejected costs a round trip — so a
+		// link refused for its own reasons, such as an index this origin does not have, usually
+		// loses that race but not always. Closing on "nobody else is attached yet" tore down
+		// perfectly good streams whenever it won: measured 1 in 150 runs of the out-of-range test
+		// under -race. Before any origin has confirmed the connID there is no stream-wide verdict
+		// to act on, so that case keeps the original rule and waits for every link to be refused.
+		fatal := !otherAttached && (s.established.Load() || allRejected)
+		if fatal && !closing {
+			s.closeWithError(errors.New("multipath: rejected by origin with no link left: " + rejectReason))
 		}
 		return
 	}

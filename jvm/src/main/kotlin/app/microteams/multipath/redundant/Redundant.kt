@@ -165,7 +165,10 @@ internal constructor(
     private val linkReason = arrayOfNulls<String>(opt.n)
     private val lastByteMs = LongArray(opt.n)
     private val reapReason = arrayOfNulls<String>(opt.n)
-    private val linkRejected = BooleanArray(opt.n) // link refused by origin (REJECT) — never retry
+    // Set once the origin has explicitly refused link i. Consulted ONLY while the stream has never
+    // been established: before any origin has confirmed the connID, "nobody else is attached"
+    // cannot tell a doomed stream from one still being brought up. See the read loop.
+    private val linkRejected = BooleanArray(opt.n)
     private var closeErr: String? = null // set when closed with a cause (e.g. all links rejected)
 
     // established becomes true the first time any origin confirms this connID by responding to a
@@ -324,6 +327,7 @@ internal constructor(
         val closing: Boolean
         val hint: String?
         var allRejected = false
+        var otherAttached = false
         lock.withLock {
             if (links[i] === conn) links[i] = null
             closing = closed
@@ -333,6 +337,7 @@ internal constructor(
             if (rejected) {
                 linkRejected[i] = true
                 allRejected = linkRejected.all { it }
+                otherAttached = links.indices.any { it != i && links[it] != null }
             }
         }
         conn.close()
@@ -340,11 +345,23 @@ internal constructor(
             if (rejected) "origin rejected: $rejectReason" else hint ?: readErr ?: "link closed"
         if (!closing) markDown(i, reason)
         if (rejected) {
-            // Every link refused → the stream can never work; close it with the reason so a dial
-            // that
-            // already returned now fails read/write fast instead of hanging forever.
-            if (allRejected && !closing) {
-                closeWithError("multipath: all links rejected by origin: $rejectReason")
+            // Refused with nothing else carrying the stream → it can never work; close it with the
+            // reason so a dial that already returned now fails read/write fast instead of hanging
+            // forever.
+            //
+            // T-092: this used to wait for EVERY link to be refused, which a down line never is —
+            // it never gets far enough to be told anything — so a machine with one dead line stayed
+            // wedged offline until a human ran `link retest`. Who is still attached is the question
+            // that decides whether the stream can work; a dead line answers it by being absent.
+            //
+            // The established check keeps bring-up honest: links dial concurrently and attaching is
+            // local while being refused costs a round trip, so a link refused for its own reasons
+            // (an index this origin does not have) can lose that race. Before any origin has
+            // confirmed the connID there is no stream-wide verdict to act on, so that case keeps
+            // the original rule and waits for every link to be refused.
+            val fatal = !otherAttached && (established.get() || allRejected)
+            if (fatal && !closing) {
+                closeWithError("multipath: rejected by origin with no link left: $rejectReason")
             }
             return
         }
