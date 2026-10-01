@@ -52,6 +52,11 @@ data class RedundantOptions(
     val ackIntervalMs: Long = 50,
     val reconnectDelayMs: Long = 200,
     val maxDelayMs: Long = 5000,
+    // Origin side only: a stream with no line attached for this long is closed and forgotten. The
+    // client that owned it is gone (its machine was destroyed, or it redialled under a new connID);
+    // a client that does come back later is REJECTed as an unknown connID and dials a fresh stream.
+    // Without it every departed client left its keepalive, ack and mux threads running forever.
+    val orphanAfterMs: Long = 600_000,
     // Called once per line up/down transition (never on the hot path, never under the internal
     // lock).
     // Edge-triggered: repeated failed reconnects don't re-fire it, but the latest reason shows up
@@ -170,6 +175,12 @@ internal constructor(
     // cannot tell a doomed stream from one still being brought up. See the read loop.
     private val linkRejected = BooleanArray(opt.n)
     private var closeErr: String? = null // set when closed with a cause (e.g. all links rejected)
+
+    // Origin side: when the last line went away (0 while any line is attached). See orphanAfterMs.
+    private var noLinkSince = 0L
+
+    // Runs once when the stream closes; the RedundantServer uses it to forget the connID.
+    internal var onClose: (() -> Unit)? = null
 
     // established becomes true the first time any origin confirms this connID by responding to a
     // link with anything other than REJECT (see the read loop below). It is what HELLO2 tells an
@@ -495,6 +506,7 @@ internal constructor(
             writable.signalAll()
         }
         for (l in snapshot) l.close()
+        onClose?.invoke()
     }
 
     private fun isClosed(): Boolean = lock.withLock { closed }
@@ -530,7 +542,13 @@ internal constructor(
             val toPing = ArrayList<LinkConn>()
             val toReap = ArrayList<LinkConn>()
             val nonce = now
+            var orphaned = false
             lock.withLock {
+                if (!client) {
+                    if (links.any { it != null }) noLinkSince = 0
+                    else if (noLinkSince == 0L) noLinkSince = now
+                    else if ((now - noLinkSince) / 1_000_000 > opt.orphanAfterMs) orphaned = true
+                }
                 for (i in links.indices) {
                     val l = links[i] ?: continue
                     if ((now - lastSeen[i]) / 1_000_000 > opt.deadAfterMs) {
@@ -544,6 +562,10 @@ internal constructor(
             }
             for (l in toPing) l.write(encodeNonce(FRAME_PING, nonce))
             for (l in toReap) l.close() // its reader errors out and (client) reconnects
+            if (orphaned) {
+                closeWithError("multipath: no link for ${opt.orphanAfterMs}ms; client gone")
+                return
+            }
         }
     }
 
@@ -673,6 +695,9 @@ class RedundantServer(
                             ?: RedundantStream.server(opt, hello.connId!!).also {
                                 isNew = true
                                 streams[key] = it
+                                it.onClose = {
+                                    lock.withLock { if (streams[key] === it) streams.remove(key) }
+                                }
                             }
                     }
                 }
