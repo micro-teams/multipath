@@ -7,7 +7,7 @@
 
 import { MultipathWebSocket } from './appws.js';
 import { encodeHeader } from './header.js';
-import { parseResponse } from './http1.js';
+import { parseResponse, serializeRequest } from './http1.js';
 import { MuxSession, MuxStream } from './mux.js';
 import { LinkStat, RedundantOptions, RedundantStream } from './redundant.js';
 
@@ -88,31 +88,6 @@ export class Client {
   close(): void {
     this.sess.close();
   }
-}
-
-const CRLF = '\r\n';
-const encoder = new TextEncoder();
-
-async function serializeRequest(request: Request): Promise<Uint8Array> {
-  const url = new URL(request.url);
-  const path = url.pathname + url.search;
-  const body = request.body ? new Uint8Array(await request.arrayBuffer()) : new Uint8Array(0);
-  const headers = new Headers(request.headers);
-  if (!headers.has('host')) headers.set('host', url.host);
-  headers.set('content-length', String(body.length));
-  // The origin's app closes the connection per response; ask for it so the response boundary is the
-  // stream's EOF and there is no keep-alive to disambiguate.
-  headers.set('connection', 'close');
-
-  let head = `${request.method} ${path} HTTP/1.1${CRLF}`;
-  for (const [name, value] of headers) head += `${name}: ${value}${CRLF}`;
-  head += CRLF;
-
-  const headBytes = encoder.encode(head);
-  const out = new Uint8Array(headBytes.length + body.length);
-  out.set(headBytes);
-  out.set(body, headBytes.length);
-  return out;
 }
 
 async function readToEnd(st: MuxStream): Promise<Uint8Array> {

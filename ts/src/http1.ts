@@ -1,14 +1,41 @@
-// Reading the HTTP/1.1 response that comes back on a stream: the status line, the headers, and the
-// body — de-chunked when the server sent it with Transfer-Encoding: chunked, which any HTTP/1.1
+// One HTTP/1.1 exchange as bytes on a stream: the request written out, and the response read back —
+// its body de-chunked when the server sent it with Transfer-Encoding: chunked, which any HTTP/1.1
 // server may do for a body whose length it did not know up front. The Response handed back carries
 // the decoded body and a Content-Length, so a caller sees what fetch() would have given it.
 //
+// serializeRequest(request) — the request line, headers and body, asking the far end to close
+//   after answering so the response ends where the stream does.
 // parseResponse(bytes) — the whole response, read to the stream's end, as a Response.
 // dechunk(body) — a chunked body's payload; throws on a malformed one rather than passing the
 //   framing through as if it were content.
 
 const CRLF = '\r\n';
+const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+
+export async function serializeRequest(request: Request): Promise<Uint8Array> {
+  const url = new URL(request.url);
+  const path = url.pathname + url.search;
+  // Read the body whatever the Request says about having one: React Native's Request (whatwg-fetch)
+  // has no `body` property at all, and a GET simply reads as empty.
+  const body = new Uint8Array(await request.arrayBuffer());
+  const headers = new Headers(request.headers);
+  if (!headers.has('host')) headers.set('host', url.host);
+  headers.set('content-length', String(body.length));
+  // The origin's app closes the connection per response; ask for it so the response boundary is the
+  // stream's EOF and there is no keep-alive to disambiguate.
+  headers.set('connection', 'close');
+
+  let head = `${request.method} ${path} HTTP/1.1${CRLF}`;
+  for (const [name, value] of headers) head += `${name}: ${value}${CRLF}`;
+  head += CRLF;
+
+  const headBytes = encoder.encode(head);
+  const out = new Uint8Array(headBytes.length + body.length);
+  out.set(headBytes);
+  out.set(body, headBytes.length);
+  return out;
+}
 
 export function parseResponse(bytes: Uint8Array): Response {
   const sep = findDoubleCRLF(bytes, 0);

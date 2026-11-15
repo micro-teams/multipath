@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { dechunk, parseResponse } from '../src/http1.js';
+import { dechunk, parseResponse, serializeRequest } from '../src/http1.js';
 
 // The response half of Client.fetch, without a transport: bytes in, Response out. A server behind
 // the origin (nginx, Spring) answers a JSON body of unknown length chunked, and a caller has to see
@@ -44,5 +44,20 @@ describe('HTTP/1.1 responses', () => {
 
   it('keeps a 204 bodiless', () => {
     expect(parseResponse(bytes('HTTP/1.1 204 No Content\r\n\r\n')).body).toBeNull();
+  });
+
+  it('writes the body of a Request that does not say it has one', async () => {
+    // React Native's Request (whatwg-fetch) has no `body` property; only reading it says what it carries.
+    const payload = bytes('{"title":"t"}');
+    const rn = {
+      url: 'http://o.example/mt/chat',
+      method: 'POST',
+      headers: new Headers({ 'content-type': 'application/json' }),
+      arrayBuffer: async () => payload.slice().buffer,
+    } as unknown as Request;
+    const text = new TextDecoder().decode(await serializeRequest(rn));
+    expect(text).toMatch(/^POST \/mt\/chat HTTP\/1\.1\r\n/);
+    expect(text).toMatch(/content-length: 13\r\n/);
+    expect(text.endsWith('\r\n\r\n{"title":"t"}')).toBe(true);
   });
 });
