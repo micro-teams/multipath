@@ -69,7 +69,11 @@ export function installFetchRouter(
 //
 // The substrate is the way out, not the only way: a request that finds no line up within
 // fallbackAfterMs, or a GET/HEAD the substrate failed, goes to the network as it would have without
-// a worker. A substrate the origin refused outright is thrown away and the next request dials a
+// a worker. So does a GET/HEAD while no line is up at all, and one the substrate has not answered
+// within requestTimeoutMs: a line that died silently is only noticed when it has been quiet for a
+// while, and until then a request over it neither succeeds nor fails — a page waiting for its
+// "load" would wait forever. The request left behind on the substrate is not cancelled; an answer
+// arriving late is simply dropped. A substrate the origin refused outright is thrown away and the next request dials a
 // fresh one.
 
 // LineStore keeps the line list across worker restarts. load() resolves with what was saved, [] when
@@ -116,6 +120,7 @@ export function cacheLineStore(
 export interface RoutedClient {
   ready(): Promise<void>;
   readonly closed: boolean;
+  stats?(): { state: string }[];
   addLines(lines: string[]): number;
   fetch(service: string, request: Request, ticket?: Uint8Array): Promise<Response>;
 }
@@ -135,6 +140,8 @@ export interface LineRouterOptions extends ClientOptions {
   // Counted from the dial, not from each request: once it has passed, a request that finds no line
   // up goes to the network at once instead of waiting again. Default 3000.
   fallbackAfterMs?: number;
+  // How long a GET/HEAD waits for the substrate's answer before going to the network. Default 10000.
+  requestTimeoutMs?: number;
   // Where a request goes when the substrate cannot take it. Default: globalThis.fetch.
   fallback?: (request: Request) => Promise<Response>;
   // Injected in tests; defaults to Client.connect.
@@ -156,6 +163,7 @@ export function createLineRouter(opts: LineRouterOptions): LineRouter {
   const connect = opts.connect ?? ((lines: string[], o: ClientOptions) => Client.connect(lines, o));
   const service = opts.service ?? 'app';
   const fallbackAfterMs = opts.fallbackAfterMs ?? 3000;
+  const requestTimeoutMs = opts.requestTimeoutMs ?? 10000;
   const fallback = opts.fallback ?? ((r: Request) => fetch(r));
   let known: string[] = [...new Set(opts.seed)];
   let loaded: Promise<void> | null = null;
@@ -220,7 +228,13 @@ export function createLineRouter(opts: LineRouterOptions): LineRouter {
         return fallback(spare ?? request);
       }
       try {
-        return await c.fetch(service, retryable ? request.clone() : request, opts.ticket);
+        if (!retryable) return await c.fetch(service, request, opts.ticket);
+        if (c.stats && !c.stats().some((s) => s.state === 'up')) return await fallback(request);
+        const answer = await within(
+          c.fetch(service, request.clone(), opts.ticket),
+          requestTimeoutMs,
+        );
+        return answer === 'late' ? await fallback(request) : answer;
       } catch (err) {
         if (!retryable) throw err;
         return fallback(request);

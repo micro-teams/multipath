@@ -115,6 +115,26 @@ describe('line router', () => {
     expect(Date.now() - started).toBeLessThan(40);
   });
 
+  it('a GET goes to the network when no line is up, or the substrate does not answer in time', async () => {
+    const fallback = vi.fn(async () => new Response('direct'));
+    const down = { ...fakeClient().client, stats: () => [{ state: 'down' }] };
+    const r1 = createLineRouter({ seed: ['wss://a'], connect: () => down, fallback });
+    expect(await (await r1.fetch(new Request('http://app/x'))).text()).toBe('direct');
+    const silent = {
+      ...fakeClient().client,
+      stats: () => [{ state: 'up' }],
+      fetch: () => new Promise<Response>(() => {}),
+    };
+    const r2 = createLineRouter({
+      seed: ['wss://a'],
+      connect: () => silent,
+      fallback,
+      requestTimeoutMs: 20,
+    });
+    expect(await (await r2.fetch(new Request('http://app/x'))).text()).toBe('direct');
+    expect(fallback).toHaveBeenCalledTimes(2);
+  });
+
   it('retries a failed GET over the network, but never a POST', async () => {
     const { client } = fakeClient({ fails: true });
     const fallback = vi.fn(async () => new Response('direct'));
