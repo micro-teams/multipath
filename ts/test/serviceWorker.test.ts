@@ -100,6 +100,21 @@ describe('line router', () => {
     expect(await (await router.fetch(new Request('http://app/x'))).text()).toBe('direct');
   });
 
+  it('waits for a dial once, not once per request', async () => {
+    const { client } = fakeClient({ up: false });
+    const fallback = vi.fn(async () => new Response('direct'));
+    const router = createLineRouter({
+      seed: ['wss://a'],
+      connect: () => client,
+      fallback,
+      fallbackAfterMs: 50,
+    });
+    await router.fetch(new Request('http://app/x'));
+    const started = Date.now();
+    expect(await (await router.fetch(new Request('http://app/y'))).text()).toBe('direct');
+    expect(Date.now() - started).toBeLessThan(40);
+  });
+
   it('retries a failed GET over the network, but never a POST', async () => {
     const { client } = fakeClient({ fails: true });
     const fallback = vi.fn(async () => new Response('direct'));

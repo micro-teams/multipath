@@ -131,7 +131,9 @@ export interface LineRouterOptions extends ClientOptions {
   // The registered service requests are routed to. Default "app".
   service?: string;
   ticket?: Uint8Array;
-  // How long a request waits for the first line before going to the network. Default 3000.
+  // How long after a dial starts requests wait for its first line before going to the network.
+  // Counted from the dial, not from each request: once it has passed, a request that finds no line
+  // up goes to the network at once instead of waiting again. Default 3000.
   fallbackAfterMs?: number;
   // Where a request goes when the substrate cannot take it. Default: globalThis.fetch.
   fallback?: (request: Request) => Promise<Response>;
@@ -158,6 +160,7 @@ export function createLineRouter(opts: LineRouterOptions): LineRouter {
   let known: string[] = [...new Set(opts.seed)];
   let loaded: Promise<void> | null = null;
   let client: RoutedClient | null = null;
+  let dialledAt = 0;
 
   const learn = (lines: string[]): boolean => {
     const fresh = lines.filter((l) => !known.includes(l));
@@ -189,7 +192,10 @@ export function createLineRouter(opts: LineRouterOptions): LineRouter {
 
   const live = async (): Promise<RoutedClient> => {
     await start();
-    if (!client || client.closed) client = connect(known, opts);
+    if (!client || client.closed) {
+      client = connect(known, opts);
+      dialledAt = Date.now();
+    }
     return client;
   };
 
@@ -209,7 +215,8 @@ export function createLineRouter(opts: LineRouterOptions): LineRouter {
       const retryable = request.method === 'GET' || request.method === 'HEAD';
       const spare = retryable ? null : request.clone();
       const c = await live();
-      if ((await within(c.ready(), fallbackAfterMs)) === 'late' || c.closed) {
+      const wait = Math.max(0, fallbackAfterMs - (Date.now() - dialledAt));
+      if ((await within(c.ready(), wait)) === 'late' || c.closed) {
         return fallback(spare ?? request);
       }
       try {
