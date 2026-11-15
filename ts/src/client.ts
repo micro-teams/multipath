@@ -7,6 +7,7 @@
 
 import { MultipathWebSocket } from './appws.js';
 import { encodeHeader } from './header.js';
+import { parseResponse } from './http1.js';
 import { MuxSession, MuxStream } from './mux.js';
 import { LinkStat, RedundantOptions, RedundantStream } from './redundant.js';
 
@@ -130,33 +131,4 @@ async function readToEnd(st: MuxStream): Promise<Uint8Array> {
     off += c.length;
   }
   return out;
-}
-
-const decoder = new TextDecoder();
-
-function parseResponse(bytes: Uint8Array): Response {
-  const sep = findDoubleCRLF(bytes);
-  if (sep < 0) throw new Error('multipath: malformed HTTP response');
-  const headText = decoder.decode(bytes.subarray(0, sep));
-  const body = bytes.subarray(sep + 4);
-  const lines = headText.split(CRLF);
-  const statusLine = lines[0].split(' ');
-  const status = Number(statusLine[1] ?? 200);
-  const headers = new Headers();
-  for (let i = 1; i < lines.length; i++) {
-    const idx = lines[i].indexOf(':');
-    if (idx > 0) headers.append(lines[i].slice(0, idx).trim(), lines[i].slice(idx + 1).trim());
-  }
-  // 204/304 must not carry a body per the Response constructor. Hand it a copied ArrayBuffer, a
-  // BodyInit the DOM types accept without quarrelling over Uint8Array's buffer generic.
-  const bodyInit = status === 204 || status === 304 ? null : body.slice().buffer;
-  return new Response(bodyInit, { status, headers });
-}
-
-function findDoubleCRLF(bytes: Uint8Array): number {
-  for (let i = 0; i + 3 < bytes.length; i++) {
-    if (bytes[i] === 13 && bytes[i + 1] === 10 && bytes[i + 2] === 13 && bytes[i + 3] === 10)
-      return i;
-  }
-  return -1;
 }
