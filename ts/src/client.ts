@@ -21,17 +21,45 @@ export class Client {
   private constructor(
     private rs: RedundantStream,
     private sess: MuxSession,
+    private up: Promise<void>,
+    private linkPath: string,
   ) {}
 
   // dial brings up the redundant transport over every line and resolves once at least one link is
   // up. Each line is a WebSocket origin (wss:// in production, ws:// for a testbed).
   static async dial(lines: string[], opts: ClientOptions = {}): Promise<Client> {
+    const client = Client.connect(lines, opts);
+    await client.ready();
+    return client;
+  }
+
+  /**
+   * Starts dialling every line and returns at once, so lines learnt meanwhile can join the race with
+   * addLines; ready() resolves once a link is up. Streams opened before then wait for it.
+   */
+  static connect(lines: string[], opts: ClientOptions = {}): Client {
     const linkPath = opts.linkPath ?? '/mt/link';
-    const urls = lines.map((l) => l.replace(/\/$/, '') + linkPath);
-    const rs = new RedundantStream({ ...opts, urls });
+    const rs = new RedundantStream({ ...opts, urls: lines.map((l) => joinPath(l, linkPath)) });
     const sess = MuxSession.client(rs);
-    await rs.dial();
-    return new Client(rs, sess);
+    return new Client(rs, sess, rs.dial(), linkPath);
+  }
+
+  /** Resolves once at least one line is up, or the client has closed (see closed). */
+  ready(): Promise<void> {
+    return this.up;
+  }
+
+  /** Whether the client is finished: closed by close(), or refused by the origin on every line. */
+  get closed(): boolean {
+    return this.rs.isClosed;
+  }
+
+  /**
+   * Adds lines to a running client; each one it does not have yet starts connecting at once, joining
+   * a dial still in progress. Returns how many were new.
+   */
+  addLines(lines: string[]): number {
+    return lines.filter((l) => this.rs.addLine(joinPath(l, this.linkPath))).length;
   }
 
   /**
@@ -88,6 +116,10 @@ export class Client {
   close(): void {
     this.sess.close();
   }
+}
+
+function joinPath(line: string, path: string): string {
+  return line.replace(/\/$/, '') + path;
 }
 
 async function readToEnd(st: MuxStream): Promise<Uint8Array> {

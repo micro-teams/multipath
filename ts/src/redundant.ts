@@ -33,7 +33,7 @@ export interface LinkStat {
 }
 
 export interface RedundantOptions {
-  urls: string[]; // one per line; a link is opened (and reconnected) to each
+  urls: string[]; // one per line; a link is opened (and reconnected) to each; addLine adds more
   window?: number; // max unacknowledged bytes before write() awaits ACKs; default 4MiB
   pingIntervalMs?: number; // default 5000
   deadAfterMs?: number; // default 15000; a link silent this long is reconnected
@@ -76,6 +76,7 @@ export class RedundantStream {
   private windowWaiters: Array<() => void> = [];
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private closed = false;
+  private dialled = false;
   private opened = false;
   private onOpenResolve: (() => void) | null = null;
   private openPromise: Promise<void>;
@@ -101,7 +102,7 @@ export class RedundantStream {
 
   constructor(opt: RedundantOptions) {
     this.opt = {
-      urls: opt.urls,
+      urls: [...opt.urls],
       window: opt.window ?? 4 << 20,
       pingIntervalMs: opt.pingIntervalMs ?? 5000,
       deadAfterMs: opt.deadAfterMs ?? 15000,
@@ -114,7 +115,12 @@ export class RedundantStream {
     this.onLinkState = opt.onLinkState ?? (() => {});
     this.connID = new Uint8Array(16);
     crypto.getRandomValues(this.connID);
-    this.slots = this.opt.urls.map(() => ({
+    this.slots = this.opt.urls.map(() => this.freshSlot());
+    this.openPromise = new Promise((resolve) => (this.onOpenResolve = resolve));
+  }
+
+  private freshSlot(): LinkSlot {
+    return {
       link: null,
       lastSeen: this.now(),
       backoff: this.opt.reconnectDelayMs,
@@ -125,12 +131,32 @@ export class RedundantStream {
       reason: '',
       reapReason: '',
       rejected: false,
-    }));
-    this.openPromise = new Promise((resolve) => (this.onOpenResolve = resolve));
+    };
   }
 
-  /** Opens the links and resolves once at least one is up. */
+  /** Whether the stream has closed — by close(), or because the origin refused every link. */
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
+  /**
+   * Adds a line to the stream, before or after dial(). Once dialling, its link is opened at once,
+   * so a line learnt while the first links are still connecting joins that race: whichever comes up
+   * first opens the stream. A url the stream already has, or a closed stream, is left as it is;
+   * returns whether the line was added. Its index is the next one, so the origin's link limit
+   * (MaxLinks) bounds how many lines one stream can use.
+   */
+  addLine(url: string): boolean {
+    if (this.closed || this.opt.urls.includes(url)) return false;
+    this.opt.urls.push(url);
+    this.slots.push(this.freshSlot());
+    if (this.dialled) this.connect(this.slots.length - 1);
+    return true;
+  }
+
+  /** Opens the links and resolves once at least one is up (or the stream closed). */
   async dial(): Promise<void> {
+    this.dialled = true;
     for (let i = 0; i < this.slots.length; i++) this.connect(i);
     this.pingTimer = setInterval(() => this.tick(), this.opt.pingIntervalMs);
     await this.openPromise;

@@ -56,3 +56,168 @@ export function installFetchRouter(
     event.respondWith(client().then((c) => c.fetch(service, event.request, opts.ticket)));
   });
 }
+
+// ---------------------------------------------------------------------------------------------
+// A router that knows where its lines come from.
+//
+// installFetchRouter is handed its lines once. A worker the browser restarts knows nothing, and the
+// lines a deployment publishes change, so createLineRouter keeps them: it dials at once over the
+// lines it can name without asking (seed, typically the worker's own origin) plus the ones it held
+// last time (store), asks for the current list in the background (discover), adds every line it
+// had not heard of to the client — a dial still in progress included, so a new line can win the
+// race it joins — and keeps the union for next time.
+//
+// The substrate is the way out, not the only way: a request that finds no line up within
+// fallbackAfterMs, or a GET/HEAD the substrate failed, goes to the network as it would have without
+// a worker. A substrate the origin refused outright is thrown away and the next request dials a
+// fresh one.
+
+// LineStore keeps the line list across worker restarts. load() resolves with what was saved, [] when
+// nothing was (and never rejects for a missing entry).
+export interface LineStore {
+  load(): Promise<string[]>;
+  save(lines: string[]): Promise<void>;
+}
+
+interface CachesLike {
+  open(name: string): Promise<{
+    match(key: string): Promise<Response | undefined>;
+    put(key: string, response: Response): Promise<void>;
+  }>;
+}
+
+// cacheLineStore keeps the list as JSON under key in the Cache Storage cache named cacheName — the
+// one store a service worker has that survives it being stopped. key is a URL nothing serves.
+export function cacheLineStore(
+  cacheName: string,
+  key: string,
+  caches: CachesLike = (globalThis as unknown as { caches: CachesLike }).caches,
+): LineStore {
+  return {
+    async load() {
+      try {
+        const held = await (await caches.open(cacheName)).match(key);
+        const lines: unknown = held ? await held.json() : [];
+        return Array.isArray(lines) ? lines.filter((l): l is string => typeof l === 'string') : [];
+      } catch {
+        return [];
+      }
+    },
+    async save(lines) {
+      const body = JSON.stringify(lines);
+      await (
+        await caches.open(cacheName)
+      ).put(key, new Response(body, { headers: { 'Content-Type': 'application/json' } }));
+    },
+  };
+}
+
+// The part of Client a router uses; injected in tests.
+export interface RoutedClient {
+  ready(): Promise<void>;
+  readonly closed: boolean;
+  addLines(lines: string[]): number;
+  fetch(service: string, request: Request, ticket?: Uint8Array): Promise<Response>;
+}
+
+export interface LineRouterOptions extends ClientOptions {
+  // Lines known without asking anybody — e.g. [wss://<the worker's host>]. Always dialled.
+  seed: string[];
+  // Where the list is kept between worker restarts. Default: kept in memory only.
+  store?: LineStore;
+  // Fetches the deployment's current lines. Called once per router (and again by refresh()); a
+  // rejection keeps the lines already known.
+  discover?: () => Promise<string[]>;
+  // The registered service requests are routed to. Default "app".
+  service?: string;
+  ticket?: Uint8Array;
+  // How long a request waits for the first line before going to the network. Default 3000.
+  fallbackAfterMs?: number;
+  // Where a request goes when the substrate cannot take it. Default: globalThis.fetch.
+  fallback?: (request: Request) => Promise<Response>;
+  // Injected in tests; defaults to Client.connect.
+  connect?: (lines: string[], opts: ClientOptions) => RoutedClient;
+  // Told about every change of the known lines (after discovery, say), for a log.
+  onLines?: (lines: string[]) => void;
+}
+
+export interface LineRouter {
+  // fetch(request) over the substrate when it can, over the network when it cannot.
+  fetch(request: Request): Promise<Response>;
+  // The lines known now: seed, stored and discovered, without repeats.
+  lines(): string[];
+  // Ask discover() again and add what it names.
+  refresh(): Promise<void>;
+}
+
+export function createLineRouter(opts: LineRouterOptions): LineRouter {
+  const connect = opts.connect ?? ((lines: string[], o: ClientOptions) => Client.connect(lines, o));
+  const service = opts.service ?? 'app';
+  const fallbackAfterMs = opts.fallbackAfterMs ?? 3000;
+  const fallback = opts.fallback ?? ((r: Request) => fetch(r));
+  let known: string[] = [...new Set(opts.seed)];
+  let loaded: Promise<void> | null = null;
+  let client: RoutedClient | null = null;
+
+  const learn = (lines: string[]): boolean => {
+    const fresh = lines.filter((l) => !known.includes(l));
+    if (!fresh.length) return false;
+    known = [...known, ...fresh];
+    client?.addLines(fresh);
+    opts.onLines?.(known);
+    return true;
+  };
+
+  const refresh = async () => {
+    if (!opts.discover) return;
+    try {
+      if (learn(await opts.discover())) await opts.store?.save(known);
+    } catch {
+      // The lines already known still work; the next refresh may do better.
+    }
+  };
+
+  const start = (): Promise<void> => {
+    if (!loaded) {
+      loaded = (async () => {
+        learn((await opts.store?.load()) ?? []);
+        void refresh();
+      })();
+    }
+    return loaded;
+  };
+
+  const live = async (): Promise<RoutedClient> => {
+    await start();
+    if (!client || client.closed) client = connect(known, opts);
+    return client;
+  };
+
+  const within = <T>(p: Promise<T>, ms: number): Promise<T | 'late'> =>
+    new Promise((resolve, reject) => {
+      const t = setTimeout(() => resolve('late'), ms);
+      p.then(
+        (v) => (clearTimeout(t), resolve(v)),
+        (e) => (clearTimeout(t), reject(e)),
+      );
+    });
+
+  return {
+    lines: () => [...known],
+    refresh,
+    async fetch(request) {
+      const retryable = request.method === 'GET' || request.method === 'HEAD';
+      const spare = retryable ? null : request.clone();
+      const c = await live();
+      if ((await within(c.ready(), fallbackAfterMs)) === 'late' || c.closed) {
+        return fallback(spare ?? request);
+      }
+      try {
+        return await c.fetch(service, retryable ? request.clone() : request, opts.ticket);
+      } catch (err) {
+        if (!retryable) throw err;
+        return fallback(request);
+      }
+    },
+  };
+}
