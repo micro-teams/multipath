@@ -55,9 +55,14 @@ export function parseResponse(bytes: Uint8Array): Response {
     headers.delete('transfer-encoding');
     headers.set('content-length', String(body.length));
   }
-  // 204/304 must not carry a body per the Response constructor. Hand it a copied ArrayBuffer, a
-  // BodyInit the DOM types accept without quarrelling over Uint8Array's buffer generic.
-  const bodyInit = status === 204 || status === 304 ? null : body.slice().buffer;
+  // 204/304 must not carry a body per the Response constructor. A textual body is handed over
+  // already decoded as UTF-8: React Native's Response (whatwg-fetch) reads an ArrayBuffer body as
+  // Latin-1, one character per byte, which turns any non-ASCII text into mojibake. Anything else
+  // goes as a copied ArrayBuffer, a BodyInit the DOM types accept without quarrelling over
+  // Uint8Array's buffer generic.
+  const textual = /^text\/|json|xml|javascript/i.test(headers.get('content-type') ?? '');
+  const bodyInit =
+    status === 204 || status === 304 ? null : textual ? decoder.decode(body) : body.slice().buffer;
   return new Response(bodyInit, { status, headers });
 }
 

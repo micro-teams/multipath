@@ -60,4 +60,15 @@ describe('HTTP/1.1 responses', () => {
     expect(text).toMatch(/content-length: 13\r\n/);
     expect(text.endsWith('\r\n\r\n{"title":"t"}')).toBe(true);
   });
+
+  it('hands a textual body over as UTF-8 text', async () => {
+    const json = bytes('{"t":"中文"}');
+    const head = bytes(
+      `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${json.length}\r\n\r\n`,
+    );
+    const all = new Uint8Array(head.length + json.length);
+    all.set(head);
+    all.set(json, head.length);
+    expect(await parseResponse(all).json()).toEqual({ t: '中文' });
+  });
 });
