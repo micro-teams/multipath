@@ -135,7 +135,7 @@ jobs:
           sdk: stable
       # Explicit rather than relying on whatever Chrome the runner image happens to ship — the Dart
       # web leg (link_web.dart, a real browser-native L2 link) needs a real browser, not a stub.
-      - uses: browser-actions/setup-chrome@v1
+      - uses: browser-actions/setup-chrome@v2
         with:
           chrome-version: stable
       - name: Build the origin and run the cross-language substrate e2e
