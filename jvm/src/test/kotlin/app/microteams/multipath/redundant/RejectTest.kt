@@ -29,8 +29,7 @@ class RejectTest {
     }
 
     // A link whose HELLO index the origin refuses is reported down with the origin's reason and
-    // never
-    // retried, while an in-range link on the same stream stays up.
+    // never retried, while an in-range link on the same stream stays up.
     @Test
     fun outOfRangeLinkReportedNotRetried() {
         val events = Collections.synchronizedList(mutableListOf<LinkState>())
@@ -51,7 +50,10 @@ class RejectTest {
         val accepted = server.accept()
 
         waitUntil("link 1 reported down with the out-of-range reason") {
-            events.any { it.index == 1 && !it.up && it.reason.contains("out of range") }
+            // A synchronized list still needs its lock to be iterated while the client appends.
+            synchronized(events) {
+                events.any { it.index == 1 && !it.up && it.reason.contains("out of range") }
+            }
         }
         waitUntil("link 0 up") { client.stats()[0].state == "up" }
         Thread.sleep(200)

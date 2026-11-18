@@ -298,8 +298,11 @@ internal constructor(
             if (!conn.write(encodeData(base + off, replay, off, len))) break
             off += len
         }
-        thread(isDaemon = true, name = "mp-read-$i") { readLoop(i, conn) }
+        // Up before the reader starts, never after: the reader can take a REJECT and mark the link
+        // down at once, and an up recorded after that down counted a recovery that never happened
+        // and showed a refused link as up.
         markUp(i)
+        thread(isDaemon = true, name = "mp-read-$i") { readLoop(i, conn) }
         return true
     }
 
