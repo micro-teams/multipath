@@ -65,7 +65,7 @@ class MuxSessionClosedException : IOException("multipath: mux session closed")
 
 class MuxStreamResetException(reason: String = "") :
     IOException(
-        if (reason.isEmpty()) "multipath: stream reset" else "multipath: stream reset: $reason"
+        if (reason.isEmpty()) "multipath: stream reset" else "multipath: stream reset: $reason",
     )
 
 /** Multiplexes many [MuxStream]s over one transport. */
@@ -141,7 +141,7 @@ class MuxSession private constructor(private val transport: MuxTransport, client
             if (len > 0) {
                 transport.write(
                     if (off == 0 && len == payload!!.size) payload
-                    else payload!!.copyOfRange(off, off + len)
+                    else payload!!.copyOfRange(off, off + len),
                 )
             }
         }
@@ -228,17 +228,16 @@ class MuxStream internal constructor(private val sess: MuxSession, private val i
     private var closed = false
     private var error: IOException? = null
 
-    internal fun deliver(p: ByteArray) =
-        lock.withLock {
-            if (closed || error != null) return
-            // compact + append
-            if (inboxOff > 0) {
-                inbox = inbox.copyOfRange(inboxOff, inbox.size)
-                inboxOff = 0
-            }
-            inbox += p
-            readable.signalAll()
+    internal fun deliver(p: ByteArray) = lock.withLock {
+        if (closed || error != null) return
+        // compact + append
+        if (inboxOff > 0) {
+            inbox = inbox.copyOfRange(inboxOff, inbox.size)
+            inboxOff = 0
         }
+        inbox += p
+        readable.signalAll()
+    }
 
     internal fun remoteFin() {
         lock.withLock {
@@ -256,18 +255,16 @@ class MuxStream internal constructor(private val sess: MuxSession, private val i
         if (done) sess.removeStream(id)
     }
 
-    internal fun grantSend(n: Long) =
-        lock.withLock {
-            sendWin += n.toInt()
-            writable.signalAll()
-        }
+    internal fun grantSend(n: Long) = lock.withLock {
+        sendWin += n.toInt()
+        writable.signalAll()
+    }
 
-    internal fun shutdown(e: IOException) =
-        lock.withLock {
-            if (error == null) error = e
-            readable.signalAll()
-            writable.signalAll()
-        }
+    internal fun shutdown(e: IOException) = lock.withLock {
+        if (error == null) error = e
+        readable.signalAll()
+        writable.signalAll()
+    }
 
     fun read(dst: ByteArray, off: Int, len: Int): Int {
         lock.withLock {
