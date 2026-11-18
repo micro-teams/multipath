@@ -40,16 +40,16 @@ object EchoServerMain {
             while (true) {
                 val st = session.acceptStream()
                 Thread {
-                        val buf = ByteArray(64 * 1024)
-                        try {
-                            while (true) {
-                                val m = st.read(buf, 0, buf.size)
-                                if (m < 0) break
-                                st.write(buf.copyOfRange(0, m))
-                            }
-                        } catch (_: Exception) {}
-                        st.closeWrite()
-                    }
+                    val buf = ByteArray(64 * 1024)
+                    try {
+                        while (true) {
+                            val m = st.read(buf, 0, buf.size)
+                            if (m < 0) break
+                            st.write(buf.copyOfRange(0, m))
+                        }
+                    } catch (_: Exception) {}
+                    st.closeWrite()
+                }
                     .apply { isDaemon = true }
                     .start()
             }

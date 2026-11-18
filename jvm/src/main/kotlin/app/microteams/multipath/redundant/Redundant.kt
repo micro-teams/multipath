@@ -229,12 +229,11 @@ internal constructor(
     /**
      * A snapshot of every line's current health. A status view reads this; a log uses onLinkState.
      */
-    fun stats(): List<LinkStat> =
-        lock.withLock {
-            (0 until opt.n).map { i ->
-                LinkStat(i, linkState[i], lastByteMs[i], linkReconn[i], linkReason[i] ?: "")
-            }
+    fun stats(): List<LinkStat> = lock.withLock {
+        (0 until opt.n).map { i ->
+            LinkStat(i, linkState[i], lastByteMs[i], linkReconn[i], linkReason[i] ?: "")
         }
+    }
 
     internal fun start() {
         thread(isDaemon = true, name = "mp-keepalive") { keepaliveLoop() }
@@ -380,11 +379,10 @@ internal constructor(
             thread(isDaemon = true, name = "mp-reconnect-$i") { connectLink(i, firstTry = false) }
     }
 
-    private fun touch(i: Int) =
-        lock.withLock {
-            lastSeen[i] = System.nanoTime()
-            lastByteMs[i] = System.currentTimeMillis()
-        }
+    private fun touch(i: Int) = lock.withLock {
+        lastSeen[i] = System.nanoTime()
+        lastByteMs[i] = System.currentTimeMillis()
+    }
 
     // --- receive side ---
 
@@ -441,14 +439,13 @@ internal constructor(
 
     // --- send side ---
 
-    private fun onAck(cumulative: Long) =
-        lock.withLock {
-            if (cumulative > sendBase) {
-                sendBuf.trimFront((cumulative - sendBase).toInt())
-                sendBase = cumulative
-                writable.signalAll()
-            }
+    private fun onAck(cumulative: Long) = lock.withLock {
+        if (cumulative > sendBase) {
+            sendBuf.trimFront((cumulative - sendBase).toInt())
+            sendBase = cumulative
+            writable.signalAll()
         }
+    }
 
     fun write(p: ByteArray) {
         var pos = 0
@@ -665,7 +662,7 @@ class RedundantServer(
                 val reason = "link index $idx out of range (n=${opt.n})"
                 conn.write(encodeReject(reason))
                 System.err.println(
-                    "multipath: rejecting link from ${sock.remoteSocketAddress}: $reason"
+                    "multipath: rejecting link from ${sock.remoteSocketAddress}: $reason",
                 )
                 conn.close()
                 return
@@ -673,34 +670,33 @@ class RedundantServer(
             val key = hello.connId!!.joinToString("") { "%02x".format(it) }
             var isNew = false
             var reject = false
-            val stream =
-                lock.withLock {
-                    val known = streams[key]
-                    if (known == null && hello.reconnect) {
-                        // hello.reconnect only arrives on a HELLO2 — a legacy HELLO decodes to
-                        // false and keeps the old, permissive behavior below. This client is
-                        // telling us it has used this connID before, and we have never heard of
-                        // it: this process forgot every stream it ever knew, almost always because
-                        // it just restarted. Accepting it as new would silently start a fresh
-                        // server-side stream at offset 0 underneath a client that is not at offset
-                        // 0, wedging the connection with no error on either side. REJECTing it
-                        // instead sends the client down the path it already has for a stream that
-                        // can never work: every link gets rejected in turn, the whole stream closes
-                        // with an error, and the caller throws it away and dials a fresh one with a
-                        // new connID.
-                        reject = true
-                        null
-                    } else {
-                        known
-                            ?: RedundantStream.server(opt, hello.connId!!).also {
-                                isNew = true
-                                streams[key] = it
-                                it.onClose = {
-                                    lock.withLock { if (streams[key] === it) streams.remove(key) }
-                                }
+            val stream = lock.withLock {
+                val known = streams[key]
+                if (known == null && hello.reconnect) {
+                    // hello.reconnect only arrives on a HELLO2 — a legacy HELLO decodes to
+                    // false and keeps the old, permissive behavior below. This client is
+                    // telling us it has used this connID before, and we have never heard of
+                    // it: this process forgot every stream it ever knew, almost always because
+                    // it just restarted. Accepting it as new would silently start a fresh
+                    // server-side stream at offset 0 underneath a client that is not at offset
+                    // 0, wedging the connection with no error on either side. REJECTing it
+                    // instead sends the client down the path it already has for a stream that
+                    // can never work: every link gets rejected in turn, the whole stream closes
+                    // with an error, and the caller throws it away and dials a fresh one with a
+                    // new connID.
+                    reject = true
+                    null
+                } else {
+                    known
+                        ?: RedundantStream.server(opt, hello.connId!!).also {
+                            isNew = true
+                            streams[key] = it
+                            it.onClose = {
+                                lock.withLock { if (streams[key] === it) streams.remove(key) }
                             }
-                    }
+                        }
                 }
+            }
             if (reject) {
                 val reason = "unknown connID (origin restarted or never held this stream)"
                 conn.write(encodeReject(reason))
