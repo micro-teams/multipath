@@ -22,6 +22,12 @@ export interface Link {
 // openWebSocketLink dials url, announces itself with HELLO(connID, linkIdx), and drives handlers.
 // It is deliberately dumb: any error becomes onClose, and the redundant stream above decides whether
 // to reconnect. wsCtor is injected so tests can supply a WebSocket that runs over an in-memory pipe.
+// What WebSocket.send takes. Our byte arrays are never views of a SharedArrayBuffer, which is the
+// one kind send refuses; TypeScript 5.7 and later type Uint8Array by its buffer and cannot know that.
+function onTheWire(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
+  return bytes as Uint8Array<ArrayBuffer>;
+}
+
 export function openWebSocketLink(
   url: string,
   connID: Uint8Array,
@@ -41,7 +47,7 @@ export function openWebSocketLink(
   };
 
   ws.onopen = () => {
-    ws.send(encodeHello(connID, linkIdx));
+    ws.send(onTheWire(encodeHello(connID, linkIdx)));
     handlers.onOpen();
   };
   ws.onmessage = (event: MessageEvent) => {
@@ -68,7 +74,7 @@ export function openWebSocketLink(
       // WebSocket.send throws if the socket is not open; a link that cannot send is a dead link, and
       // the stream will notice through the missing ACKs and reconnect it.
       try {
-        ws.send(frame);
+        ws.send(onTheWire(frame));
       } catch {
         /* dead link; reconnect handles it */
       }
