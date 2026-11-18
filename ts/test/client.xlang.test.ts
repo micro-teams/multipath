@@ -39,6 +39,26 @@ const fast = {
 
 describe('browser client cross-language', () => {
   maybe(
+    'a line added while the dial is stuck on a dead one joins the race and wins it',
+    async () => {
+      const origin = await startOrigin(2);
+      try {
+        // Port 1 refuses every connection: alone, this dial would retry it forever.
+        const client = Client.connect(['ws://127.0.0.1:1'], fast);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(client.addLines(['ws://127.0.0.1:1', `ws://127.0.0.1:${origin.port}`])).toBe(1);
+        await client.ready();
+        const resp = await client.fetch('greeter', new Request('http://origin/late'));
+        expect(await resp.text()).toBe('hello /late');
+        client.close();
+      } finally {
+        origin.kill();
+      }
+    },
+    30000,
+  );
+
+  maybe(
     'tunnels and round-trips HTTP through a JVM origin over WebSocket links',
     async () => {
       const n = 3;

@@ -12,6 +12,7 @@
 // the far end is a genuine WebSocket server the origin's service handler is fronting, unaware its
 // bytes are travelling over a redundant mux instead of a plain TCP socket.
 
+import { sha1 } from './sha1.js';
 import { MuxStream } from './mux.js';
 
 const encoder = new TextEncoder();
@@ -108,8 +109,8 @@ function encodeFrame(opcode: number, payload: Uint8Array): Uint8Array {
 }
 
 async function wsAccept(key: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-1', encoder.encode(key + WS_GUID));
-  return btoa(String.fromCharCode(...new Uint8Array(digest)));
+  const digest = sha1(encoder.encode(key + WS_GUID));
+  return btoa(String.fromCharCode(...digest));
 }
 
 function findDoubleCRLF(buf: Uint8Array): number {
