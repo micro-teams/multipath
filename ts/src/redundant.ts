@@ -61,7 +61,7 @@ interface LinkSlot {
 }
 
 export class RedundantStream {
-  readonly connID: Uint8Array;
+  readonly connID: Uint8Array<ArrayBuffer>;
   private opt: Required<Omit<RedundantOptions, 'wsCtor' | 'now' | 'onLinkState'>>;
   private wsCtor: typeof WebSocket;
   private now: () => number;
