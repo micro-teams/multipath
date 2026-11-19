@@ -1,23 +1,40 @@
-// A minimal RFC 6455 WebSocket, client and server, just enough to carry a link over a CDN edge that
-// terminates TLS and forwards only HTTP. It is deliberately tiny: a link is an opaque byte stream,
-// so the only opcode that matters is binary, and control frames (ping/pong/close) are handled just
-// enough to keep the stream honest. There are no extensions, no compression, no text frames.
+// Package link carries MultiPath frames over WebSocket connections (PROTOCOL.md section 3): one
+// binary message is one frame. It holds a minimal RFC 6455 implementation rather than a dependency,
+// because a link needs only binary messages and the few control frames, and because the bounds that
+// keep a server safe (the largest message, a close that never blocks) must be under our control.
 //
-// This lives in the package rather than in a dependency because MultiPath ships with none: a
-// WebSocket used only as a byte pipe is a page of framing, not a reason to take on a library whose
-// message semantics we do not want anyway. The wsConn it returns is a plain net.Conn — a byte
-// stream, not a message stream — so everything above it (redundant frames, mux) is unchanged
-// whether a link is raw TLS or a WebSocket.
-
-package multipath
+// This file: the connection and the server side of the handshake.
+//
+//   - Accept(w, r) upgrades an HTTP request to a server-side *Conn, or answers 400 and returns an
+//     error. The request is left to the caller, which reads the client address from its headers.
+//
+//   - (*Conn).ReadMessage(max) returns the payload of the next binary message, answering pings and
+//     skipping pongs on the way. A message longer than max fails before its payload is read; a text
+//     message or a close fails too, since neither belongs on a link.
+//
+//   - (*Conn).WriteMessage(p) writes p as one binary message. Writes are serialised; callers bound
+//     their duration with SetWriteDeadline.
+//
+//   - (*Conn).Close() closes the connection without ever blocking: it sends a close frame only when
+//     no write is in progress, because a write stuck on a full TCP buffer must not hold up a close.
+//
+//   - RemoteAddr, SetDeadline, SetReadDeadline and SetWriteDeadline pass through to the socket.
+//
+//     http.HandleFunc("/multipath/v3/link", func(w http.ResponseWriter, r *http.Request) {
+//     c, err := link.Accept(w, r)
+//     if err != nil { log.Print(err); return }
+//     msg, err := c.ReadMessage(65538)
+//     ...
+//     })
+package link
 
 import (
 	"bufio"
-	"context"
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -27,252 +44,213 @@ import (
 	"time"
 )
 
-// wsGUID is the RFC 6455 magic value mixed into the handshake so an accept token cannot be forged
-// from the key alone.
+// wsGUID is the RFC 6455 value mixed into the handshake so an accept token cannot be forged from the
+// key alone.
 const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 const (
-	wsOpContinuation = 0x0
-	wsOpText         = 0x1 // unused by the link layer (links never carry text frames); appws.go does
-	wsOpBinary       = 0x2
-	wsOpClose        = 0x8
-	wsOpPing         = 0x9
-	wsOpPong         = 0xA
+	opContinuation = 0x0
+	opText         = 0x1
+	opBinary       = 0x2
+	opClose        = 0x8
+	opPing         = 0x9
+	opPong         = 0xA
 )
 
-// clientWebSocket performs the client handshake over an already-connected (and, for wss, already
-// TLS-wrapped) conn, then returns a byte-stream net.Conn carrying binary frames.
-func clientWebSocket(ctx context.Context, raw net.Conn, host, path string) (net.Conn, error) {
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = raw.SetDeadline(deadline)
-	}
-	keyBytes := make([]byte, 16)
-	if _, err := rand.Read(keyBytes); err != nil {
-		_ = raw.Close()
-		return nil, err
-	}
-	key := base64.StdEncoding.EncodeToString(keyBytes)
+// maxControl is the largest control frame payload RFC 6455 allows.
+const maxControl = 125
 
-	request := "GET " + path + " HTTP/1.1\r\n" +
-		"Host: " + host + "\r\n" +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Key: " + key + "\r\n" +
-		"Sec-WebSocket-Version: 13\r\n\r\n"
-	if _, err := io.WriteString(raw, request); err != nil {
-		_ = raw.Close()
-		return nil, err
-	}
+// ErrTooLarge is returned by ReadMessage for a message longer than its limit.
+var ErrTooLarge = errors.New("multipath: websocket message too large")
 
-	br := bufio.NewReader(raw)
-	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodGet})
-	if err != nil {
-		_ = raw.Close()
-		return nil, fmt.Errorf("multipath: websocket handshake read: %w", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusSwitchingProtocols {
-		_ = raw.Close()
-		return nil, fmt.Errorf("multipath: websocket handshake got %s", resp.Status)
-	}
-	if !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") ||
-		resp.Header.Get("Sec-WebSocket-Accept") != wsAccept(key) {
-		_ = raw.Close()
-		return nil, fmt.Errorf("multipath: websocket handshake response did not confirm the upgrade")
-	}
-	_ = raw.SetDeadline(time.Time{})
-	return newWSConn(raw, br, true), nil
+// Conn is one WebSocket connection carrying binary messages.
+type Conn struct {
+	raw    net.Conn
+	br     *bufio.Reader
+	client bool // a client masks what it writes, as RFC 6455 requires
+
+	writeMu sync.Mutex
+	closeMu sync.Mutex
+	closed  bool
 }
 
-// acceptWebSocket performs the server handshake on a freshly accepted conn whose first bytes are an
-// HTTP upgrade request. The link acceptor calls it for ws/wss lines; path must match what the
-// client dialled.
-func acceptWebSocket(raw net.Conn, path string) (net.Conn, error) {
-	br := bufio.NewReader(raw)
-	req, err := http.ReadRequest(br)
-	if err != nil {
-		_ = raw.Close()
-		return nil, fmt.Errorf("multipath: websocket accept read: %w", err)
+// Accept performs the server handshake on an HTTP upgrade request.
+func Accept(w http.ResponseWriter, r *http.Request) (*Conn, error) {
+	key := r.Header.Get("Sec-WebSocket-Key")
+	if r.Method != http.MethodGet || !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") || key == "" {
+		http.Error(w, "expected a WebSocket upgrade", http.StatusBadRequest)
+		return nil, fmt.Errorf("multipath: not a websocket upgrade from %s", r.RemoteAddr)
 	}
-	key := req.Header.Get("Sec-WebSocket-Key")
-	upgrade := strings.EqualFold(req.Header.Get("Upgrade"), "websocket")
-	if req.Method != http.MethodGet || !upgrade || key == "" || (path != "" && req.URL.Path != path) {
-		_, _ = io.WriteString(raw, "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-		_ = raw.Close()
-		return nil, fmt.Errorf("multipath: not a websocket upgrade for %q", path)
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "connection cannot be upgraded", http.StatusInternalServerError)
+		return nil, errors.New("multipath: response writer cannot hijack")
+	}
+	raw, brw, err := hj.Hijack()
+	if err != nil {
+		return nil, fmt.Errorf("multipath: hijack: %w", err)
 	}
 	response := "HTTP/1.1 101 Switching Protocols\r\n" +
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: " + wsAccept(key) + "\r\n\r\n"
+		"Sec-WebSocket-Accept: " + acceptToken(key) + "\r\n\r\n"
 	if _, err := io.WriteString(raw, response); err != nil {
-		_ = raw.Close()
+		_ = raw.Close() // the write error is what the caller needs; the close adds nothing
 		return nil, err
 	}
-	return newWSConn(raw, br, false), nil
+	return &Conn{raw: raw, br: brw.Reader}, nil
 }
 
-// wsAccept computes the Sec-WebSocket-Accept token for a key.
-func wsAccept(key string) string {
+// acceptToken computes the Sec-WebSocket-Accept value for a key.
+func acceptToken(key string) string {
 	sum := sha1.Sum([]byte(key + wsGUID))
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
-// wsConn is a byte-stream net.Conn over a WebSocket: each Write is one binary frame, Read spans
-// frames transparently, and control frames are absorbed. A client-side conn masks its writes, as
-// RFC 6455 requires; a server-side conn does not.
-type wsConn struct {
-	raw    net.Conn
-	br     *bufio.Reader
-	client bool
-
-	readMu    sync.Mutex
-	remaining int64  // payload bytes left in the frame currently being read
-	pending   []byte // decoded bytes not yet handed to Read
-
-	writeMu sync.Mutex
-	closed  bool
-}
-
-func newWSConn(raw net.Conn, br *bufio.Reader, client bool) *wsConn {
-	return &wsConn{raw: raw, br: br, client: client}
-}
-
-func (c *wsConn) Read(p []byte) (int, error) {
-	c.readMu.Lock()
-	defer c.readMu.Unlock()
-	for len(c.pending) == 0 {
-		if err := c.readFrame(); err != nil {
-			return 0, err
+// ReadMessage returns the next binary message of at most max bytes.
+func (c *Conn) ReadMessage(max int) ([]byte, error) {
+	var msg []byte
+	for {
+		fin, op, payload, err := c.readFrame(max - len(msg))
+		if err != nil {
+			return nil, err
+		}
+		switch op {
+		case opBinary, opContinuation:
+			msg = append(msg, payload...)
+			if fin {
+				return msg, nil
+			}
+		case opPing:
+			if err := c.writeFrame(opPong, payload); err != nil {
+				return nil, err
+			}
+		case opPong:
+		case opClose:
+			return nil, io.EOF
+		default:
+			return nil, fmt.Errorf("multipath: websocket opcode %d on a link", op)
 		}
 	}
-	n := copy(p, c.pending)
-	c.pending = c.pending[n:]
-	return n, nil
 }
 
-// readFrame reads one data frame's payload into c.pending, answering control frames along the way.
-func (c *wsConn) readFrame() error {
-	var header [2]byte
-	if _, err := io.ReadFull(c.br, header[:]); err != nil {
-		return err
+// readFrame reads one WebSocket frame whose data payload is at most max bytes.
+func (c *Conn) readFrame(max int) (fin bool, op byte, payload []byte, err error) {
+	var h [2]byte
+	if _, err = io.ReadFull(c.br, h[:]); err != nil {
+		return
 	}
-	opcode := header[0] & 0x0f
-	masked := header[1]&0x80 != 0
-	length := int64(header[1] & 0x7f)
+	fin, op = h[0]&0x80 != 0, h[0]&0x0f
+	length := uint64(h[1] & 0x7f)
 	switch length {
 	case 126:
 		var ext [2]byte
-		if _, err := io.ReadFull(c.br, ext[:]); err != nil {
-			return err
+		if _, err = io.ReadFull(c.br, ext[:]); err != nil {
+			return
 		}
-		length = int64(binary.BigEndian.Uint16(ext[:]))
+		length = uint64(binary.BigEndian.Uint16(ext[:]))
 	case 127:
 		var ext [8]byte
-		if _, err := io.ReadFull(c.br, ext[:]); err != nil {
-			return err
+		if _, err = io.ReadFull(c.br, ext[:]); err != nil {
+			return
 		}
-		length = int64(binary.BigEndian.Uint64(ext[:]))
+		length = binary.BigEndian.Uint64(ext[:])
+	}
+	limit := uint64(max)
+	if op >= opClose {
+		limit = maxControl
+	}
+	if length > limit {
+		err = fmt.Errorf("%w: %d bytes, limit %d", ErrTooLarge, length, limit)
+		return
 	}
 	var mask [4]byte
+	masked := h[1]&0x80 != 0
 	if masked {
-		if _, err := io.ReadFull(c.br, mask[:]); err != nil {
-			return err
+		if _, err = io.ReadFull(c.br, mask[:]); err != nil {
+			return
 		}
 	}
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(c.br, payload); err != nil {
-		return err
+	payload = make([]byte, length)
+	if _, err = io.ReadFull(c.br, payload); err != nil {
+		return
 	}
 	if masked {
 		for i := range payload {
 			payload[i] ^= mask[i%4]
 		}
 	}
-
-	switch opcode {
-	case wsOpBinary, wsOpContinuation:
-		c.pending = append(c.pending, payload...)
-		return nil
-	case wsOpPing:
-		return c.writeFrame(wsOpPong, payload)
-	case wsOpPong:
-		return nil
-	case wsOpClose:
-		_ = c.writeFrame(wsOpClose, nil)
-		return io.EOF
-	default:
-		return fmt.Errorf("multipath: websocket unexpected opcode %d", opcode)
-	}
+	return
 }
 
-func (c *wsConn) Write(p []byte) (int, error) {
-	if err := c.writeFrame(wsOpBinary, p); err != nil {
-		return 0, err
-	}
-	return len(p), nil
-}
+// WriteMessage writes p as one binary message.
+func (c *Conn) WriteMessage(p []byte) error { return c.writeFrame(opBinary, p) }
 
-// writeFrame emits one frame, masking the payload when this end is the client.
-func (c *wsConn) writeFrame(opcode byte, payload []byte) error {
+// writeFrame writes one unfragmented frame, masked when this end is the client.
+func (c *Conn) writeFrame(op byte, payload []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	if c.closed && opcode != wsOpClose {
-		return net.ErrClosed
-	}
+	return c.writeFrameLocked(op, payload)
+}
 
-	var head []byte
-	head = append(head, 0x80|opcode) // FIN set; a Write is one self-contained message
-	length := len(payload)
+func (c *Conn) writeFrameLocked(op byte, payload []byte) error {
+	b := make([]byte, 0, 14+len(payload))
+	b = append(b, 0x80|op)
 	maskBit := byte(0)
 	if c.client {
 		maskBit = 0x80
 	}
-	switch {
-	case length < 126:
-		head = append(head, maskBit|byte(length))
-	case length < 1<<16:
-		head = append(head, maskBit|126)
-		head = binary.BigEndian.AppendUint16(head, uint16(length))
+	switch n := len(payload); {
+	case n < 126:
+		b = append(b, maskBit|byte(n))
+	case n < 1<<16:
+		b = binary.BigEndian.AppendUint16(append(b, maskBit|126), uint16(n))
 	default:
-		head = append(head, maskBit|127)
-		head = binary.BigEndian.AppendUint64(head, uint64(length))
+		b = binary.BigEndian.AppendUint64(append(b, maskBit|127), uint64(n))
 	}
-
-	if c.client {
-		var mask [4]byte
-		if _, err := rand.Read(mask[:]); err != nil {
-			return err
-		}
-		head = append(head, mask[:]...)
-		masked := make([]byte, length)
-		for i := range payload {
-			masked[i] = payload[i] ^ mask[i%4]
-		}
-		if _, err := c.raw.Write(append(head, masked...)); err != nil {
-			return err
-		}
-		return nil
-	}
-	if _, err := c.raw.Write(append(head, payload...)); err != nil {
+	if !c.client {
+		_, err := c.raw.Write(append(b, payload...))
 		return err
 	}
-	return nil
+	var mask [4]byte
+	if _, err := rand.Read(mask[:]); err != nil {
+		return err
+	}
+	b = append(b, mask[:]...)
+	for i, v := range payload {
+		b = append(b, v^mask[i%4])
+	}
+	_, err := c.raw.Write(b)
+	return err
 }
 
-func (c *wsConn) Close() error {
-	c.writeMu.Lock()
+// Close closes the connection. It never waits for a write in progress.
+func (c *Conn) Close() error {
+	c.closeMu.Lock()
 	already := c.closed
 	c.closed = true
-	c.writeMu.Unlock()
-	if !already {
-		_ = c.writeFrame(wsOpClose, nil)
+	c.closeMu.Unlock()
+	if already {
+		return nil
+	}
+	if c.writeMu.TryLock() {
+		// The close frame is a courtesy to the peer; a socket that cannot take it within a moment is
+		// being closed anyway, so its write error carries no information.
+		_ = c.raw.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+		_ = c.writeFrameLocked(opClose, nil)
+		c.writeMu.Unlock()
 	}
 	return c.raw.Close()
 }
 
-func (c *wsConn) LocalAddr() net.Addr                { return c.raw.LocalAddr() }
-func (c *wsConn) RemoteAddr() net.Addr               { return c.raw.RemoteAddr() }
-func (c *wsConn) SetDeadline(t time.Time) error      { return c.raw.SetDeadline(t) }
-func (c *wsConn) SetReadDeadline(t time.Time) error  { return c.raw.SetReadDeadline(t) }
-func (c *wsConn) SetWriteDeadline(t time.Time) error { return c.raw.SetWriteDeadline(t) }
+// RemoteAddr returns the peer address of the socket.
+func (c *Conn) RemoteAddr() net.Addr { return c.raw.RemoteAddr() }
+
+// SetDeadline sets the socket's read and write deadlines.
+func (c *Conn) SetDeadline(t time.Time) error { return c.raw.SetDeadline(t) }
+
+// SetReadDeadline sets the socket's read deadline.
+func (c *Conn) SetReadDeadline(t time.Time) error { return c.raw.SetReadDeadline(t) }
+
+// SetWriteDeadline sets the socket's write deadline.
+func (c *Conn) SetWriteDeadline(t time.Time) error { return c.raw.SetWriteDeadline(t) }

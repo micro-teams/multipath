@@ -1,186 +1,186 @@
-// L2 — the one place that knows how to reach a line.
+// The client side of a link: reach a line's ws:// or wss:// URL, through an HTTP proxy when one is
+// configured, and perform the WebSocket handshake. A machine that can reach the internet only through
+// a proxy must still connect, so the proxy decision is made here, for every link, the same way
+// net/http makes it for a request.
 //
-// A line is a network path to the origin; a link is one live duplex connection over it. Every link
-// of a redundant stream is opened here, and nothing above this file ever repeats the choice of how
-// to talk to a line. The encapsulation follows the line's transport: a direct line is a TLS socket
-// straight to the origin; a CDN-fronted line — one whose edge terminates TLS and forwards only
-// HTTP — is a WebSocket carried inside that HTTPS, because a raw duplex would not survive the edge.
-// Plaintext variants exist for the testbed, where the "edge" is a local process on loopback and
-// nothing is worth encrypting twice.
+//   - Options carries the TLS configuration for wss lines and the proxy function. Proxy has the
+//     signature of http.Transport.Proxy, so http.ProxyFromEnvironment (HTTPS_PROXY, HTTP_PROXY,
+//     NO_PROXY) and http.ProxyURL(u) both fit; nil means a direct connection.
 //
-// There is exactly one entry point, DialLink, because there is exactly one kind of thing above it:
-// a redundant stream is N links, and a link is opaque bytes. The request/response shape a consumer
-// might expect is not a second way to reach a line — it is a mux stream carried over these same
-// links (see mux.go), so it goes through here too.
-
-package multipath
+//   - Dial(ctx, rawURL, opt) returns a client-side *Conn for "ws://host[:port]/path" or
+//     "wss://host[:port]/path". ctx bounds the whole setup, proxy and handshake included. An http://
+//     proxy is used with CONNECT, with Basic credentials taken from the proxy URL; other proxy
+//     schemes are refused with an error rather than bypassed.
+//
+//     c, err := link.Dial(ctx, "wss://cf.example.app/multipath/v3/link",
+//     link.Options{Proxy: http.ProxyFromEnvironment})
+package link
 
 import (
+	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
-// Transport is how a link to a line is encapsulated. The zero value is inferred from the line's URL
-// scheme, so an ordinary registry that says nothing gets the obvious choice: https → TLS, http →
-// plain TCP.
-type Transport string
-
-const (
-	// TransportTLS is a raw TLS socket straight to the origin. The default for an https line.
-	TransportTLS Transport = "tls"
-	// TransportWSS is a WebSocket carried inside HTTPS, for a line whose edge (a CDN) terminates
-	// TLS and speaks only HTTP. The default is never this — a line must ask for it, because it
-	// costs a handshake round trip the direct case does not.
-	TransportWSS Transport = "wss"
-	// TransportTCP is a plaintext socket. Testbed only: there is no edge to hide from on loopback.
-	TransportTCP Transport = "tcp"
-	// TransportWS is a plaintext WebSocket. Testbed only, to exercise the WebSocket framing without
-	// a certificate.
-	TransportWS Transport = "ws"
-)
-
-// LinkOptions carries what DialLink cannot read off the line itself.
-type LinkOptions struct {
-	// TLSConfig is used for TransportTLS and TransportWSS. Nil means the platform default with the
-	// origin's host as the server name.
-	TLSConfig *tls.Config
-	// LinkPath is the path the WebSocket upgrade is issued against on a ws/wss line. The origin
-	// mounts its link acceptor here. Defaults to "/mt/link".
-	LinkPath string
-	// DialTimeout bounds establishing one link. Zero means no explicit timeout beyond ctx.
-	DialTimeout time.Duration
-	// dialer is injected in tests so a link can be opened over an in-memory pipe.
-	dialer func(ctx context.Context, network, address string) (net.Conn, error)
+// Options configures Dial.
+type Options struct {
+	TLSConfig *tls.Config                           // for wss; nil means the system roots and the URL's host
+	Proxy     func(*http.Request) (*url.URL, error) // nil means connect directly
 }
 
-const defaultLinkPath = "/mt/link"
-
-// resolveTransport picks the encapsulation for a line: the line's explicit transport if it set one,
-// otherwise the obvious default for its URL scheme.
-func resolveTransport(line Line) (Transport, error) {
-	switch Transport(line.Transport) {
-	case TransportTLS, TransportWSS, TransportTCP, TransportWS:
-		return Transport(line.Transport), nil
-	case "":
-		// Inferred from the scheme. A same-origin line ("") has no scheme of its own here; a link
-		// needs a concrete host, so that case is the caller's to resolve before dialling.
-		if line.URL == "" {
-			return "", fmt.Errorf("multipath: line %q is same-origin; a link needs a concrete URL", line.ID)
-		}
-		u, err := url.Parse(line.URL)
-		if err != nil {
-			return "", fmt.Errorf("multipath: line %q has an unparseable url %q: %w", line.ID, line.URL, err)
-		}
-		switch u.Scheme {
-		case "https":
-			return TransportTLS, nil
-		case "http":
-			return TransportTCP, nil
-		default:
-			return "", fmt.Errorf("multipath: line %q url scheme %q is neither http nor https", line.ID, u.Scheme)
-		}
-	default:
-		return "", fmt.Errorf("multipath: line %q has unknown transport %q", line.ID, line.Transport)
-	}
-}
-
-// hostPort returns the host:port to dial for a line, defaulting the port to the scheme's.
-func hostPort(line Line) (host, address string, err error) {
-	u, err := url.Parse(line.URL)
+// Dial opens one link to a ws:// or wss:// URL.
+func Dial(ctx context.Context, rawURL string, opt Options) (*Conn, error) {
+	u, err := url.Parse(rawURL)
 	if err != nil {
-		return "", "", fmt.Errorf("multipath: line %q has an unparseable url %q: %w", line.ID, line.URL, err)
+		return nil, err
 	}
-	host = u.Hostname()
+	secure := u.Scheme == "wss"
+	if !secure && u.Scheme != "ws" {
+		return nil, fmt.Errorf("multipath: link url %q is not ws or wss", rawURL)
+	}
 	port := u.Port()
 	if port == "" {
-		switch u.Scheme {
-		case "https":
-			port = "443"
-		case "http":
-			port = "80"
-		default:
-			return "", "", fmt.Errorf("multipath: line %q url has no port and scheme %q has no default", line.ID, u.Scheme)
-		}
+		port = map[bool]string{true: "443", false: "80"}[secure]
 	}
-	return host, net.JoinHostPort(host, port), nil
-}
+	address := net.JoinHostPort(u.Hostname(), port)
 
-// DialLink opens one duplex link to a line, choosing the encapsulation the line calls for. The
-// returned conn carries opaque bytes; what rides it (redundant frames, and mux streams above them)
-// is decided higher up. A link is long-lived — the cost of the choice made here is paid once.
-func DialLink(ctx context.Context, line Line, opt LinkOptions) (net.Conn, error) {
-	transport, err := resolveTransport(line)
+	raw, err := dialTCP(ctx, u, address, opt.Proxy)
 	if err != nil {
 		return nil, err
 	}
-	host, address, err := hostPort(line)
+	// Every step below honours ctx through the socket deadline, so a silent line cannot hold a
+	// dial longer than the caller allowed.
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = raw.SetDeadline(deadline) // a socket that refuses a deadline fails its next read anyway
+	}
+	stop := context.AfterFunc(ctx, func() { _ = raw.SetDeadline(time.Unix(1, 0)) }) // unblocks the handshake
+	defer stop()
+
+	if secure {
+		cfg := &tls.Config{}
+		if opt.TLSConfig != nil {
+			cfg = opt.TLSConfig.Clone()
+		}
+		if cfg.ServerName == "" {
+			cfg.ServerName = u.Hostname()
+		}
+		conn := tls.Client(raw, cfg)
+		if err := conn.HandshakeContext(ctx); err != nil {
+			_ = raw.Close() // the handshake error is what the caller needs
+			return nil, fmt.Errorf("multipath: tls to %s: %w", address, err)
+		}
+		raw = conn
+	}
+	c, err := clientHandshake(raw, u)
 	if err != nil {
+		_ = raw.Close() // the handshake error is what the caller needs
 		return nil, err
 	}
-	if opt.LinkPath == "" {
-		opt.LinkPath = defaultLinkPath
+	if err := raw.SetDeadline(time.Time{}); err != nil {
+		_ = raw.Close() // the deadline error is what the caller needs
+		return nil, err
 	}
-	if opt.DialTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, opt.DialTimeout)
-		defer cancel()
-	}
-
-	raw, err := opt.dial(ctx, address)
-	if err != nil {
-		return nil, fmt.Errorf("multipath: line %q dial %s: %w", line.ID, address, err)
-	}
-
-	switch transport {
-	case TransportTCP:
-		return raw, nil
-	case TransportWS:
-		return clientWebSocket(ctx, raw, host, opt.LinkPath)
-	case TransportTLS:
-		conn, err := tlsHandshake(ctx, raw, host, opt.TLSConfig)
-		if err != nil {
-			return nil, fmt.Errorf("multipath: line %q tls: %w", line.ID, err)
-		}
-		return conn, nil
-	case TransportWSS:
-		conn, err := tlsHandshake(ctx, raw, host, opt.TLSConfig)
-		if err != nil {
-			return nil, fmt.Errorf("multipath: line %q tls: %w", line.ID, err)
-		}
-		return clientWebSocket(ctx, conn, host, opt.LinkPath)
-	default:
-		return nil, fmt.Errorf("multipath: line %q has unhandled transport %q", line.ID, transport)
-	}
+	return c, nil
 }
 
-// dial opens the raw TCP conn, honouring an injected dialer in tests.
-func (opt LinkOptions) dial(ctx context.Context, address string) (net.Conn, error) {
-	if opt.dialer != nil {
-		return opt.dialer(ctx, "tcp", address)
-	}
+// dialTCP connects to address, directly or through the proxy the proxy function picks for u.
+func dialTCP(ctx context.Context, u *url.URL, address string, proxy func(*http.Request) (*url.URL, error)) (net.Conn, error) {
 	var d net.Dialer
-	return d.DialContext(ctx, "tcp", address)
+	var proxyURL *url.URL
+	if proxy != nil {
+		// Proxy functions decide by the http(s) scheme, as for a request to the same host.
+		probe := &http.Request{URL: &url.URL{Scheme: strings.Replace(u.Scheme, "ws", "http", 1), Host: u.Host}}
+		var err error
+		if proxyURL, err = proxy(probe); err != nil {
+			return nil, fmt.Errorf("multipath: proxy for %s: %w", u.Host, err)
+		}
+	}
+	if proxyURL == nil {
+		c, err := d.DialContext(ctx, "tcp", address)
+		if err != nil {
+			return nil, fmt.Errorf("multipath: dial %s: %w", address, err)
+		}
+		return c, nil
+	}
+	if proxyURL.Scheme != "http" {
+		return nil, fmt.Errorf("multipath: proxy %s: only http:// proxies are supported", proxyURL.Redacted())
+	}
+	proxyAddr := proxyURL.Host
+	if proxyURL.Port() == "" {
+		proxyAddr = net.JoinHostPort(proxyURL.Hostname(), "80")
+	}
+	c, err := d.DialContext(ctx, "tcp", proxyAddr)
+	if err != nil {
+		return nil, fmt.Errorf("multipath: dial proxy %s: %w", proxyURL.Redacted(), err)
+	}
+	if err := connect(ctx, c, proxyURL, address); err != nil {
+		_ = c.Close() // the CONNECT error is what the caller needs
+		return nil, fmt.Errorf("multipath: proxy %s: %w", proxyURL.Redacted(), err)
+	}
+	return c, nil
 }
 
-// tlsHandshake wraps a raw conn in TLS with the origin's host as the server name and completes the
-// handshake under ctx.
-func tlsHandshake(ctx context.Context, raw net.Conn, host string, cfg *tls.Config) (net.Conn, error) {
-	if cfg == nil {
-		cfg = &tls.Config{}
+// connect asks an HTTP proxy for a tunnel to address on c.
+func connect(ctx context.Context, c net.Conn, proxyURL *url.URL, address string) error {
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = c.SetDeadline(deadline) // a socket that refuses a deadline fails its next read anyway
 	}
-	if cfg.ServerName == "" {
-		clone := cfg.Clone()
-		clone.ServerName = host
-		cfg = clone
+	req := "CONNECT " + address + " HTTP/1.1\r\nHost: " + address + "\r\n"
+	if user := proxyURL.User; user != nil {
+		password, _ := user.Password()
+		req += "Proxy-Authorization: Basic " + base64.StdEncoding.EncodeToString([]byte(user.Username()+":"+password)) + "\r\n"
 	}
-	conn := tls.Client(raw, cfg)
-	if err := conn.HandshakeContext(ctx); err != nil {
-		_ = raw.Close()
+	if _, err := io.WriteString(c, req+"\r\n"); err != nil {
+		return err
+	}
+	// The proxy says nothing after its response until the tunnel carries bytes, so reading the
+	// response through a buffered reader cannot swallow tunnel bytes.
+	resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("CONNECT %s: %s", address, resp.Status)
+	}
+	return nil
+}
+
+// clientHandshake sends the upgrade request for u on raw and checks the answer.
+func clientHandshake(raw net.Conn, u *url.URL) (*Conn, error) {
+	keyBytes := make([]byte, 16)
+	if _, err := rand.Read(keyBytes); err != nil {
 		return nil, err
 	}
-	return conn, nil
+	key := base64.StdEncoding.EncodeToString(keyBytes)
+	path := u.RequestURI()
+	request := "GET " + path + " HTTP/1.1\r\n" +
+		"Host: " + u.Host + "\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: " + key + "\r\n" +
+		"Sec-WebSocket-Version: 13\r\n\r\n"
+	if _, err := io.WriteString(raw, request); err != nil {
+		return nil, err
+	}
+	br := bufio.NewReader(raw)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodGet})
+	if err != nil {
+		return nil, fmt.Errorf("multipath: websocket handshake with %s: %w", u.Host, err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		return nil, fmt.Errorf("multipath: websocket handshake with %s%s: %s", u.Host, path, resp.Status)
+	}
+	if !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") || resp.Header.Get("Sec-WebSocket-Accept") != acceptToken(key) {
+		return nil, fmt.Errorf("multipath: websocket handshake with %s did not confirm the upgrade", u.Host)
+	}
+	return &Conn{raw: raw, br: br, client: true}, nil
 }
