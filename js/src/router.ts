@@ -1,86 +1,67 @@
-// The browser integration point: a service worker that intercepts fetch and routes it over the
-// multipath substrate instead of the network. The application keeps calling fetch() as it always
-// did; underneath, every request becomes a mux stream over one redundant transport across all lines,
-// and nothing in the app learns that more than one path exists.
+// The service worker's side: requests the browser makes for the page (the document, scripts, fonts,
+// images) are what a worker can intercept, and the line router carries them over a Client instead of
+// the network. The worker serves only those; the page holds its own Client for everything it fetches
+// itself, so a page has one session and its worker another.
 //
-// The scope and event are typed by the minimum this needs, so the package compiles against the DOM
-// lib alone without pulling in the WebWorker lib (whose globals collide with the DOM's).
-
-import { Client, ClientOptions } from './client.js';
-
-export interface FetchEventLike {
-  readonly request: Request;
-  respondWith(response: Response | Promise<Response>): void;
-}
-
-export interface FetchScope {
-  addEventListener(type: 'fetch', listener: (event: FetchEventLike) => void): void;
-}
-
-export interface RouterOptions extends ClientOptions {
-  // The registered service name intercepted requests are routed to. The origin must have registered
-  // it (e.g. the app's own HTTP service). Default "app".
-  service?: string;
-  // An opaque ticket sent with each routed request for the origin's handler to authorise.
-  ticket?: Uint8Array;
-  // Decide per request whether to route it over multipath; return false to let it hit the network
-  // untouched. Default: route everything.
-  shouldRoute?: (request: Request) => boolean;
-  // Injected in tests; defaults to Client.dial.
-  dial?: (lines: string[], opts: ClientOptions) => Promise<Client>;
-}
-
-// installFetchRouter wires a service worker's fetch handler to the substrate. The client is dialled
-// lazily on the first routed request and reused; a failed dial is retried on the next request rather
-// than cached, so a transient startup failure does not wedge the worker.
-export function installFetchRouter(
-  scope: FetchScope,
-  lines: string[],
-  opts: RouterOptions = {},
-): void {
-  const dial = opts.dial ?? Client.dial;
-  const service = opts.service ?? 'app';
-  let pending: Promise<Client> | null = null;
-  const client = (): Promise<Client> => {
-    if (pending === null) {
-      pending = dial(lines, opts).catch((err) => {
-        pending = null; // let the next request try again
-        throw err;
-      });
-    }
-    return pending;
-  };
-
-  scope.addEventListener('fetch', (event) => {
-    if (opts.shouldRoute && !opts.shouldRoute(event.request)) return;
-    event.respondWith(client().then((c) => c.fetch(service, event.request, opts.ticket)));
-  });
-}
-
-// ---------------------------------------------------------------------------------------------
-// A router that knows where its lines come from.
+// The router is a way out, not the only way. A request goes to the network instead (the fallback),
+// logged and reported as a "fallback" ClientEvent with its reason, when no session is live within
+// fallbackAfterMs of the router's start (counted once, so later requests do not wait again), and a
+// GET or HEAD also when the client fails it or has not answered its head within requestTimeoutMs;
+// the abandoned stream is reset. Any other method is never sent twice: once it may have reached the
+// server, its failure is the caller's.
 //
-// installFetchRouter is handed its lines once. A worker the browser restarts knows nothing, and the
-// lines a deployment publishes change, so createLineRouter keeps them: it dials at once over the
-// lines it can name without asking (seed, typically the worker's own origin) plus the ones it held
-// last time (store), asks for the current list in the background (discover), adds every line it
-// had not heard of to the client — a dial still in progress included, so a new line can win the
-// race it joins — and keeps the union for next time.
+// Static-file integrity. A file whose path matches an IntegrityRule carries a hash of its content in
+// its name; its body is checked against that hash as it streams through. Every byte but the last
+// piece passes at once, so progress stays visible; the last piece is released only after the digest
+// matched. On a mismatch the body fails instead of ending, so no cache that stores it (the worker's,
+// a loader's) ever keeps it, the mismatch is logged and reported as a fallback, and from then on that
+// URL goes to the network. A rule's pattern has one capture group, the hex hash, which must be a
+// prefix of the content's digest under the rule's algorithm; the first rule whose pattern matches
+// the path decides.
 //
-// The substrate is the way out, not the only way: a request that finds no line up within
-// fallbackAfterMs, or a GET/HEAD the substrate failed, goes to the network as it would have without
-// a worker. So does a GET/HEAD while no line is up at all, and one the substrate has not answered
-// within requestTimeoutMs: a line that died silently is only noticed when it has been quiet for a
-// while, and until then a request over it neither succeeds nor fails — a page waiting for its
-// "load" would wait forever. The request left behind on the substrate is not cancelled; an answer
-// arriving late is simply dropped. A substrate the origin refused outright is thrown away and the next request dials a
-// fresh one.
+//   - createLineRouter(options) starts a Client at once (LineRouterOptions: the ClientOptions plus
+//     fallbackAfterMs, default 3000; requestTimeoutMs, default 10000; fallback, default the
+//     platform's fetch; integrity, default none; client, a stand-in for tests) and returns a
+//     LineRouter: fetch(request) answers a request over the lines or the network, stats() is the
+//     client's ClientStats, close() closes the client.
+//   - cacheLineStore(cacheName, key, caches) is a LineStore in Cache Storage, the one store a service
+//     worker keeps across restarts: the list as JSON under key (a URL nothing serves) in cacheName.
+//
+//     const router = createLineRouter({
+//       entry: self.location.origin,
+//       store: cacheLineStore('lines', new URL('__lines', self.location.href).href),
+//       integrity: [{ pattern: /-([0-9a-f]{32})\.js$/, algorithm: 'MD5' }],
+//     });
+//     self.addEventListener('fetch', (e) => e.respondWith(router.fetch(e.request)));
+import { Client, type ClientOptions, type ClientStats, type LineStore } from './client.js';
+import { hexDigest, type HashAlgorithm } from './hash.js';
+import { parseLines, type Line } from './lines.js';
 
-// LineStore keeps the line list across worker restarts. load() resolves with what was saved, [] when
-// nothing was (and never rejects for a missing entry).
-export interface LineStore {
-  load(): Promise<string[]>;
-  save(lines: string[]): Promise<void>;
+export interface IntegrityRule {
+  pattern: RegExp;
+  algorithm: HashAlgorithm;
+}
+
+// The part of Client a router uses.
+export interface RouterClient {
+  live(timeoutMs: number): Promise<boolean>;
+  fetch(request: Request): Promise<Response>;
+  stats(): ClientStats;
+  close(): Promise<void>;
+}
+
+export interface LineRouterOptions extends ClientOptions {
+  fallbackAfterMs?: number;
+  requestTimeoutMs?: number;
+  fallback?: (request: Request) => Promise<Response>;
+  integrity?: IntegrityRule[];
+  client?: RouterClient;
+}
+
+export interface LineRouter {
+  fetch(request: Request): Promise<Response>;
+  stats(): ClientStats;
+  close(): Promise<void>;
 }
 
 interface CachesLike {
@@ -90,121 +71,76 @@ interface CachesLike {
   }>;
 }
 
-// cacheLineStore keeps the list as JSON under key in the Cache Storage cache named cacheName — the
-// one store a service worker has that survives it being stopped. key is a URL nothing serves.
 export function cacheLineStore(
   cacheName: string,
   key: string,
   caches: CachesLike = (globalThis as unknown as { caches: CachesLike }).caches,
 ): LineStore {
   return {
-    async load() {
-      try {
-        const held = await (await caches.open(cacheName)).match(key);
-        const lines: unknown = held ? await held.json() : [];
-        return Array.isArray(lines) ? lines.filter((l): l is string => typeof l === 'string') : [];
-      } catch {
-        return [];
-      }
+    async load(): Promise<Line[]> {
+      const held = await (await caches.open(cacheName)).match(key);
+      return held ? parseLines({ lines: await held.json() }) : [];
     },
     async save(lines) {
       const body = JSON.stringify(lines);
-      await (
-        await caches.open(cacheName)
-      ).put(key, new Response(body, { headers: { 'Content-Type': 'application/json' } }));
+      const headers = { 'Content-Type': 'application/json' };
+      await (await caches.open(cacheName)).put(key, new Response(body, { headers }));
     },
   };
 }
 
-// The part of Client a router uses; injected in tests.
-export interface RoutedClient {
-  ready(): Promise<void>;
-  readonly closed: boolean;
-  stats?(): { state: string }[];
-  addLines(lines: string[]): number;
-  fetch(service: string, request: Request, ticket?: Uint8Array): Promise<Response>;
-}
-
-export interface LineRouterOptions extends ClientOptions {
-  // Lines known without asking anybody — e.g. [wss://<the worker's host>]. Always dialled.
-  seed: string[];
-  // Where the list is kept between worker restarts. Default: kept in memory only.
-  store?: LineStore;
-  // Fetches the deployment's current lines. Called once per router (and again by refresh()); a
-  // rejection keeps the lines already known.
-  discover?: () => Promise<string[]>;
-  // The registered service requests are routed to. Default "app".
-  service?: string;
-  ticket?: Uint8Array;
-  // How long after a dial starts requests wait for its first line before going to the network.
-  // Counted from the dial, not from each request: once it has passed, a request that finds no line
-  // up goes to the network at once instead of waiting again. Default 3000.
-  fallbackAfterMs?: number;
-  // How long a GET/HEAD waits for the substrate's answer before going to the network. Default 10000.
-  requestTimeoutMs?: number;
-  // Where a request goes when the substrate cannot take it. Default: globalThis.fetch.
-  fallback?: (request: Request) => Promise<Response>;
-  // Injected in tests; defaults to Client.connect.
-  connect?: (lines: string[], opts: ClientOptions) => RoutedClient;
-  // Told about every change of the known lines (after discovery, say), for a log.
-  onLines?: (lines: string[]) => void;
-}
-
-export interface LineRouter {
-  // fetch(request) over the substrate when it can, over the network when it cannot.
-  fetch(request: Request): Promise<Response>;
-  // The lines known now: seed, stored and discovered, without repeats.
-  lines(): string[];
-  // Ask discover() again and add what it names.
-  refresh(): Promise<void>;
-}
-
 export function createLineRouter(opts: LineRouterOptions): LineRouter {
-  const connect = opts.connect ?? ((lines: string[], o: ClientOptions) => Client.connect(lines, o));
-  const service = opts.service ?? 'app';
+  const log = opts.log ?? ((m: string) => console.info(`multipath: ${m}`));
+  const client = opts.client ?? new Client(opts);
   const fallbackAfterMs = opts.fallbackAfterMs ?? 3000;
-  const requestTimeoutMs = opts.requestTimeoutMs ?? 10000;
-  const fallback = opts.fallback ?? ((r: Request) => fetch(r));
-  let known: string[] = [...new Set(opts.seed)];
-  let loaded: Promise<void> | null = null;
-  let client: RoutedClient | null = null;
-  let dialledAt = 0;
+  const requestTimeoutMs = opts.requestTimeoutMs ?? 10_000;
+  const network = opts.fallback ?? ((r: Request) => fetch(r));
+  const rules = opts.integrity ?? [];
+  const tainted = new Set<string>();
+  const started = Date.now();
 
-  const learn = (lines: string[]): boolean => {
-    const fresh = lines.filter((l) => !known.includes(l));
-    if (!fresh.length) return false;
-    known = [...known, ...fresh];
-    client?.addLines(fresh);
-    opts.onLines?.(known);
-    return true;
+  const fallback = (request: Request, reason: string): Promise<Response> => {
+    log(`${request.method} ${request.url} goes to the network: ${reason}`);
+    opts.onEvent?.({ type: 'fallback', url: request.url, reason });
+    return network(request);
   };
 
-  const refresh = async () => {
-    if (!opts.discover) return;
-    try {
-      if (learn(await opts.discover())) await opts.store?.save(known);
-    } catch {
-      // The lines already known still work; the next refresh may do better.
-    }
-  };
-
-  const start = (): Promise<void> => {
-    if (!loaded) {
-      loaded = (async () => {
-        learn((await opts.store?.load()) ?? []);
-        void refresh();
-      })();
-    }
-    return loaded;
-  };
-
-  const live = async (): Promise<RoutedClient> => {
-    await start();
-    if (!client || client.closed) {
-      client = connect(known, opts);
-      dialledAt = Date.now();
-    }
-    return client;
+  // verified passes response through, checking its body against the hash its URL names.
+  const verified = (url: string, response: Response): Response => {
+    const rule = rules.find((r) => r.pattern.test(new URL(url).pathname));
+    const want = rule?.pattern.exec(new URL(url).pathname)?.[1]?.toLowerCase();
+    if (!rule || !want || response.status !== 200 || response.body === null) return response;
+    const parts: Uint8Array[] = [];
+    let last: Uint8Array | null = null;
+    const check = new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        parts.push(chunk);
+        if (last) controller.enqueue(last);
+        last = chunk;
+      },
+      async flush(controller) {
+        const all = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+        let off = 0;
+        for (const p of parts) {
+          all.set(p, off);
+          off += p.length;
+        }
+        const got = await hexDigest(rule.algorithm, all);
+        if (!got.startsWith(want)) {
+          tainted.add(url);
+          const reason = `${rule.algorithm} of the content is ${got}, the name says ${want}`;
+          log(
+            `integrity mismatch on ${url}: ${reason}; not kept, and fetched from the network from now on`,
+          );
+          opts.onEvent?.({ type: 'fallback', url, reason: `integrity mismatch: ${reason}` });
+          controller.error(new Error(`multipath: integrity mismatch on ${url}`));
+          return;
+        }
+        if (last) controller.enqueue(last);
+      },
+    });
+    const { status, statusText, headers } = response;
+    return new Response(response.body.pipeThrough(check), { status, statusText, headers });
   };
 
   const within = <T>(p: Promise<T>, ms: number): Promise<T | 'late'> =>
@@ -212,32 +148,40 @@ export function createLineRouter(opts: LineRouterOptions): LineRouter {
       const t = setTimeout(() => resolve('late'), ms);
       p.then(
         (v) => (clearTimeout(t), resolve(v)),
-        (e) => (clearTimeout(t), reject(e)),
+        (e: unknown) => (clearTimeout(t), reject(e)),
       );
     });
 
   return {
-    lines: () => [...known],
-    refresh,
+    stats: () => client.stats(),
+    close: () => client.close(),
     async fetch(request) {
       const retryable = request.method === 'GET' || request.method === 'HEAD';
+      if (tainted.has(request.url))
+        return fallback(request, 'its content failed the integrity check before');
       const spare = retryable ? null : request.clone();
-      const c = await live();
-      const wait = Math.max(0, fallbackAfterMs - (Date.now() - dialledAt));
-      if ((await within(c.ready(), wait)) === 'late' || c.closed) {
-        return fallback(spare ?? request);
-      }
-      try {
-        if (!retryable) return await c.fetch(service, request, opts.ticket);
-        if (c.stats && !c.stats().some((s) => s.state === 'up')) return await fallback(request);
-        const answer = await within(
-          c.fetch(service, request.clone(), opts.ticket),
-          requestTimeoutMs,
+      const wait = Math.max(0, fallbackAfterMs - (Date.now() - started));
+      if (!(await client.live(wait))) {
+        return fallback(
+          spare ?? request,
+          `no live session ${wait > 0 ? `within ${wait} ms` : 'now'}`,
         );
-        return answer === 'late' ? await fallback(request) : answer;
+      }
+      if (!retryable) return client.fetch(request);
+      // A plain copy, since a navigation request cannot be re-made with a signal of its own.
+      const abort = new AbortController();
+      const copy = new Request(request.url, {
+        method: request.method,
+        headers: request.headers,
+        signal: abort.signal,
+      });
+      try {
+        const answer = await within(client.fetch(copy), requestTimeoutMs);
+        if (answer !== 'late') return verified(request.url, answer);
+        abort.abort();
+        return fallback(request, `no answer over the lines within ${requestTimeoutMs} ms`);
       } catch (err) {
-        if (!retryable) throw err;
-        return fallback(request);
+        return fallback(request, `failed over the lines: ${String(err)}`);
       }
     },
   };
