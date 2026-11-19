@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { sha1 } from '../src/sha1.js';
+import { sha1 } from '../src/hash.js';
 
 // Checked against Node's own SHA-1 across the block boundaries where padding goes wrong, and
 // against RFC 6455's worked handshake example.

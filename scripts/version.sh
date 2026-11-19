@@ -4,7 +4,7 @@
 #
 # The repository-root VERSION file is the single source of truth. The Go implementation carries the
 # same number in go/protocol/version.go, where it becomes the impl string sent in HELLO and WELCOME,
-# and the CI release job refuses a tag that disagrees with either. The legacy ts/ package keeps the
+# and the CI release job refuses a tag that disagrees with either. The legacy js/ package keeps the
 # version it was last released with; it speaks protocol version 2 and is not released from here.
 #
 # Usage:

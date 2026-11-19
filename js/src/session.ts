@@ -8,7 +8,7 @@
 // has room, and delivered bytes are handed up through onDeliver. connID is the client's, minted once
 // with the platform CSPRNG and carried in every link's HELLO so the origin groups them.
 
-import { FrameType, MAX_SEGMENT, encodeAck, encodeData, encodeNonce } from './frames.js';
+import { FrameType, MAX_SEGMENT, encodeAck, encodeData, encodeNonce } from './protocol.js';
 import { Link, openWebSocketLink } from './link.js';
 
 // LinkState is reported to onLinkState the moment a line's up/down state changes — the edge a log

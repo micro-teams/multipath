@@ -25,7 +25,7 @@ server is never an open relay. The wire protocol is defined in [`PROTOCOL.md`](.
 | `go/` packages | `protocol` (frames, limits, line list), `link` (WebSocket links, HTTP proxies), `session` (the redundant byte stream), `mux` (streams with credit), `server`, `client`. |
 | `spec/vectors/` | Encodings of every frame, shared by all implementations. |
 | `conformance/` | A fault-injecting proxy and scenarios that run the real binaries through broken lines and attacks. |
-| `ts/` | Legacy: the browser client of protocol version 2, kept buildable until its successor exists. It does not speak version 3. |
+| `js/` | Legacy: the browser client of protocol version 2, kept buildable until its successor exists. It does not speak version 3. |
 
 ## Running the server
 

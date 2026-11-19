@@ -12,7 +12,7 @@
 // the far end is a genuine WebSocket server the origin's service handler is fronting, unaware its
 // bytes are travelling over a redundant mux instead of a plain TCP socket.
 
-import { sha1 } from './sha1.js';
+import { sha1 } from './hash.js';
 import { MuxStream } from './mux.js';
 
 const encoder = new TextEncoder();

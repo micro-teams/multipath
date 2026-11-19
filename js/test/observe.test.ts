@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { LinkState, RedundantStream } from '../src/redundant.js';
+import { LinkState, RedundantStream } from '../src/session.js';
 
 // A minimal fake WebSocket that lets the test drive open/close by hand, so link up/down transitions
 // can be observed without a real server. It records what was sent and exposes open()/drop() helpers.

@@ -4,7 +4,7 @@
 #   go           formatting, vet, build, and the unit tests under the race detector
 #   conformance  the real server and client binaries through the fault proxy and the attack
 #                scenarios, with production timeouts: the job that decides whether MultiPath works
-#   ts           the legacy protocol-version-2 browser package still builds and passes its tests
+#   js           the legacy protocol-version-2 browser package still builds and passes its tests
 #   release      on a v* tag only: the tag agrees with VERSION and the Go implementation version.
 #                Go needs no publishing, since the tag is what `go get` resolves.
 #
@@ -56,18 +56,18 @@ jobs:
           go-version-file: go/go.mod
       - run: conformance/run.sh
 
-  ts:
+  js:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: ts
+        working-directory: js
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: "npm"
-          cache-dependency-path: ts/package-lock.json
+          cache-dependency-path: js/package-lock.json
       - run: npm ci
       - run: npm run format:check
       - run: npm run lint
@@ -77,7 +77,7 @@ jobs:
       - run: npm test
 
   release:
-    needs: [go, conformance, ts]
+    needs: [go, conformance, js]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:

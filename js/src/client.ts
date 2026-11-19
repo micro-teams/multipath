@@ -5,11 +5,11 @@
 // client-chosen address): a caller opens a service by name, or uses fetch(service, request), which
 // carries one HTTP exchange over such a stream (the drop-in the service worker routes through).
 
-import { MultipathWebSocket } from './appws.js';
+import { MultipathWebSocket } from './websocket.js';
 import { encodeHeader } from './header.js';
 import { parseResponse, serializeRequest } from './http1.js';
 import { MuxSession, MuxStream } from './mux.js';
-import { LinkStat, RedundantOptions, RedundantStream } from './redundant.js';
+import { LinkStat, RedundantOptions, RedundantStream } from './session.js';
 
 export interface ClientOptions extends Omit<RedundantOptions, 'urls'> {
   // The WebSocket upgrade path the origin's link acceptor listens on; joined to each line. Defaults

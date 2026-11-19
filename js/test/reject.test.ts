@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import { encodeAck, encodeReject } from '../src/frames.js';
-import { RedundantStream } from '../src/redundant.js';
+import { encodeAck, encodeReject } from '../src/protocol.js';
+import { RedundantStream } from '../src/session.js';
 
 // A fake WebSocket the test drives by hand: open() fires onopen, message(bytes) delivers a frame,
 // close() fires onclose.

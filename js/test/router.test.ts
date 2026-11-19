@@ -7,7 +7,7 @@ import {
   type FetchScope,
   type LineStore,
   type RoutedClient,
-} from '../src/serviceWorker.js';
+} from '../src/router.js';
 import type { Client } from '../src/client.js';
 
 function fakeScope() {

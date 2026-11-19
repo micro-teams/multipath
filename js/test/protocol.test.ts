@@ -6,7 +6,7 @@ import {
   encodeData,
   encodeHello,
   encodeNonce,
-} from '../src/frames.js';
+} from '../src/protocol.js';
 import { encodeHeader, readHeader } from '../src/header.js';
 
 // Feeds bytes to a FrameReader one byte at a time — the worst case a WebSocket can hand it — and

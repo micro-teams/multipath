@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { describe, expect, it } from 'vitest';
-import { RedundantStream } from '../src/redundant.js';
+import { RedundantStream } from '../src/session.js';
 
 // Cross-language proof for the redundant layer: the browser RedundantStream (run here in Node, whose
 // global WebSocket stands in for the browser's) against the real JVM RedundantServer echoing bytes,

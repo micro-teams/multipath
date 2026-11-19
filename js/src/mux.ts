@@ -4,7 +4,7 @@
 // the shared transport, FIN half-closes and RST aborts, and a stream fully half-closed both ways is
 // freed without an RST so a graceful close never discards the peer's buffered bytes.
 
-import { RedundantStream } from './redundant.js';
+import { RedundantStream } from './session.js';
 
 const Mux = { Syn: 0x01, Data: 0x02, Fin: 0x03, Rst: 0x04, Window: 0x05 } as const;
 const rstDecoder = new TextDecoder();

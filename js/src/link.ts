@@ -6,7 +6,7 @@
 // messages; it reassembles frames across message boundaries with a FrameReader and hands whole
 // frames up. It knows nothing of offsets or windows — that is the redundant stream's job.
 
-import { Frame, FrameReader, encodeHello } from './frames.js';
+import { Frame, FrameReader, encodeHello } from './protocol.js';
 
 export interface LinkHandlers {
   onOpen(): void;

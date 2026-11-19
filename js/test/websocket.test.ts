@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { MultipathWebSocket, WSFrameReader } from '../src/appws.js';
+import { MultipathWebSocket, WSFrameReader } from '../src/websocket.js';
 import type { MuxStream } from '../src/mux.js';
 
 describe('WSFrameReader', () => {

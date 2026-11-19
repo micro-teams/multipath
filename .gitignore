@@ -1,4 +1,4 @@
-# Build output and dependencies of the legacy ts/ package, and editor droppings.
+# Build output and dependencies of the js/ package, and editor droppings.
 node_modules/
 dist/
 *.tsbuildinfo
