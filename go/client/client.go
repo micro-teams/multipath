@@ -126,7 +126,7 @@ func (c *Client) Run(ctx context.Context) error {
 
 // sessionLoop runs one session after another.
 func (c *Client) sessionLoop(ctx context.Context) {
-	retry := time.Second
+	retry := 250 * time.Millisecond
 	for ctx.Err() == nil {
 		lines, err := c.fetchLines(ctx)
 		if err != nil {
@@ -135,7 +135,7 @@ func (c *Client) sessionLoop(ctx context.Context) {
 			retry = min(2*retry, 30*time.Second)
 			continue
 		}
-		retry = time.Second
+		retry = 250 * time.Millisecond
 		cs := newClientSession(c, lines)
 		c.setCurrent(cs)
 		select {
