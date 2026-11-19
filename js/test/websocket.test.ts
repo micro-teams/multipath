@@ -1,7 +1,10 @@
+// The application WebSocket (src/websocket.ts) over a scripted stream: the frame reader, the
+// handshake with Host and protocols, messages and pings, a refused upgrade, and the release of the
+// stream when the socket closes.
 import { describe, expect, it, vi } from 'vitest';
 
 import { MultipathWebSocket, WSFrameReader } from '../src/websocket.js';
-import type { MuxStream } from '../src/mux.js';
+import type { Stream } from '../src/mux.js';
 
 describe('WSFrameReader', () => {
   it('parses a small unmasked frame in one push', () => {
@@ -80,7 +83,11 @@ class FakeStream {
     else this.queue.push(chunk);
   }
 
-  reset(): void {}
+  resets: string[] = [];
+
+  reset(why: string): void {
+    this.resets.push(why);
+  }
 }
 
 const encoder = new TextEncoder();
@@ -105,9 +112,39 @@ async function wsAccept(key: string): Promise<string> {
 }
 
 describe('MultipathWebSocket', () => {
+  it('sends Host and the offered protocols, and takes the one the server chose', async () => {
+    const fake = new FakeStream();
+    const openPromise = MultipathWebSocket.open(fake as unknown as Stream, '/ws', {
+      host: 'app.example',
+      protocols: ['v12.stomp', 'v11.stomp'],
+    });
+    const { key } = await acceptedHandshakeBytes(fake);
+    const req = new TextDecoder().decode(fake.writes[0]);
+    expect(req).toMatch(/^GET \/ws HTTP\/1\.1\r\nHost: app\.example\r\n/);
+    expect(req).toMatch(/Sec-WebSocket-Protocol: v12\.stomp, v11\.stomp\r\n/);
+    fake.push(
+      encoder.encode(
+        `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n` +
+          `Sec-WebSocket-Accept: ${await wsAccept(key)}\r\nSec-WebSocket-Protocol: v12.stomp\r\n\r\n`,
+      ),
+    );
+    expect((await openPromise).protocol).toBe('v12.stomp');
+  });
+
+  it('rejects a refused upgrade and releases the stream', async () => {
+    const fake = new FakeStream();
+    const openPromise = MultipathWebSocket.open(fake as unknown as Stream, '/ws', { host: 'h' });
+    await acceptedHandshakeBytes(fake);
+    fake.push(encoder.encode('HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n'));
+    await expect(openPromise).rejects.toThrow(/404 Not Found/);
+    expect(fake.resets).toEqual(['websocket handshake failed']);
+  });
+
   it('performs the handshake, delivers a message, and answers a ping without surfacing it', async () => {
     const fake = new FakeStream();
-    const openPromise = MultipathWebSocket.open(fake as unknown as MuxStream, '/chat');
+    const openPromise = MultipathWebSocket.open(fake as unknown as Stream, '/chat', {
+      host: 'app.example',
+    });
 
     const { key } = await acceptedHandshakeBytes(fake);
     const accept = await wsAccept(key);
@@ -144,7 +181,9 @@ describe('MultipathWebSocket', () => {
 
   it('send() masks and frames text as one complete message', async () => {
     const fake = new FakeStream();
-    const openPromise = MultipathWebSocket.open(fake as unknown as MuxStream, '/chat');
+    const openPromise = MultipathWebSocket.open(fake as unknown as Stream, '/chat', {
+      host: 'app.example',
+    });
     const { key } = await acceptedHandshakeBytes(fake);
     const accept = await wsAccept(key);
     fake.push(
@@ -171,7 +210,9 @@ describe('MultipathWebSocket', () => {
 
   it('calls onclose when the stream reaches EOF', async () => {
     const fake = new FakeStream();
-    const openPromise = MultipathWebSocket.open(fake as unknown as MuxStream, '/chat');
+    const openPromise = MultipathWebSocket.open(fake as unknown as Stream, '/chat', {
+      host: 'app.example',
+    });
     const { key } = await acceptedHandshakeBytes(fake);
     const accept = await wsAccept(key);
     fake.push(
@@ -189,5 +230,6 @@ describe('MultipathWebSocket', () => {
 
     expect(onclose).toHaveBeenCalledTimes(1);
     expect(ws.readyState).toBe(MultipathWebSocket.CLOSED);
+    expect(fake.resets).toEqual(['websocket closed']); // the stream is released
   });
 });
