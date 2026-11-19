@@ -1,0 +1,233 @@
+{
+  "description": "Encodings of PROTOCOL.md version 3. Integers wider than 32 bits are decimal strings; byte strings are hex. Valid vectors must encode to and decode from their hex; invalid vectors must fail to decode with the listed error, reading link frames with maxPayload 32780.",
+  "link": [
+    {
+      "name": "hello new",
+      "hex": "0100260003000102030405060708090a0b0c0d0e0f00006d756c7469706174682d676f2f302e332e30",
+      "type": "HELLO",
+      "fields": {
+        "impl": "multipath-go/0.3.0",
+        "link": 0,
+        "mode": "new",
+        "session": "000102030405060708090a0b0c0d0e0f",
+        "version": 3
+      }
+    },
+    {
+      "name": "hello join without impl",
+      "hex": "0100140003ffeeddccbbaa998877665544332211000701",
+      "type": "HELLO",
+      "fields": {
+        "impl": "",
+        "link": 7,
+        "mode": "join",
+        "session": "ffeeddccbbaa99887766554433221100",
+        "version": 3
+      }
+    },
+    {
+      "name": "welcome created with defaults",
+      "hex": "02002a000301ffff002000000004000001000801f403e80bb803e86d756c7469706174682d676f2f302e332e30",
+      "type": "WELCOME",
+      "fields": {
+        "clientDeadMs": 1000,
+        "created": true,
+        "impl": "multipath-go/0.3.0",
+        "maxLinks": 8,
+        "maxPayload": 65535,
+        "maxStreams": 256,
+        "pingMs": 500,
+        "progressMs": 1000,
+        "serverDeadMs": 3000,
+        "streamWindow": 262144,
+        "version": 3,
+        "window": 2097152
+      }
+    },
+    {
+      "name": "welcome joined",
+      "hex": "020018000300800c00040000000100000001010064012c0384012c",
+      "type": "WELCOME",
+      "fields": {
+        "clientDeadMs": 300,
+        "created": false,
+        "impl": "",
+        "maxLinks": 1,
+        "maxPayload": 32780,
+        "maxStreams": 1,
+        "pingMs": 100,
+        "progressMs": 300,
+        "serverDeadMs": 900,
+        "streamWindow": 65536,
+        "version": 3,
+        "window": 262144
+      }
+    },
+    {
+      "name": "reject unknown session",
+      "hex": "03001002756e6b6e6f776e2073657373696f6e",
+      "type": "REJECT",
+      "fields": {
+        "code": 2,
+        "reason": "unknown session"
+      }
+    },
+    {
+      "name": "data",
+      "hex": "04001100000001000000003610a68668656c6c6f",
+      "type": "DATA",
+      "fields": {
+        "data": "68656c6c6f",
+        "offset": "4294967296"
+      }
+    },
+    {
+      "name": "ack",
+      "hex": "0500080000001cbe991a14",
+      "type": "ACK",
+      "fields": {
+        "value": "123456789012"
+      }
+    },
+    {
+      "name": "ping",
+      "hex": "0600080000000000000001",
+      "type": "PING",
+      "fields": {
+        "value": "1"
+      }
+    },
+    {
+      "name": "pong",
+      "hex": "070008ffffffffffffffff",
+      "type": "PONG",
+      "fields": {
+        "value": "18446744073709551615"
+      }
+    },
+    {
+      "name": "goodbye",
+      "hex": "080014636c69656e74207368757474696e6720646f776e",
+      "type": "GOODBYE",
+      "fields": {
+        "reason": "client shutting down"
+      }
+    },
+    {
+      "name": "goodbye without reason",
+      "hex": "080000",
+      "type": "GOODBYE",
+      "fields": {
+        "reason": ""
+      }
+    },
+    {
+      "name": "unknown type is a frame like any other",
+      "hex": "7f00020102",
+      "type": "UNKNOWN",
+      "fields": {
+        "code": 127,
+        "payload": "0102"
+      }
+    }
+  ],
+  "mux": [
+    {
+      "name": "syn",
+      "hex": "01000400000001",
+      "type": "SYN",
+      "fields": {
+        "body": "",
+        "stream": 1
+      }
+    },
+    {
+      "name": "data",
+      "hex": "02001400000003476554202f20485454502f312e310d0a",
+      "type": "DATA",
+      "fields": {
+        "body": "476554202f20485454502f312e310d0a",
+        "stream": 3
+      }
+    },
+    {
+      "name": "fin",
+      "hex": "03000400000003",
+      "type": "FIN",
+      "fields": {
+        "body": "",
+        "stream": 3
+      }
+    },
+    {
+      "name": "rst with reason",
+      "hex": "04001400000005746f6f206d616e792073747265616d73",
+      "type": "RST",
+      "fields": {
+        "body": "746f6f206d616e792073747265616d73",
+        "stream": 5
+      }
+    },
+    {
+      "name": "window",
+      "hex": "050008ffffffff00010000",
+      "type": "WINDOW",
+      "fields": {
+        "body": "00010000",
+        "stream": 4294967295
+      }
+    },
+    {
+      "name": "unknown type",
+      "hex": "7f000500000009ff",
+      "type": "UNKNOWN",
+      "fields": {
+        "body": "ff",
+        "stream": 9
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "length above maxPayload",
+      "hex": "048010",
+      "error": "too large"
+    },
+    {
+      "name": "hello too short",
+      "hex": "010003000300",
+      "error": "corrupt"
+    },
+    {
+      "name": "hello with mode 2",
+      "hex": "0100140003000102030405060708090a0b0c0d0e0f0002",
+      "error": "corrupt"
+    },
+    {
+      "name": "data with a bad crc",
+      "hex": "04000d000000000000000000000000ff",
+      "error": "corrupt"
+    },
+    {
+      "name": "data without bytes",
+      "hex": "04000c000000000000000000000000",
+      "error": "corrupt"
+    },
+    {
+      "name": "ack of 7 bytes",
+      "hex": "05000700000000000000",
+      "error": "corrupt"
+    },
+    {
+      "name": "welcome with a window of zero",
+      "hex": "020018000301000000000000000000000000000000000000000000",
+      "error": "corrupt"
+    },
+    {
+      "name": "mux frame shorter than its stream id",
+      "hex": "02000300000000",
+      "type": "mux",
+      "error": "corrupt"
+    }
+  ]
+}

@@ -107,8 +107,8 @@ for every frame keeps one parser for everything: every frame of this protocol fi
 
 Sizes and bounds:
 
-- HELLO: 21 bytes plus `impl` of at most 64 bytes. `mode` is 0 (new) or 1 (join).
-- WELCOME: 25 bytes plus `impl` of at most 64 bytes. `flags` bit 0 is `created` (section 4.2).
+- HELLO: 20 bytes plus `impl` of at most 64 bytes. `mode` is 0 (new) or 1 (join).
+- WELCOME: 24 bytes plus `impl` of at most 64 bytes. `flags` bit 0 is `created` (section 4.2).
 - REJECT and GOODBYE: `reason` at most 256 bytes. REJECT has 1 more byte for `code`.
 - DATA: 12 bytes plus 1 to 32768 bytes of data. `crc32` is IEEE CRC-32 of the data bytes; a
   mismatch closes the link (the bytes arrive intact on another link or in a replay).
@@ -143,8 +143,10 @@ connection resets (the Go server half-closes and drains for up to one second).
 
 The client:
 
-- On REJECT code 2, or on a WELCOME with `created = 1` for a session that already had a WELCOME,
-  the server has lost the session (it restarted). The client ends the whole session at once
+- On REJECT code 2, or on a WELCOME with `created = 1` when an earlier WELCOME of the same session
+  also had `created = 1`, the server has lost the session (it restarted). Several links may race to
+  be first with mode `new`; exactly one of them creates the session, so one `created = 1` is normal
+  and a second one is not. The client ends the whole session at once
   (section 5.5) and starts a new one after a random delay of 0 to 2 seconds, so that many clients do
   not reconnect in the same instant after a server restart.
 - On other REJECT codes it logs the reason and retries that line with backoff.
@@ -212,8 +214,8 @@ The progress rule catches a link that carries bytes in one direction only, or wh
 moving while control frames still flow. A consequence of the fixed 1 second: under load, a line whose
 round trip exceeds about one second is dropped and redialled.
 
-A dead link is closed. Each link has its own writer with a bounded send queue of `window + 65536`
-bytes; a full queue, or a single write blocked for longer than the side's dead time, closes only
+A dead link is closed. Each link has its own writer with a bounded send queue of `window + 131072`
+bytes (enough for a full replay with its frame headers); a full queue, or a single write blocked for longer than the side's dead time, closes only
 that link. A slow link never blocks the session or the other links. A link's writer MAY skip DATA
 frames that have been acknowledged meanwhile.
 
@@ -266,7 +268,7 @@ type: u8 | length: u16 | stream: u32 | body: length - 4 bytes
 | `maxPayload` (frame payload) | 65535 | at least 32780 | both, per frame |
 | `window` (session send window, reorder span) | 2 MiB | 256 KiB to 64 MiB | sender waits; receiver closes the link |
 | reorder buffer | 2 × `window` | | receiver closes the link |
-| link send queue | `window` + 64 KiB | | sender closes the link |
+| link send queue | `window` + 128 KiB | | sender closes the link |
 | `streamWindow` (mux credit) | 256 KiB | 64 KiB to 16 MiB | sender waits; receiver ends the session |
 | `maxStreams` per session | 256 | 1 to 65535 | server resets the stream |
 | `maxLinks` per session | 8 | 1 to 255 | server REJECTs |
@@ -280,7 +282,7 @@ number of live TCP connections times a constant**.
 
 - A session needs at least one live link, and a link is one TCP connection; a session ends when its
   last link dies.
-- Per link: one reader and one writer task, and at most `window + 64 KiB` of queued bytes.
+- Per link: one reader and one writer task, and at most `window + 128 KiB` of queued bytes.
 - Per session: at most `window` of unacknowledged bytes, `2 × window` of reorder buffer, and at most
   `maxStreams` streams, each with at most `streamWindow` of received bytes and one target connection
   with one splice task per direction. There are no per-session threads or goroutines.

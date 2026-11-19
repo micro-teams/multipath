@@ -1,202 +1,234 @@
-// Wire framing for the redundant stream: encode/decode the frame types and a streaming reader that
-// reassembles frames off a byte-oriented link. Kept separate from the stream logic so the wire
-// format is easy to read in one place and to mirror in the JVM implementation.
+// Link frame codecs (PROTOCOL.md section 4): every frame is `type u8 | length u16 | payload`, and
+// each type's payload has a fixed layout. Encoders return a whole frame, ready to be written as one
+// WebSocket message; decoders take a payload as ParseFrame returned it and check its size exactly,
+// because a frame of a known type with the wrong size is a protocol violation, not something to
+// guess around. ParseFrame itself knows no types, so a frame of an unknown type is handed back like
+// any other, for the caller to skip.
 //
-// Frame layout (all integers big-endian):
+//   - ParseFrame(msg, maxPayload) (typ, payload, err): splits one link message, which must hold
+//     exactly one frame (PROTOCOL.md section 3); a declared length above maxPayload is ErrTooLarge.
 //
-//	HELLO 0x05 | connID[16] | linkIndex:u16
-//	DATA  0x01 | offset:u64  | len:u16 | crc32:u32 | payload[len]
-//	ACK   0x02 | cumulative:u64
-//	PING  0x03 | nonce:u64
-//	PONG  0x04 | nonce:u64
-//	REJECT 0x06 | reasonLen:u16 | reason[reasonLen]
-//	HELLO2 0x07 | connID[16] | linkIndex:u16 | reconnect:u8 (0 or 1)
+//   - EncodeHello / DecodeHello, EncodeWelcome / DecodeWelcome, EncodeReject / DecodeReject: the
+//     handshake (section 4.2), with the HelloFrame, WelcomeFrame and RejectFrame values.
 //
-// REJECT is the one frame that flows server→client: the origin refuses a link (e.g. a HELLO link
-// index out of range) and says why, in UTF-8, before closing. Without it a refused link is
-// indistinguishable from a flaky network — the client would back off, reconnect, be closed again,
-// forever, while Dial reported success (it only wrote HELLO) and every request hung. With it the
-// client surfaces the reason and stops retrying a link that will never be accepted.
+//   - EncodeData / DecodeData: offset, CRC-32 and up to MaxData bytes; a CRC mismatch is ErrCorrupt.
 //
-// HELLO is the first frame a client sends on every link (initial dial and every reconnect). It lets
-// a server that accepts many independent TCP connections group them: all links carrying the same
-// connID are the same logical stream, and a reconnecting link re-attaches to it.
+//   - EncodeAck, EncodePing, EncodePong / DecodeU64: the three 8-byte frames.
 //
-// HELLO2 is HELLO plus a `reconnect` bit: whether the CLIENT believes this connID has already been
-// accepted once before (by any origin), as opposed to a connID freshly minted for a brand-new
-// stream. It exists because a plain HELLO gives a restarted origin no way to tell those two cases
-// apart — an origin that just lost every connID it ever knew (a process restart, not a network
-// blip) used to accept a stale reconnect as if it were brand new, silently building a server-side
-// stream whose byte offsets start at 0 while the client's side does not, wedging the logical stream
-// with no error either side would ever see: nothing to reconnect from, because nothing failed. An
-// origin that gets HELLO2 with reconnect=true for a connID it does not have now REJECTs it instead,
-// which is a case the client already knows how to recover from (see RedundantStream.connectLink:
-// once every link of a stream has been rejected, the whole stream closes with an error, and the
-// caller — here, the connector's control-link dialer — throws it away and dials a fresh one with a
-// new connID). A legacy HELLO carries no such claim and keeps the old, permissive behavior, so
-// nothing that has not been rebuilt against this needs to change first.
-
-package multipath
+//   - EncodeGoodbye / DecodeReason: GOODBYE's reason (DecodeReason also reads RST reasons).
+//
+//     f := protocol.EncodeData(0, []byte("hi"))
+//     typ, payload, err := protocol.ParseFrame(f, protocol.DefaultLimits().MaxPayload)
+//     off, data, err := protocol.DecodeData(payload) // 0, "hi"
+package protocol
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"hash/crc32"
-	"io"
+	"time"
 )
 
-// frame is one decoded frame. Only the fields relevant to typ are set.
-type frame struct {
-	typ       byte
-	offset    uint64   // DATA offset, or ACK cumulative
-	payload   []byte   // DATA
-	nonce     uint64   // PING / PONG
-	connID    [16]byte // HELLO / HELLO2
-	linkIdx   uint16   // HELLO / HELLO2
-	reason    string   // REJECT
-	reconnect bool     // HELLO2 only; false (legacy, permissive) for a plain HELLO
+// ErrTooLarge is returned by ParseFrame for a frame longer than the caller's limit.
+var ErrTooLarge = errors.New("multipath: frame too large")
+
+// ErrCorrupt is returned for a frame whose payload has the wrong size or a bad CRC.
+var ErrCorrupt = errors.New("multipath: corrupt frame")
+
+// HelloFrame is the client's first frame on every link.
+type HelloFrame struct {
+	Version uint16
+	Session [16]byte
+	Link    uint8
+	Mode    byte
+	Impl    string
 }
 
-// encodeReject frames a server→client refusal carrying a UTF-8 reason. The reason is bounded so a
-// hostile length cannot force a large allocation on the client.
-func encodeReject(reason string) []byte {
-	r := []byte(reason)
-	if len(r) > maxSegment {
-		r = r[:maxSegment]
+// WelcomeFrame accepts a link. Created is true when this link created the session.
+type WelcomeFrame struct {
+	Version uint16
+	Created bool
+	Limits  Limits
+	Impl    string
+}
+
+// RejectFrame refuses a link, with one of the Reject codes.
+type RejectFrame struct {
+	Code   byte
+	Reason string
+}
+
+// ParseFrame splits one link message into its frame type and payload; the payload aliases msg.
+func ParseFrame(msg []byte, maxPayload int) (byte, []byte, error) {
+	if len(msg) < HeaderLen {
+		return 0, nil, fmt.Errorf("%w: message of %d bytes", ErrCorrupt, len(msg))
 	}
-	b := make([]byte, 1+2+len(r))
-	b[0] = frameReject
-	binary.BigEndian.PutUint16(b[1:], uint16(len(r)))
-	copy(b[3:], r)
-	return b
-}
-
-func encodeHello(connID [16]byte, linkIdx uint16) []byte {
-	b := make([]byte, 1+16+2)
-	b[0] = frameHello
-	copy(b[1:], connID[:])
-	binary.BigEndian.PutUint16(b[17:], linkIdx)
-	return b
-}
-
-func encodeHello2(connID [16]byte, linkIdx uint16, reconnect bool) []byte {
-	b := make([]byte, 1+16+2+1)
-	b[0] = frameHello2
-	copy(b[1:], connID[:])
-	binary.BigEndian.PutUint16(b[17:], linkIdx)
-	if reconnect {
-		b[19] = 1
+	n := int(binary.BigEndian.Uint16(msg[1:]))
+	if n > maxPayload {
+		return 0, nil, fmt.Errorf("%w: type 0x%02x length %d > %d", ErrTooLarge, msg[0], n, maxPayload)
 	}
-	return b
+	if len(msg) != HeaderLen+n {
+		return 0, nil, fmt.Errorf("%w: message of %d bytes holds a frame of %d", ErrCorrupt, len(msg), HeaderLen+n)
+	}
+	return msg[0], msg[HeaderLen:], nil
 }
 
-func encodeData(offset uint64, payload []byte) []byte {
-	b := make([]byte, dataHdrLen+len(payload))
-	b[0] = frameData
-	binary.BigEndian.PutUint64(b[1:], offset)
-	binary.BigEndian.PutUint16(b[9:], uint16(len(payload)))
-	binary.BigEndian.PutUint32(b[11:], crc32.ChecksumIEEE(payload))
-	copy(b[dataHdrLen:], payload)
-	return b
-}
+// Fixed parts of the HELLO and WELCOME payloads, before the impl string.
+const (
+	helloLen   = 20
+	welcomeLen = 24
+)
 
-func encodeAck(cumulative uint64) []byte {
-	b := make([]byte, 1+8)
-	b[0] = frameAck
-	binary.BigEndian.PutUint64(b[1:], cumulative)
-	return b
-}
-
-func encodePing(nonce uint64) []byte { return encodeNonce(framePing, nonce) }
-func encodePong(nonce uint64) []byte { return encodeNonce(framePong, nonce) }
-
-func encodeNonce(typ byte, nonce uint64) []byte {
-	b := make([]byte, 1+8)
+func frame(typ byte, size int) []byte {
+	b := make([]byte, HeaderLen, HeaderLen+size)
 	b[0] = typ
-	binary.BigEndian.PutUint64(b[1:], nonce)
+	binary.BigEndian.PutUint16(b[1:], uint16(size))
 	return b
 }
 
-// frameReader reads whole frames off a link. It uses io.ReadFull, so a link that delivers bytes in
-// arbitrary chunk boundaries still yields correct frames.
-type frameReader struct {
-	conn io.Reader
-	hdr  [dataHdrLen]byte
+func clip(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
 }
 
-// next returns the next frame. A corrupt DATA frame (CRC or length mismatch) or an unknown tag is
-// reported as errCorruptFrame so the caller drops the link; the same bytes arrive intact on another
-// link or a replay.
-func (r *frameReader) next() (frame, error) {
-	var t [1]byte
-	if _, err := io.ReadFull(r.conn, t[:]); err != nil {
-		return frame{}, err
+// EncodeHello frames a HELLO; Impl is cut to MaxImpl bytes.
+func EncodeHello(h HelloFrame) []byte {
+	impl := clip(h.Impl, MaxImpl)
+	b := frame(Hello, helloLen+len(impl))
+	b = binary.BigEndian.AppendUint16(b, h.Version)
+	b = append(b, h.Session[:]...)
+	b = append(b, h.Link, h.Mode)
+	return append(b, impl...)
+}
+
+// DecodeHello parses a HELLO payload. The version is returned as sent; checking it is the server's.
+func DecodeHello(p []byte) (HelloFrame, error) {
+	if len(p) < helloLen || len(p) > helloLen+MaxImpl || p[19] > ModeJoin {
+		return HelloFrame{}, fmt.Errorf("%w: hello of %d bytes", ErrCorrupt, len(p))
 	}
-	switch t[0] {
-	case frameHello:
-		var b [18]byte
-		if _, err := io.ReadFull(r.conn, b[:]); err != nil {
-			return frame{}, err
-		}
-		f := frame{typ: frameHello, linkIdx: binary.BigEndian.Uint16(b[16:])}
-		copy(f.connID[:], b[:16])
-		return f, nil
-	case frameHello2:
-		var b [19]byte
-		if _, err := io.ReadFull(r.conn, b[:]); err != nil {
-			return frame{}, err
-		}
-		f := frame{
-			typ:       frameHello2,
-			linkIdx:   binary.BigEndian.Uint16(b[16:18]),
-			reconnect: b[18] != 0,
-		}
-		copy(f.connID[:], b[:16])
-		return f, nil
-	case frameData:
-		if _, err := io.ReadFull(r.conn, r.hdr[1:dataHdrLen]); err != nil {
-			return frame{}, err
-		}
-		offset := binary.BigEndian.Uint64(r.hdr[1:])
-		n := binary.BigEndian.Uint16(r.hdr[9:])
-		want := binary.BigEndian.Uint32(r.hdr[11:])
-		if n > maxSegment {
-			return frame{}, errCorruptFrame
-		}
-		buf := make([]byte, n)
-		if _, err := io.ReadFull(r.conn, buf); err != nil {
-			return frame{}, err
-		}
-		if crc32.ChecksumIEEE(buf) != want {
-			return frame{}, errCorruptFrame
-		}
-		return frame{typ: frameData, offset: offset, payload: buf}, nil
-	case frameAck:
-		var b [8]byte
-		if _, err := io.ReadFull(r.conn, b[:]); err != nil {
-			return frame{}, err
-		}
-		return frame{typ: frameAck, offset: binary.BigEndian.Uint64(b[:])}, nil
-	case framePing, framePong:
-		var b [8]byte
-		if _, err := io.ReadFull(r.conn, b[:]); err != nil {
-			return frame{}, err
-		}
-		return frame{typ: t[0], nonce: binary.BigEndian.Uint64(b[:])}, nil
-	case frameReject:
-		var l [2]byte
-		if _, err := io.ReadFull(r.conn, l[:]); err != nil {
-			return frame{}, err
-		}
-		n := binary.BigEndian.Uint16(l[:])
-		if n > maxSegment {
-			return frame{}, errCorruptFrame
-		}
-		buf := make([]byte, n)
-		if _, err := io.ReadFull(r.conn, buf); err != nil {
-			return frame{}, err
-		}
-		return frame{typ: frameReject, reason: string(buf)}, nil
-	default:
-		return frame{}, errCorruptFrame
+	h := HelloFrame{Version: binary.BigEndian.Uint16(p), Link: p[18], Mode: p[19], Impl: string(p[helloLen:])}
+	copy(h.Session[:], p[2:18])
+	return h, nil
+}
+
+// EncodeWelcome frames a WELCOME; the limits must already be valid.
+func EncodeWelcome(w WelcomeFrame) []byte {
+	impl := clip(w.Impl, MaxImpl)
+	b := frame(Welcome, welcomeLen+len(impl))
+	b = binary.BigEndian.AppendUint16(b, w.Version)
+	flags := byte(0)
+	if w.Created {
+		flags = 1
 	}
+	l := w.Limits
+	b = append(b, flags)
+	b = binary.BigEndian.AppendUint16(b, uint16(l.MaxPayload))
+	b = binary.BigEndian.AppendUint32(b, uint32(l.Window))
+	b = binary.BigEndian.AppendUint32(b, uint32(l.StreamWindow))
+	b = binary.BigEndian.AppendUint16(b, uint16(l.MaxStreams))
+	b = append(b, byte(l.MaxLinks))
+	for _, d := range []time.Duration{l.Ping, l.ClientDead, l.ServerDead, l.Progress} {
+		b = binary.BigEndian.AppendUint16(b, uint16(d/time.Millisecond))
+	}
+	return append(b, impl...)
+}
+
+// DecodeWelcome parses a WELCOME payload and validates its limits.
+func DecodeWelcome(p []byte) (WelcomeFrame, error) {
+	if len(p) < welcomeLen || len(p) > welcomeLen+MaxImpl {
+		return WelcomeFrame{}, fmt.Errorf("%w: welcome of %d bytes", ErrCorrupt, len(p))
+	}
+	ms := func(i int) time.Duration { return time.Duration(binary.BigEndian.Uint16(p[i:])) * time.Millisecond }
+	w := WelcomeFrame{
+		Version: binary.BigEndian.Uint16(p),
+		Created: p[2]&1 != 0,
+		Limits: Limits{
+			MaxPayload:   int(binary.BigEndian.Uint16(p[3:])),
+			Window:       int(binary.BigEndian.Uint32(p[5:])),
+			StreamWindow: int(binary.BigEndian.Uint32(p[9:])),
+			MaxStreams:   int(binary.BigEndian.Uint16(p[13:])),
+			MaxLinks:     int(p[15]),
+			Ping:         ms(16),
+			ClientDead:   ms(18),
+			ServerDead:   ms(20),
+			Progress:     ms(22),
+		},
+		Impl: string(p[welcomeLen:]),
+	}
+	if err := w.Limits.Validate(); err != nil {
+		return WelcomeFrame{}, fmt.Errorf("%w: welcome limits: %v", ErrCorrupt, err)
+	}
+	return w, nil
+}
+
+// EncodeReject frames a REJECT; the reason is cut to MaxReason bytes.
+func EncodeReject(code byte, reason string) []byte {
+	reason = clip(reason, MaxReason)
+	b := frame(Reject, 1+len(reason))
+	b = append(b, code)
+	return append(b, reason...)
+}
+
+// DecodeReject parses a REJECT payload.
+func DecodeReject(p []byte) (RejectFrame, error) {
+	if len(p) < 1 || len(p) > 1+MaxReason {
+		return RejectFrame{}, fmt.Errorf("%w: reject of %d bytes", ErrCorrupt, len(p))
+	}
+	return RejectFrame{Code: p[0], Reason: string(p[1:])}, nil
+}
+
+// EncodeData frames up to MaxData stream bytes starting at offset.
+func EncodeData(offset uint64, data []byte) []byte {
+	b := frame(Data, DataOverhead+len(data))
+	b = binary.BigEndian.AppendUint64(b, offset)
+	b = binary.BigEndian.AppendUint32(b, crc32.ChecksumIEEE(data))
+	return append(b, data...)
+}
+
+// DecodeData parses a DATA payload; the returned bytes alias p.
+func DecodeData(p []byte) (uint64, []byte, error) {
+	if len(p) <= DataOverhead || len(p) > DataOverhead+MaxData {
+		return 0, nil, fmt.Errorf("%w: data of %d bytes", ErrCorrupt, len(p))
+	}
+	data := p[DataOverhead:]
+	if crc32.ChecksumIEEE(data) != binary.BigEndian.Uint32(p[8:]) {
+		return 0, nil, fmt.Errorf("%w: data crc mismatch", ErrCorrupt)
+	}
+	return binary.BigEndian.Uint64(p), data, nil
+}
+
+func encodeU64(typ byte, v uint64) []byte { return binary.BigEndian.AppendUint64(frame(typ, 8), v) }
+
+// EncodeAck frames an ACK of every byte below offset.
+func EncodeAck(offset uint64) []byte { return encodeU64(Ack, offset) }
+
+// EncodePing frames a PING.
+func EncodePing(nonce uint64) []byte { return encodeU64(Ping, nonce) }
+
+// EncodePong frames the PONG answering a PING with nonce.
+func EncodePong(nonce uint64) []byte { return encodeU64(Pong, nonce) }
+
+// DecodeU64 parses an ACK, PING or PONG payload.
+func DecodeU64(p []byte) (uint64, error) {
+	if len(p) != 8 {
+		return 0, fmt.Errorf("%w: 8-byte frame of %d bytes", ErrCorrupt, len(p))
+	}
+	return binary.BigEndian.Uint64(p), nil
+}
+
+// EncodeGoodbye frames a GOODBYE; the reason is cut to MaxReason bytes.
+func EncodeGoodbye(reason string) []byte {
+	reason = clip(reason, MaxReason)
+	return append(frame(Goodbye, len(reason)), reason...)
+}
+
+// DecodeReason parses a GOODBYE payload or an RST body.
+func DecodeReason(p []byte) (string, error) {
+	if len(p) > MaxReason {
+		return "", fmt.Errorf("%w: reason of %d bytes", ErrCorrupt, len(p))
+	}
+	return string(p), nil
 }
