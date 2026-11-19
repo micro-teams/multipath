@@ -1,467 +1,458 @@
-package multipath
+// Tests for the redundant session over an in-memory fault-injecting link fabric. A fabric link is a
+// pair of message pipes with a policy that can, while set, swallow every message (black-hole), stall
+// writes like a peer that stopped reading, corrupt one DATA frame, or drop only the ACKs flowing to
+// the client. A harness redials a link whenever the client side reports it down, so replay on
+// reconnect is exercised for real. Timings are scaled down from production by about ten.
+package session
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
-	"encoding/binary"
-	"hash/crc32"
+	"errors"
 	"io"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/micro-teams/multipath/go/protocol"
 )
 
-// ---- in-memory fault-injecting link fabric -------------------------------------------------------
-//
-// A link is a full-duplex in-memory byte pipe with a policy that can, per direction, deliver bytes
-// normally, silently swallow them (black-hole: the conn stays "up" but no bytes move), or corrupt a
-// byte (which desyncs the frame reader / trips the CRC, exactly as a real integrity failure would).
-// The fabric models client-initiated links: side A dials and side B accepts, and each reconnect
-// rendezvous makes a fresh pipe — so replay-on-reconnect is exercised for real.
-
-type linkPolicy struct {
-	blackhole atomic.Bool // both directions: swallow everything, deliver nothing
-	corrupt   atomic.Bool // flip one byte on the next delivered write, then clear (one-shot)
-	corrupted atomic.Bool
+type policy struct {
+	blackhole atomic.Bool
+	stall     atomic.Bool // writes block until their deadline
+	corrupt   atomic.Bool // corrupt the next DATA frame, once
+	dropAcks  atomic.Bool // swallow ACKs written by the server side
 }
 
 type memConn struct {
 	mu     sync.Mutex
 	cond   *sync.Cond
-	buf    []byte
+	msgs   [][]byte
 	closed bool
+	wdl    time.Time
 	peer   *memConn
-	pol    *linkPolicy
+	pol    *policy
+	server bool
 }
 
-func newMemPair(pol *linkPolicy) (*memConn, *memConn) {
-	a := &memConn{pol: pol}
-	b := &memConn{pol: pol}
-	a.cond = sync.NewCond(&a.mu)
-	b.cond = sync.NewCond(&b.mu)
-	a.peer = b
-	b.peer = a
-	return a, b
+func memPair(pol *policy) (client, server *memConn) {
+	client, server = &memConn{pol: pol}, &memConn{pol: pol, server: true}
+	client.cond, server.cond = sync.NewCond(&client.mu), sync.NewCond(&server.mu)
+	client.peer, server.peer = server, client
+	return
 }
 
-func (c *memConn) Write(p []byte) (int, error) {
-	c.mu.Lock()
-	if c.closed {
+func (c *memConn) WriteMessage(p []byte) error {
+	for c.pol.stall.Load() {
+		c.mu.Lock()
+		closed, dl := c.closed, c.wdl
 		c.mu.Unlock()
-		return 0, io.ErrClosedPipe
+		if closed {
+			return io.ErrClosedPipe
+		}
+		if !dl.IsZero() && time.Now().After(dl) {
+			return os.ErrDeadlineExceeded
+		}
+		time.Sleep(time.Millisecond)
 	}
+	c.mu.Lock()
+	closed := c.closed
 	c.mu.Unlock()
-	if c.pol.blackhole.Load() {
-		return len(p), nil // swallowed — link looks up, bytes never arrive
+	if closed {
+		return io.ErrClosedPipe
+	}
+	if c.pol.blackhole.Load() || (c.server && p[0] == protocol.Ack && c.pol.dropAcks.Load()) {
+		return nil
 	}
 	out := append([]byte(nil), p...)
-	if c.pol.corrupt.Load() && len(out) > 0 && !c.pol.corrupted.Swap(true) {
-		out[len(out)/2] ^= 0xFF
+	if out[0] == protocol.Data && c.pol.corrupt.CompareAndSwap(true, false) {
+		out[len(out)-1] ^= 0xff
 	}
-	c.peer.deliver(out)
-	return len(p), nil
-}
-
-func (c *memConn) deliver(b []byte) {
-	c.mu.Lock()
-	if !c.closed {
-		c.buf = append(c.buf, b...)
-		c.cond.Broadcast()
-	}
-	c.mu.Unlock()
-}
-
-func (c *memConn) Read(p []byte) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for len(c.buf) == 0 && !c.closed {
-		c.cond.Wait()
-	}
-	if len(c.buf) == 0 && c.closed {
-		return 0, io.EOF
-	}
-	n := copy(p, c.buf)
-	c.buf = c.buf[n:]
-	return n, nil
-}
-
-func (c *memConn) Close() error {
-	c.mu.Lock()
-	c.closed = true
-	c.cond.Broadcast()
-	c.mu.Unlock()
 	c.peer.mu.Lock()
-	c.peer.closed = true
-	c.peer.cond.Broadcast()
+	if !c.peer.closed {
+		c.peer.msgs = append(c.peer.msgs, out)
+		c.peer.cond.Broadcast()
+	}
 	c.peer.mu.Unlock()
 	return nil
 }
 
-type fabric struct {
-	pol    []*linkPolicy
-	accept []chan *memConn
+func (c *memConn) ReadMessage(max int) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for len(c.msgs) == 0 && !c.closed {
+		c.cond.Wait()
+	}
+	if c.closed {
+		return nil, io.EOF
+	}
+	m := c.msgs[0]
+	c.msgs = c.msgs[1:]
+	if len(m) > max {
+		return nil, errors.New("message too large")
+	}
+	return m, nil
 }
 
-func newFabric(n int) *fabric {
-	f := &fabric{pol: make([]*linkPolicy, n), accept: make([]chan *memConn, n)}
-	for i := range f.pol {
-		f.pol[i] = &linkPolicy{}
-		f.accept[i] = make(chan *memConn, 16)
-	}
-	return f
+func (c *memConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.wdl = t
+	c.mu.Unlock()
+	return nil
 }
 
-func (f *fabric) clientDial(ctx context.Context, i int) (io.ReadWriteCloser, error) {
-	a, b := newMemPair(f.pol[i])
-	select {
-	case f.accept[i] <- b:
-		return a, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+func (c *memConn) Close() error {
+	for _, e := range []*memConn{c, c.peer} {
+		e.mu.Lock()
+		e.closed = true
+		e.cond.Broadcast()
+		e.mu.Unlock()
 	}
+	return nil
 }
 
-func (f *fabric) serverDial(ctx context.Context, i int) (io.ReadWriteCloser, error) {
-	select {
-	case b := <-f.accept[i]:
-		return b, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
+// sink collects delivered bytes.
+type sink struct {
+	mu   sync.Mutex
+	cond *sync.Cond
+	buf  []byte
 }
 
-// fastOpts is the timing profile for tests: reap and reconnect quickly.
-func fastOpts(n int, dial func(context.Context, int) (io.ReadWriteCloser, error)) RedundantOptions {
-	return RedundantOptions{
-		N:              n,
-		Dial:           dial,
-		Window:         1 << 20,
-		PingInterval:   15 * time.Millisecond,
-		DeadAfter:      60 * time.Millisecond,
-		AckInterval:    5 * time.Millisecond,
-		ReconnectDelay: 5 * time.Millisecond,
-		MaxDelay:       40 * time.Millisecond,
-	}
+func newSink() *sink { k := &sink{}; k.cond = sync.NewCond(&k.mu); return k }
+
+func (k *sink) deliver(p []byte) error {
+	k.mu.Lock()
+	k.buf = append(k.buf, p...)
+	k.cond.Broadcast()
+	k.mu.Unlock()
+	return nil
 }
 
-// pair spins up a connected client/server RedundantStream over the fabric.
-func pair(t *testing.T, f *fabric) (*RedundantStream, *RedundantStream) {
-	t.Helper()
-	n := len(f.pol)
-	ctx := context.Background()
-	var cli, srv *RedundantStream
-	var cerr, serr error
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); srv, serr = DialRedundant(ctx, fastOpts(n, f.serverDial)) }()
-	go func() { defer wg.Done(); cli, cerr = DialRedundant(ctx, fastOpts(n, f.clientDial)) }()
-	wg.Wait()
-	if cerr != nil || serr != nil {
-		t.Fatalf("dial: cli=%v srv=%v", cerr, serr)
+// await waits until n bytes arrived or the timeout passes, and returns what arrived.
+func (k *sink) await(n int, timeout time.Duration) []byte {
+	deadline := time.Now().Add(timeout)
+	go func() { time.Sleep(timeout); k.mu.Lock(); k.cond.Broadcast(); k.mu.Unlock() }()
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	for len(k.buf) < n && time.Now().Before(deadline) {
+		k.cond.Wait()
 	}
-	return cli, srv
+	return append([]byte(nil), k.buf...)
+}
+
+func testLimits() protocol.Limits {
+	l := protocol.DefaultLimits()
+	l.Window = 1 << 20
+	l.Ping = 15 * time.Millisecond
+	l.ClientDead = 60 * time.Millisecond
+	l.ServerDead = 150 * time.Millisecond
+	l.Progress = 100 * time.Millisecond
+	return l
+}
+
+type harness struct {
+	t        *testing.T
+	clock    *Clock
+	pol      []*policy
+	cli, srv *Session
+	cin, sin *sink
+	ended    chan string
+	redial   atomic.Bool
+}
+
+// newHarness connects a client and a server session over n fabric links.
+func newHarness(t *testing.T, n int, lim protocol.Limits) *harness {
+	h := &harness{t: t, clock: NewClock(5 * time.Millisecond), cin: newSink(), sin: newSink(), ended: make(chan string, 2)}
+	h.redial.Store(true)
+	t.Cleanup(h.clock.Stop)
+	for range n {
+		h.pol = append(h.pol, &policy{})
+	}
+	h.cli = New(Options{Limits: lim, Client: true, Clock: h.clock, Deliver: h.cin.deliver,
+		OnLink: func(i int, up bool, _ string) {
+			if !up && h.redial.Load() {
+				go func() { time.Sleep(5 * time.Millisecond); h.connect(i) }()
+			}
+		},
+		OnEnd: func(why string) { h.ended <- "client: " + why }})
+	h.srv = New(Options{Limits: lim, Clock: h.clock, Deliver: h.sin.deliver,
+		OnEnd: func(why string) { h.ended <- "server: " + why }})
+	for i := range n {
+		h.connect(i)
+	}
+	t.Cleanup(func() { h.redial.Store(false); h.cli.End("test over"); h.srv.End("test over") })
+	return h
+}
+
+// connect attaches a fresh pipe as link i on both sides.
+func (h *harness) connect(i int) {
+	a, b := memPair(h.pol[i])
+	if h.srv.Attach(i, b) != nil || h.cli.Attach(i, a) != nil {
+		a.Close()
+	}
 }
 
 func randBytes(n int) []byte {
 	b := make([]byte, n)
-	_, _ = rand.Read(b)
+	_, _ = rand.Read(b) // crypto/rand does not fail on supported platforms
 	return b
 }
 
-// sendAll writes payload and closes the write side by signalling via a sentinel: since the stream
-// has no half-close in the first slice, the receiver reads exactly len(payload) bytes.
-func recvN(t *testing.T, s *RedundantStream, n int) []byte {
+// send writes p in MaxData pieces, as the mux does.
+func send(s *Session, p []byte) error {
+	for len(p) > 0 {
+		n := min(len(p), protocol.MaxData)
+		if err := s.Send(p[:n], false); err != nil {
+			return err
+		}
+		p = p[n:]
+	}
+	return nil
+}
+
+func expect(t *testing.T, k *sink, want []byte) {
 	t.Helper()
-	out := make([]byte, 0, n)
-	buf := make([]byte, 64*1024)
-	deadline := time.Now().Add(10 * time.Second)
-	for len(out) < n {
-		if time.Now().After(deadline) {
-			t.Fatalf("recv timeout: got %d/%d", len(out), n)
+	if got := k.await(len(want), 10*time.Second); !bytes.Equal(got, want) {
+		t.Fatalf("received %d of %d bytes, equal=%v", len(got), len(want), bytes.Equal(got, want[:min(len(got), len(want))]))
+	}
+}
+
+func TestReorderDedup(t *testing.T) {
+	k := newSink()
+	s := &Session{opt: Options{Deliver: k.deliver}, lim: testLimits(), reorder: map[uint64][]byte{}}
+	s.writable = sync.NewCond(&s.mu)
+	for _, f := range []struct {
+		off  uint64
+		data string
+	}{{6, "WORLD"}, {0, "HEL"}, {0, "HEL"}, {3, "LO "}, {2, "LLO WO"}} {
+		if err := s.onData(f.off, []byte(f.data)); err != nil {
+			t.Fatal(err)
 		}
-		s.setReadDeadlineHelper()
-		m, err := s.Read(buf)
-		if m > 0 {
-			out = append(out, buf[:m]...)
-		}
-		if err != nil && len(out) < n {
-			t.Fatalf("read err at %d/%d: %v", len(out), n, err)
-		}
 	}
-	return out
-}
-
-// setReadDeadlineHelper is a no-op hook kept so recvN reads naturally; Read blocks until data.
-func (s *RedundantStream) setReadDeadlineHelper() {}
-
-// ---- unit: framing -------------------------------------------------------------------------------
-
-func TestFrameRoundTrip(t *testing.T) {
-	payload := randBytes(1000)
-	frames := bytes.Join([][]byte{
-		encodeData(42, payload),
-		encodeAck(12345),
-		encodePing(7),
-		encodePong(7),
-	}, nil)
-	r := &frameReader{conn: bytes.NewReader(frames)}
-
-	f, err := r.next()
-	if err != nil || f.typ != frameData || f.offset != 42 || !bytes.Equal(f.payload, payload) {
-		t.Fatalf("data: typ=%x off=%d eq=%v err=%v", f.typ, f.offset, bytes.Equal(f.payload, payload), err)
-	}
-	f, err = r.next()
-	if err != nil || f.typ != frameAck || f.offset != 12345 {
-		t.Fatalf("ack: typ=%x off=%d err=%v", f.typ, f.offset, err)
-	}
-	f, err = r.next()
-	if err != nil || f.typ != framePing || f.nonce != 7 {
-		t.Fatalf("ping: typ=%x nonce=%d err=%v", f.typ, f.nonce, err)
-	}
-	f, err = r.next()
-	if err != nil || f.typ != framePong || f.nonce != 7 {
-		t.Fatalf("pong: typ=%x nonce=%d err=%v", f.typ, f.nonce, err)
+	if got := string(k.buf); got != "HELLO WORLD" || len(s.reorder) != 0 || s.reorderBytes != 0 {
+		t.Fatalf("delivered %q, reorder %v (%d bytes)", got, s.reorder, s.reorderBytes)
 	}
 }
 
-func TestHelloRoundTrip(t *testing.T) {
-	id := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-	r := &frameReader{conn: bytes.NewReader(encodeHello(id, 3))}
-	f, err := r.next()
-	if err != nil || f.typ != frameHello || f.connID != id || f.linkIdx != 3 {
-		t.Fatalf("hello: %+v err=%v", f, err)
+func TestDataBeyondWindowIsAViolation(t *testing.T) {
+	s := &Session{opt: Options{Deliver: newSink().deliver}, lim: testLimits(), reorder: map[uint64][]byte{}}
+	if err := s.onData(uint64(testLimits().Window+protocol.ControlSlack), []byte("x")); err == nil || err.session {
+		t.Fatalf("want a link violation, got %v", err)
 	}
 }
 
-func TestFrameRejectsCorruptCRC(t *testing.T) {
-	f := encodeData(0, []byte("hello world"))
-	f[len(f)-1] ^= 0xFF // corrupt the payload's last byte; CRC no longer matches
-	r := &frameReader{conn: bytes.NewReader(f)}
-	if _, err := r.next(); err != errCorruptFrame {
-		t.Fatalf("want errCorruptFrame, got %v", err)
-	}
+func TestCleanTransfer(t *testing.T) {
+	h := newHarness(t, 3, testLimits())
+	msg := randBytes(4 << 20)
+	go func() { _ = send(h.cli, msg) }()
+	expect(t, h.sin, msg)
 }
 
-func TestFrameRejectsBadLength(t *testing.T) {
-	f := encodeData(0, []byte("x"))
-	binary.BigEndian.PutUint16(f[9:], uint16(maxSegment+1)) // impossible length
-	r := &frameReader{conn: bytes.NewReader(f)}
-	if _, err := r.next(); err != errCorruptFrame {
-		t.Fatalf("want errCorruptFrame for over-long len, got %v", err)
-	}
+func TestBothDirections(t *testing.T) {
+	h := newHarness(t, 3, testLimits())
+	a, b := randBytes(1<<20), randBytes(1<<20)
+	go func() { _ = send(h.cli, a) }()
+	go func() { _ = send(h.srv, b) }()
+	expect(t, h.sin, a)
+	expect(t, h.cin, b)
 }
 
-// ---- unit: reassembly + dedup (white-box) --------------------------------------------------------
-
-func TestReassemblyDedupReorder(t *testing.T) {
-	s := &RedundantStream{reasm: make(map[uint64][]byte)}
-	s.readable = sync.NewCond(&s.mu)
-	// Deliver "HELLO WORLD" (11 bytes) out of order, with duplicates and an overlap.
-	s.onData(6, []byte("WORLD"))  // future segment, buffered
-	s.onData(0, []byte("HEL"))    // head
-	s.onData(0, []byte("HEL"))    // exact duplicate — dropped
-	s.onData(3, []byte("LO "))    // fills to 6, then WORLD drains
-	s.onData(2, []byte("LLO WO")) // overlaps already-delivered, only new tail (if any) applied
-	if got := string(s.inbox); got != "HELLO WORLD" {
-		t.Fatalf("reassembled %q, want %q", got, "HELLO WORLD")
-	}
-	if len(s.reasm) != 0 {
-		t.Fatalf("reasm not drained: %v", s.reasm)
-	}
-}
-
-// ---- end-to-end scenarios ------------------------------------------------------------------------
-
-func TestE2EClean(t *testing.T) {
-	f := newFabric(3)
-	cli, srv := pair(t, f)
-	defer cli.Close()
-	defer srv.Close()
+func TestBlackholedLinksAreReaped(t *testing.T) {
+	h := newHarness(t, 3, testLimits())
+	h.pol[0].blackhole.Store(true)
+	h.pol[2].blackhole.Store(true)
 	msg := randBytes(1 << 20)
-	go func() { _, _ = cli.Write(msg) }()
-	got := recvN(t, srv, len(msg))
-	if !bytes.Equal(got, msg) {
-		t.Fatalf("clean transfer mismatch")
+	go func() { _ = send(h.cli, msg) }()
+	expect(t, h.sin, msg)
+}
+
+func TestLinksRecoverAndReplay(t *testing.T) {
+	h := newHarness(t, 3, testLimits())
+	h.pol[0].blackhole.Store(true)
+	h.pol[1].blackhole.Store(true)
+	first := randBytes(256 << 10)
+	go func() {
+		_ = send(h.cli, first)
+		time.Sleep(20 * time.Millisecond)
+		h.pol[0].blackhole.Store(false)
+		h.pol[1].blackhole.Store(false)
+		_ = send(h.cli, first)
+	}()
+	expect(t, h.sin, append(append([]byte(nil), first...), first...))
+}
+
+func TestCorruptFrameDropsOnlyItsLink(t *testing.T) {
+	h := newHarness(t, 3, testLimits())
+	h.pol[1].corrupt.Store(true)
+	msg := randBytes(1 << 20)
+	go func() { _ = send(h.cli, msg) }()
+	expect(t, h.sin, msg)
+}
+
+// A link whose peer stopped reading must not slow the others: its writer is stuck, its queue fills,
+// and it is closed, while the transfer completes over the healthy links.
+func TestStalledLinkDoesNotBlockOthers(t *testing.T) {
+	h := newHarness(t, 2, testLimits())
+	h.redial.Store(false)
+	h.pol[0].stall.Store(true)
+	msg := randBytes(4 << 20)
+	start := time.Now()
+	go func() { _ = send(h.cli, msg) }()
+	expect(t, h.sin, msg)
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("transfer took %v with one stalled link", d)
 	}
 }
 
-// readExactly reads n bytes (or until error) without touching *testing.T, so it is safe to call
-// from a goroutine; the caller asserts on the main goroutine.
-func readExactly(s *RedundantStream, n int) []byte {
-	out := make([]byte, 0, n)
-	buf := make([]byte, 64*1024)
-	deadline := time.Now().Add(10 * time.Second)
-	for len(out) < n && time.Now().Before(deadline) {
-		m, err := s.Read(buf)
-		if m > 0 {
-			out = append(out, buf[:m]...)
+// Many reconnects during a heavy transfer: the replay of each reattached link must precede any newer
+// frame, and a frame that arrives ahead of a gap must wait, not vanish.
+func TestManyReconnectsUnderLoad(t *testing.T) {
+	h := newHarness(t, 2, testLimits())
+	msg := randBytes(8 << 20)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			case <-time.After(3 * time.Millisecond):
+			}
+			// Only a link whose sibling is up is dropped: losing both would end the session.
+			h.cli.mu.Lock()
+			l, other := h.cli.links[i%2], h.cli.links[(i+1)%2]
+			h.cli.mu.Unlock()
+			if l != nil && other != nil {
+				h.cli.drop(l, "test drop")
+			}
 		}
+	}()
+	go func() { _ = send(h.cli, msg) }()
+	expect(t, h.sin, msg)
+}
+
+// The first frames on a link are the ACK and then the replay from the acknowledged offset, even
+// with a sender writing concurrently.
+func TestAttachQueuesReplayFirst(t *testing.T) {
+	clock := NewClock(time.Hour)
+	defer clock.Stop()
+	s := New(Options{Limits: testLimits(), Client: true, Clock: clock, Deliver: newSink().deliver})
+	defer s.End("test over")
+	if err := send(s, randBytes(100<<10)); err != nil {
+		t.Fatal(err)
+	}
+	a, b := memPair(&policy{})
+	go func() { _ = send(s, randBytes(100<<10)) }()
+	if err := s.Attach(0, a); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := b.ReadMessage(1 << 16)
+	if m[0] != protocol.Ack {
+		t.Fatalf("first frame 0x%02x, want ACK", m[0])
+	}
+	next := uint64(0)
+	for next < 200<<10 {
+		m, err := b.ReadMessage(1 << 16)
 		if err != nil {
-			break
+			t.Fatal(err)
 		}
-	}
-	return out
-}
-
-func TestE2EBothDirections(t *testing.T) {
-	f := newFabric(3)
-	cli, srv := pair(t, f)
-	defer cli.Close()
-	defer srv.Close()
-	a := randBytes(256 << 10)
-	b := randBytes(256 << 10)
-	go func() { _, _ = cli.Write(a) }()
-	go func() { _, _ = srv.Write(b) }()
-	gotBCh := make(chan []byte, 1)
-	go func() { gotBCh <- readExactly(cli, len(b)) }()
-	gotA := recvN(t, srv, len(a))
-	gotB := <-gotBCh
-	if !bytes.Equal(gotA, a) {
-		t.Fatalf("cli->srv mismatch")
-	}
-	if !bytes.Equal(gotB, b) {
-		t.Fatalf("srv->cli mismatch")
-	}
-}
-
-func TestE2ELinkDropMidStream(t *testing.T) {
-	f := newFabric(3)
-	cli, srv := pair(t, f)
-	defer cli.Close()
-	defer srv.Close()
-	msg := randBytes(1 << 20)
-	go func() {
-		// Drop link 0 partway by black-holing it; the transfer must complete via 1 and 2.
-		time.Sleep(3 * time.Millisecond)
-		f.pol[0].blackhole.Store(true)
-		_, _ = cli.Write(msg)
-	}()
-	got := recvN(t, srv, len(msg))
-	if !bytes.Equal(got, msg) {
-		t.Fatalf("mismatch after link drop")
-	}
-}
-
-func TestE2EBlackholeStallReapedAndRecovers(t *testing.T) {
-	f := newFabric(3)
-	// Two of three links are black-holes (up, but no bytes move) — the classic "connected but no
-	// data" case. DeadAfter must reap them; the transfer completes over the one good link.
-	f.pol[0].blackhole.Store(true)
-	f.pol[2].blackhole.Store(true)
-	cli, srv := pair(t, f)
-	defer cli.Close()
-	defer srv.Close()
-	msg := randBytes(512 << 10)
-	go func() { _, _ = cli.Write(msg) }()
-	got := recvN(t, srv, len(msg))
-	if !bytes.Equal(got, msg) {
-		t.Fatalf("mismatch with 2/3 links black-holed")
-	}
-}
-
-func TestE2EAllButOneThenRecover(t *testing.T) {
-	f := newFabric(3)
-	f.pol[0].blackhole.Store(true)
-	f.pol[1].blackhole.Store(true)
-	cli, srv := pair(t, f)
-	defer cli.Close()
-	defer srv.Close()
-	first := randBytes(128 << 10)
-	go func() {
-		_, _ = cli.Write(first)
-		time.Sleep(5 * time.Millisecond)
-		f.pol[0].blackhole.Store(false) // links recover; reconnect + replay must not corrupt anything
-		f.pol[1].blackhole.Store(false)
-		_, _ = cli.Write(first)
-	}()
-	got := recvN(t, srv, 2*len(first))
-	want := append(append([]byte(nil), first...), first...)
-	if !bytes.Equal(got, want) {
-		t.Fatalf("mismatch across link recovery")
-	}
-}
-
-func TestE2ECorruptionBreaksLinkButStreamExact(t *testing.T) {
-	f := newFabric(3)
-	cli, srv := pair(t, f)
-	defer cli.Close()
-	defer srv.Close()
-	msg := randBytes(512 << 10)
-	go func() {
-		time.Sleep(2 * time.Millisecond)
-		f.pol[1].corrupt.Store(true) // one corrupted frame on link 1 -> CRC/parse fail -> link reaped
-		_, _ = cli.Write(msg)
-	}()
-	got := recvN(t, srv, len(msg))
-	if !bytes.Equal(got, msg) {
-		t.Fatalf("mismatch after corruption on one link")
-	}
-}
-
-func TestE2EBackpressureBounded(t *testing.T) {
-	f := newFabric(2)
-	// Tiny window; a slow reader must throttle the writer without unbounded buffering.
-	opt := func(dial func(context.Context, int) (io.ReadWriteCloser, error)) RedundantOptions {
-		o := fastOpts(2, dial)
-		o.Window = 64 << 10
-		return o
-	}
-	ctx := context.Background()
-	var cli, srv *RedundantStream
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); srv, _ = DialRedundant(ctx, opt(f.serverDial)) }()
-	go func() { defer wg.Done(); cli, _ = DialRedundant(ctx, opt(f.clientDial)) }()
-	wg.Wait()
-	defer cli.Close()
-	defer srv.Close()
-
-	msg := randBytes(1 << 20)
-	go func() { _, _ = cli.Write(msg) }()
-	// Read slowly.
-	out := make([]byte, 0, len(msg))
-	buf := make([]byte, 4096)
-	for len(out) < len(msg) {
-		n, err := srv.Read(buf)
-		out = append(out, buf[:n]...)
-		if err != nil && len(out) < len(msg) {
-			t.Fatalf("read err %v", err)
+		_, p, _ := protocol.ParseFrame(m, 1<<16)
+		off, data, err := protocol.DecodeData(p)
+		if err != nil || off != next {
+			t.Fatalf("frame at %d, want %d (%v)", off, next, err)
 		}
-		time.Sleep(200 * time.Microsecond)
-		cli.mu.Lock()
-		bufLen := len(cli.sendBuf)
-		cli.mu.Unlock()
-		if bufLen > cli.opt.Window+maxSegment {
-			t.Fatalf("send buffer exceeded window: %d > %d", bufLen, cli.opt.Window)
-		}
-	}
-	if !bytes.Equal(out, msg) {
-		t.Fatalf("backpressure transfer mismatch")
+		next += uint64(len(data))
 	}
 }
 
-func TestCloseUnblocksRead(t *testing.T) {
-	f := newFabric(2)
-	cli, srv := pair(t, f)
-	defer cli.Close()
+func TestSendWaitsForWindowAndEndReleasesIt(t *testing.T) {
+	s := New(Options{Limits: testLimits(), Deliver: newSink().deliver, Clock: NewClock(time.Hour)})
+	if err := send(s, randBytes(testLimits().Window)); err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan error, 1)
-	go func() {
-		_, err := srv.Read(make([]byte, 16))
-		done <- err
-	}()
-	time.Sleep(5 * time.Millisecond)
-	srv.Close()
+	go func() { done <- s.Send([]byte("x"), false) }()
 	select {
 	case err := <-done:
-		if err == nil {
-			t.Fatalf("expected error after close")
-		}
-	case <-time.After(time.Second):
-		t.Fatalf("Read did not unblock on Close")
+		t.Fatalf("send past the window returned %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := s.Send([]byte("control"), true); err != nil {
+		t.Fatalf("control send waited or failed: %v", err)
+	}
+	s.End("test over")
+	if err := <-done; !errors.Is(err, ErrEnded) {
+		t.Fatalf("blocked send returned %v, want ErrEnded", err)
 	}
 }
 
-// guard: crc helper is exercised (keeps import honest if the frame file changes).
-var _ = crc32.ChecksumIEEE
+// When every link dies at once, both sides end the session within their dead times.
+func TestAllLinksDeadEndsBothSides(t *testing.T) {
+	h := newHarness(t, 2, testLimits())
+	h.redial.Store(false)
+	for _, p := range h.pol {
+		p.blackhole.Store(true)
+	}
+	for range 2 {
+		select {
+		case why := <-h.ended:
+			t.Log(why)
+		case <-time.After(2 * time.Second):
+			t.Fatal("a side did not end the session")
+		}
+	}
+	if err := h.cli.Send([]byte("x"), false); !errors.Is(err, ErrEnded) {
+		t.Fatalf("send after the end returned %v", err)
+	}
+}
+
+func TestGoodbyeEndsThePeer(t *testing.T) {
+	h := newHarness(t, 2, testLimits())
+	h.redial.Store(false)
+	h.cli.Goodbye("client shutting down")
+	for range 2 {
+		select {
+		case why := <-h.ended:
+			t.Log(why)
+		case <-time.After(time.Second):
+			t.Fatal("goodbye did not end both sides")
+		}
+	}
+}
+
+// ACKs that never come back on a link, while pings are answered, trip the progress rule.
+func TestProgressRuleDropsALinkWithoutAcks(t *testing.T) {
+	h := newHarness(t, 1, testLimits())
+	h.redial.Store(false)
+	h.pol[0].dropAcks.Store(true)
+	start := time.Now()
+	if err := send(h.cli, []byte("needs an ack")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case why := <-h.ended:
+		if d := time.Since(start); d > 500*time.Millisecond {
+			t.Fatalf("ended after %v: %s", d, why)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("link without acks survived")
+	}
+}
+
+func TestStatsCountsLinksAndBytes(t *testing.T) {
+	h := newHarness(t, 3, testLimits())
+	msg := randBytes(64 << 10)
+	go func() { _ = send(h.cli, msg) }()
+	expect(t, h.sin, msg)
+	st := h.cli.Stats()
+	if len(st.Links) != 3 || st.SendNext != uint64(len(msg)) {
+		t.Fatalf("stats %+v", st)
+	}
+	for _, l := range st.Links {
+		if l.BytesOut < int64(len(msg)) || time.Since(l.LastByte) > time.Second {
+			t.Fatalf("link stats %+v", l)
+		}
+	}
+}
