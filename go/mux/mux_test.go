@@ -1,310 +1,302 @@
-package multipath
+// Tests for the mux over an in-memory transport that feeds each side's frames to the other in order,
+// one goroutine per direction: stream round trips, concurrency, independence, reset, credit on both
+// the sending and the receiving side, the stream limit, id rules, and splicing to a TCP target.
+package mux
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/micro-teams/multipath/go/protocol"
 )
 
-// pipeTransport is an in-memory io.ReadWriteCloser pair for testing the mux without a network.
-type pipeTransport struct {
-	rd *io.PipeReader
-	wr *io.PipeWriter
+// pipe is one direction of the in-memory transport; sends after close fail like a dead session.
+type pipe struct {
+	mu     sync.Mutex
+	ch     chan []byte
+	closed bool
 }
 
-func newPipePair() (a, b *pipeTransport) {
-	ar, bw := io.Pipe()
-	br, aw := io.Pipe()
-	return &pipeTransport{rd: ar, wr: aw}, &pipeTransport{rd: br, wr: bw}
+func newPipe() *pipe { return &pipe{ch: make(chan []byte, 1<<14)} }
+
+func (p *pipe) Send(f []byte, _ bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return io.ErrClosedPipe
+	}
+	p.ch <- append([]byte(nil), f...)
+	return nil
 }
 
-func (t *pipeTransport) Read(p []byte) (int, error)  { return t.rd.Read(p) }
-func (t *pipeTransport) Write(p []byte) (int, error) { return t.wr.Write(p) }
-func (t *pipeTransport) Close() error                { t.rd.Close(); return t.wr.Close() }
-
-func muxPair(t *testing.T) (*Session, *Session) {
-	t.Helper()
-	a, b := newPipePair()
-	return NewClientSession(a), NewServerSession(b)
+func (p *pipe) close() {
+	p.mu.Lock()
+	p.closed = true
+	close(p.ch)
+	p.mu.Unlock()
 }
 
-func TestMuxSingleStreamRoundTrip(t *testing.T) {
-	cli, srv := muxPair(t)
-	defer cli.Close()
-	defer srv.Close()
-
-	go func() {
-		st, err := srv.AcceptStream()
-		if err != nil {
+func pump(t *testing.T, p *pipe, to *Mux, errs chan<- error) {
+	for f := range p.ch {
+		if err := to.Feed(f); err != nil {
+			t.Errorf("feed: %v", err)
+			errs <- err
 			return
 		}
-		io.Copy(st, st) // echo
-		st.Close()
-	}()
+	}
+}
 
-	st, err := cli.OpenStream()
+func testLimits() protocol.Limits {
+	l := protocol.DefaultLimits()
+	l.StreamWindow = 64 << 10
+	l.MaxStreams = 64
+	return l
+}
+
+// pair returns a client mux and a server mux whose accepted streams arrive on the channel.
+func pair(t *testing.T, lim protocol.Limits) (*Mux, chan *Stream, chan error) {
+	c2s, s2c := newPipe(), newPipe()
+	accepted := make(chan *Stream, 128)
+	errs := make(chan error, 2)
+	cli := New(c2s, true, lim, nil)
+	srv := New(s2c, false, lim, func(st *Stream) { accepted <- st })
+	go pump(t, c2s, srv, errs)
+	go pump(t, s2c, cli, errs)
+	t.Cleanup(func() { c2s.close(); s2c.close(); cli.Close("test over"); srv.Close("test over") })
+	return cli, accepted, errs
+}
+
+func echo(st *Stream) { _, _ = io.Copy(st, st); _ = st.Close() } // the test checks what the client reads
+
+func randBytes(n int) []byte {
+	b := make([]byte, n)
+	_, _ = rand.Read(b) // crypto/rand does not fail on supported platforms
+	return b
+}
+
+func TestSingleStreamRoundTrip(t *testing.T) {
+	cli, accepted, _ := pair(t, testLimits())
+	go func() { echo(<-accepted) }()
+	st, err := cli.Open()
 	if err != nil {
-		t.Fatalf("open: %v", err)
+		t.Fatal(err)
 	}
 	msg := []byte("hello multiplexed world")
 	if _, err := st.Write(msg); err != nil {
-		t.Fatalf("write: %v", err)
+		t.Fatal(err)
 	}
-	st.Close() // half-close so the echo copy ends
-	got, _ := io.ReadAll(st)
-	if !bytes.Equal(got, msg) {
-		t.Fatalf("echo mismatch: %q", got)
+	_ = st.Close()
+	if got, _ := io.ReadAll(st); !bytes.Equal(got, msg) {
+		t.Fatalf("echo %q", got)
 	}
 }
 
-func TestMuxManyConcurrentStreams(t *testing.T) {
-	cli, srv := muxPair(t)
-	defer cli.Close()
-	defer srv.Close()
-
-	// Server echoes every accepted stream.
+func TestManyConcurrentStreams(t *testing.T) {
+	cli, accepted, _ := pair(t, testLimits())
 	go func() {
-		for {
-			st, err := srv.AcceptStream()
-			if err != nil {
-				return
-			}
-			go func(st *MuxStream) {
-				io.Copy(st, st)
-				st.Close()
-			}(st)
+		for st := range accepted {
+			go echo(st)
 		}
 	}()
-
-	const n = 50
 	var wg sync.WaitGroup
-	errs := make(chan error, n)
-	for i := 0; i < n; i++ {
+	errs := make(chan error, 50)
+	for i := range 50 {
 		wg.Add(1)
-		go func(i int) {
+		go func() {
 			defer wg.Done()
-			st, err := cli.OpenStream()
+			st, err := cli.Open()
 			if err != nil {
 				errs <- err
 				return
 			}
-			// A distinct, larger-than-one-chunk payload per stream, so interleaving and flow
-			// control are actually exercised.
-			payload := []byte(fmt.Sprintf("stream-%d:", i))
-			payload = append(payload, randBytes(40*1024)...)
-			go func() { st.Write(payload); st.Close() }()
-			got, _ := io.ReadAll(st)
-			if !bytes.Equal(got, payload) {
-				errs <- fmt.Errorf("stream %d mismatch (%d bytes)", i, len(got))
+			payload := append([]byte(fmt.Sprintf("stream-%d:", i)), randBytes(200<<10)...)
+			go func() { _, _ = st.Write(payload); _ = st.Close() }() // a failed write shows as a mismatch
+			if got, _ := io.ReadAll(st); !bytes.Equal(got, payload) {
+				errs <- fmt.Errorf("stream %d: %d of %d bytes", i, len(got), len(payload))
 			}
-		}(i)
+		}()
 	}
 	wg.Wait()
 	close(errs)
 	for err := range errs {
-		t.Fatal(err)
+		t.Error(err)
 	}
 }
 
-func TestMuxStreamsAreIndependent(t *testing.T) {
-	cli, srv := muxPair(t)
-	defer cli.Close()
-	defer srv.Close()
-
-	accepted := make(chan *MuxStream, 2)
-	go func() {
-		for {
-			st, err := srv.AcceptStream()
-			if err != nil {
-				return
-			}
-			accepted <- st
-		}
-	}()
-
-	a, _ := cli.OpenStream()
-	b, _ := cli.OpenStream()
-	sa := <-accepted
-	sb := <-accepted
-
-	// Write on b, read on b — a stays idle and must not interfere.
-	if _, err := b.Write([]byte("on-b")); err != nil {
-		t.Fatalf("write b: %v", err)
-	}
+func TestStreamsAreIndependent(t *testing.T) {
+	cli, accepted, _ := pair(t, testLimits())
+	a, _ := cli.Open()
+	b, _ := cli.Open()
+	sa, sb := <-accepted, <-accepted
+	// a's peer never reads; b must still flow.
+	go func() { _, _ = a.Write(randBytes(1 << 20)) }() // blocks on credit, which is the point
 	buf := make([]byte, 4)
-	if _, err := io.ReadFull(sb, buf); err != nil || string(buf) != "on-b" {
-		t.Fatalf("read sb: %q %v", buf, err)
+	for range 100 {
+		if _, err := b.Write([]byte("on-b")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(sb, buf); err != nil || string(buf) != "on-b" {
+			t.Fatalf("read b: %q %v", buf, err)
+		}
 	}
-	// Now a.
-	if _, err := a.Write([]byte("on-a")); err != nil {
-		t.Fatalf("write a: %v", err)
-	}
-	if _, err := io.ReadFull(sa, buf); err != nil || string(buf) != "on-a" {
-		t.Fatalf("read sa: %q %v", buf, err)
-	}
-	_ = a
-	_ = b
+	_ = sa
 }
 
-func TestMuxReset(t *testing.T) {
-	cli, srv := muxPair(t)
-	defer cli.Close()
-	defer srv.Close()
-
-	accepted := make(chan *MuxStream, 1)
-	go func() {
-		st, err := srv.AcceptStream()
-		if err == nil {
-			accepted <- st
-		}
-	}()
-	st, _ := cli.OpenStream()
+func TestResetReachesThePeerWithItsReason(t *testing.T) {
+	cli, accepted, _ := pair(t, testLimits())
+	st, _ := cli.Open()
 	peer := <-accepted
-	st.Reset()
-	// The peer's next read must fail (reset), not hang.
-	done := make(chan error, 1)
-	go func() { _, err := peer.Read(make([]byte, 8)); done <- err }()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatalf("expected error after reset")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("read did not unblock after reset")
+	_ = st.Reset("going away")
+	if _, err := peer.Read(make([]byte, 8)); err == nil || !strings.Contains(err.Error(), "going away") {
+		t.Fatalf("peer read after reset: %v", err)
 	}
 }
 
-func TestMuxFlowControlBounded(t *testing.T) {
-	cli, srv := muxPair(t)
-	defer cli.Close()
-	defer srv.Close()
-
-	accepted := make(chan *MuxStream, 1)
-	go func() {
-		st, err := srv.AcceptStream()
-		if err == nil {
-			accepted <- st
-		}
-	}()
-	st, _ := cli.OpenStream()
+func TestWriterWaitsForCredit(t *testing.T) {
+	cli, accepted, _ := pair(t, testLimits())
+	st, _ := cli.Open()
 	peer := <-accepted
-
-	// The writer must not be able to push more than one window ahead of a non-reading peer.
-	// Write a lot in the background; with the peer not reading, Write should block after ~1 window.
 	wrote := make(chan int, 1)
-	go func() {
-		big := randBytes(4 << 20)
-		n, _ := st.Write(big)
-		wrote <- n
-	}()
-	time.Sleep(200 * time.Millisecond)
+	go func() { n, _ := st.Write(randBytes(1 << 20)); wrote <- n }() // n is checked below
+	time.Sleep(100 * time.Millisecond)
 	select {
 	case n := <-wrote:
-		t.Fatalf("write completed (%d) despite peer not reading — no backpressure", n)
+		t.Fatalf("write of %d bytes completed while the peer read nothing", n)
 	default:
-		// good: still blocked
 	}
-	// Drain the peer; the write should now complete.
-	go io.Copy(io.Discard, peer)
+	go func() { _, _ = io.Copy(io.Discard, peer) }() // drains so the writer can finish
 	select {
 	case <-wrote:
 	case <-time.After(5 * time.Second):
-		t.Fatalf("write never completed after peer drained")
+		t.Fatal("write never completed after the peer drained")
 	}
 }
 
-// TestMuxOverRedundantTCPUnderFaults is the integration proof: run a mux Session over a real
-// RedundantStream (many TCP links through the fault middlebox), open many concurrent streams, and
-// require every stream's echo to be byte-exact despite black-hole / one-way / disconnect cuts.
-func TestMuxOverRedundantTCPUnderFaults(t *testing.T) {
-	const nLinks = 3
-	srvLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer srvLn.Close()
-	acc := Listen(srvLn, RedundantOptions{
-		N: nLinks, Window: 2 << 20,
-		PingInterval: 20 * time.Millisecond, DeadAfter: 80 * time.Millisecond, AckInterval: 8 * time.Millisecond,
-	})
-	boxes := make([]*middlebox, nLinks)
-	for i := 0; i < nLinks; i++ {
-		boxes[i] = newMiddlebox(t, srvLn.Addr().String(), int64(5000+i))
-		defer boxes[i].close()
-	}
-
-	cliRS, err := DialRedundant(context.Background(), RedundantOptions{
-		N: nLinks, Window: 2 << 20,
-		PingInterval: 20 * time.Millisecond, DeadAfter: 80 * time.Millisecond, AckInterval: 8 * time.Millisecond,
-		ReconnectDelay: 5 * time.Millisecond, MaxDelay: 40 * time.Millisecond,
-		Dial: func(ctx context.Context, i int) (io.ReadWriteCloser, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "tcp", boxes[i].addr())
-		},
-	})
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer cliRS.Close()
-	srvRS, err := acc.Accept()
-	if err != nil {
-		t.Fatalf("accept: %v", err)
-	}
-	defer srvRS.Close()
-
-	cliSess := NewClientSession(cliRS)
-	srvSess := NewServerSession(srvRS)
-	defer cliSess.Close()
-	defer srvSess.Close()
-
-	// Server: echo every stream.
-	go func() {
-		for {
-			st, err := srvSess.AcceptStream()
-			if err != nil {
-				return
-			}
-			go func(st *MuxStream) { io.Copy(st, st); st.Close() }(st)
-		}
-	}()
-
-	const nStreams = 20
-	var wg sync.WaitGroup
-	errs := make(chan error, nStreams)
-	for i := 0; i < nStreams; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			st, err := cliSess.OpenStream()
-			if err != nil {
-				errs <- err
-				return
-			}
-			payload := append([]byte(fmt.Sprintf("s%02d:", i)), randBytes(64*1024)...)
-			go func() { st.Write(payload); st.Close() }()
-			got, _ := io.ReadAll(st)
-			if !bytes.Equal(got, payload) {
-				errs <- fmt.Errorf("stream %d mismatch: got %d/%d bytes", i, len(got), len(payload))
-			}
-		}(i)
-	}
-	done := make(chan struct{})
-	go func() { wg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(60 * time.Second):
-		t.Fatalf("mux-over-redundant under faults timed out")
-	}
-	close(errs)
-	for err := range errs {
+// A sender that ignores credit is caught by the receiver.
+func TestReceiverEnforcesCredit(t *testing.T) {
+	srv := New(newPipe(), false, testLimits(), func(*Stream) {})
+	if err := srv.Feed(protocol.EncodeMux(protocol.MuxSyn, 1, nil)); err != nil {
 		t.Fatal(err)
 	}
+	chunk := protocol.EncodeMux(protocol.MuxData, 1, make([]byte, protocol.MaxMuxData))
+	var err error
+	for i := 0; err == nil && i < 10; i++ {
+		err = srv.Feed(chunk)
+	}
+	if err == nil || !strings.Contains(err.Error(), "credit") {
+		t.Fatalf("want a credit violation, got %v", err)
+	}
 }
 
-var _ = rand.Read
+func TestStreamLimitResetsTheExtraStream(t *testing.T) {
+	lim := testLimits()
+	lim.MaxStreams = 2
+	out := newPipe()
+	srv := New(out, false, lim, func(*Stream) {})
+	for id := uint32(1); id <= 5; id += 2 {
+		if err := srv.Feed(protocol.EncodeMux(protocol.MuxSyn, id, nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f, _, _ := protocol.ParseMux(<-out.ch)
+	if f.Type != protocol.MuxRst || f.Stream != 5 || string(f.Body) != "too many streams" {
+		t.Fatalf("got %+v", f)
+	}
+}
+
+func TestStreamIDRules(t *testing.T) {
+	for name, feed := range map[string][]uint32{"even id": {2}, "id not increasing": {3, 1}, "id repeated": {1, 1}} {
+		srv := New(newPipe(), false, testLimits(), func(*Stream) {})
+		var err error
+		for _, id := range feed {
+			if err == nil {
+				err = srv.Feed(protocol.EncodeMux(protocol.MuxSyn, id, nil))
+			}
+		}
+		if err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	cli := New(newPipe(), true, testLimits(), nil)
+	if err := cli.Feed(protocol.EncodeMux(protocol.MuxSyn, 1, nil)); err == nil {
+		t.Error("client accepted a syn")
+	}
+}
+
+func TestFeedAcceptsAnySplit(t *testing.T) {
+	got := make(chan *Stream, 1)
+	srv := New(newPipe(), false, testLimits(), func(st *Stream) { got <- st })
+	all := append(protocol.EncodeMux(protocol.MuxSyn, 1, nil), protocol.EncodeMux(protocol.MuxData, 1, []byte("abc"))...)
+	all = append(all, protocol.EncodeMux(0x7f, 1, []byte("unknown type"))...)
+	for _, b := range all {
+		if err := srv.Feed([]byte{b}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := <-got
+	buf := make([]byte, 3)
+	if _, err := io.ReadFull(st, buf); err != nil || string(buf) != "abc" {
+		t.Fatalf("read %q %v", buf, err)
+	}
+}
+
+func TestCloseFailsEveryStream(t *testing.T) {
+	cli, _, _ := pair(t, testLimits())
+	st, _ := cli.Open()
+	cli.Close("all links are dead")
+	if _, err := st.Read(make([]byte, 1)); err == nil || !strings.Contains(err.Error(), "all links are dead") {
+		t.Fatalf("read after close: %v", err)
+	}
+	if _, err := cli.Open(); err == nil {
+		t.Fatal("open after close succeeded")
+	}
+}
+
+// Splice carries a request and its answer between a stream and a TCP target, with half-close.
+func TestSpliceToTCP(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		req, _ := io.ReadAll(c) // the reply below shows what arrived
+		_, _ = c.Write(append([]byte("got "), req...))
+		_ = c.Close()
+	}()
+	cli, accepted, _ := pair(t, testLimits())
+	spliced := make(chan error, 1)
+	go func() {
+		st := <-accepted
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			spliced <- err
+			return
+		}
+		spliced <- Splice(st, c)
+	}()
+	st, _ := cli.Open()
+	_, _ = st.Write([]byte("request"))
+	_ = st.Close()
+	got, _ := io.ReadAll(st)
+	if string(got) != "got request" {
+		t.Fatalf("got %q", got)
+	}
+	if err := <-spliced; err != nil {
+		t.Fatalf("splice: %v", err)
+	}
+	if n := len(cli.Streams()); n != 0 {
+		t.Fatalf("%d streams left open", n)
+	}
+}

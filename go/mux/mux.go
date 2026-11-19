@@ -1,35 +1,39 @@
-// Stream multiplexing over one reliable transport: carry many independent logical connections
-// ("streams") over a single io.ReadWriteCloser — in practice a RedundantStream, so a machine holds
-// ONE bundle of N redundant links and multiplexes all of its connections over it, instead of paying
-// N links per connection.
+// Package mux carries many streams over one session (PROTOCOL.md section 6): SYN opens a stream,
+// DATA carries its bytes, FIN half-closes it, RST aborts it, and WINDOW returns credit. Every stream
+// has its own credit window in each direction, enforced by the receiver, so one stream can neither
+// starve the others nor make the receiver buffer without bound.
 //
-// This is the missing half of the redundant primitive: the redundant stream gives you one
-// never-interrupted ordered byte pipe; the mux Session gives you as many independent
-// io.ReadWriteCloser streams as you want on top of it. A yamux/smux/HTTP-2-style design: SYN opens a
-// stream, DATA carries bytes, FIN half-closes, RST aborts, and a per-stream credit window
-// (WINDOW_UPDATE) provides flow control so one stream can neither starve the others nor buffer
-// without bound. DATA is chunked so a long write cannot monopolise the shared transport.
+// The mux never blocks the session's reader: Feed only appends to stream buffers and sends control
+// frames, which the session never makes wait. A stream's Write waits for credit and for the session
+// window, in the writer's own goroutine. Streams share the session's one ordered byte stream, so a
+// stalled session stalls all of them together; that is the price of the bounded link count, and the
+// session is built not to stall.
 //
-// Session-level ordering caveat, stated plainly: the streams share one underlying ordered byte
-// stream, so a stalled transport blocks all of them together (head-of-line coupling, like HTTP/2
-// over TCP). That is the deliberate trade for a bounded link count; it is fine when the payload is
-// small and the transport is a redundant stream that rarely stalls.
+//   - Transport is what the mux writes to; *session.Session implements it.
 //
-// Wire framing over the transport (all integers big-endian), identical in Go and JVM:
+//   - New(t, client, lim, onStream) creates a mux. Only the client opens streams. On the server,
+//     onStream is called for each stream the client opens; it must not block (start a goroutine).
+//     Beyond lim.MaxStreams open streams, a new one is reset with "too many streams".
 //
-//	type:u8 | streamID:u32 | length:u32 | payload[length]
+//   - (*Mux).Feed(p) consumes in-order session bytes; it returns an error for a protocol violation,
+//     which ends the session.
 //
-//	SYN           0x01  length 0            open streamID
-//	DATA          0x02  length n            n bytes for streamID
-//	FIN           0x03  length 0            no more data from this side of streamID
-//	RST           0x04  length n            abort streamID immediately; payload (if any) is a UTF-8
-//	                                         reason the peer surfaces on read (e.g. "unknown service")
-//	WINDOW_UPDATE 0x05  length 4            grant streamID this many more bytes of send credit
+//   - (*Mux).Open() opens a stream (client only).
 //
-// Stream IDs: the client (session opener) uses odd IDs, the server uses even, so both may open
-// without colliding.
-
-package multipath
+//   - (*Mux).Close(why) fails every stream at once; the owner calls it when the session ends.
+//
+//   - (*Mux).Streams() is a snapshot of the open streams, for status pages.
+//
+//   - *Stream is an io.ReadWriteCloser: Read returns bytes in order and returns credit as they are
+//     consumed; Write waits for credit; Close sends FIN (reads continue until the peer's FIN);
+//     Reset(why) aborts both directions and tells the peer why.
+//
+//   - Splice(st, conn) (splice.go) relays a stream and a TCP connection until both are done.
+//
+//     m := mux.New(sess, true, protocol.DefaultLimits(), nil)
+//     st, err := m.Open()
+//     _, err = st.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
+package mux
 
 import (
 	"encoding/binary"
@@ -37,318 +41,274 @@ import (
 	"fmt"
 	"io"
 	"sync"
+
+	"github.com/micro-teams/multipath/go/protocol"
 )
 
-const (
-	muxSyn    = 0x01
-	muxData   = 0x02
-	muxFin    = 0x03
-	muxRst    = 0x04
-	muxWindow = 0x05
+// ErrClosed is returned once the mux has closed and no reason is known.
+var ErrClosed = errors.New("multipath: mux closed")
 
-	muxHdrLen    = 1 + 4 + 4
-	muxMaxChunk  = 16 * 1024  // max DATA payload per frame — bounds one stream's grab of the transport
-	muxDefWindow = 256 * 1024 // per-stream receive window
-)
-
-// ErrSessionClosed is returned once the session (or its transport) is gone.
-var ErrSessionClosed = errors.New("multipath: mux session closed")
-
-// ErrStreamReset is returned to the peer of a stream that was RST.
-var ErrStreamReset = errors.New("multipath: stream reset")
-
-// Session multiplexes many Streams over one transport.
-type Session struct {
-	transport io.ReadWriteCloser
-	client    bool
-
-	wmu sync.Mutex // serialises frame writes to the transport
-
-	mu       sync.Mutex
-	streams  map[uint32]*MuxStream
-	nextID   uint32
-	accept   chan *MuxStream
-	closed   bool
-	closeErr error
+// Transport carries mux frames; control frames must never wait.
+type Transport interface {
+	Send(frame []byte, control bool) error
 }
 
-// NewClientSession and NewServerSession wrap a transport (e.g. a *RedundantStream). The two ends must
-// agree on who is client — the client opens odd stream IDs, the server even.
-func NewClientSession(transport io.ReadWriteCloser) *Session { return newSession(transport, true) }
-func NewServerSession(transport io.ReadWriteCloser) *Session { return newSession(transport, false) }
+// Mux multiplexes streams over one Transport.
+type Mux struct {
+	t        Transport
+	client   bool
+	window   int
+	max      int
+	onStream func(*Stream)
 
-func newSession(transport io.ReadWriteCloser, client bool) *Session {
-	s := &Session{
-		transport: transport,
-		client:    client,
-		streams:   make(map[uint32]*MuxStream),
-		accept:    make(chan *MuxStream, 64),
-	}
-	if client {
-		s.nextID = 1
-	} else {
-		s.nextID = 2
-	}
-	go s.readLoop()
-	return s
+	openMu  sync.Mutex
+	mu      sync.Mutex
+	streams map[uint32]*Stream
+	nextID  uint32 // client: the next id to open
+	lastID  uint32 // server: the highest id opened by the peer
+	err     error  // set once the mux is closed
+	buf     []byte // a partial frame carried over between Feed calls
 }
 
-// OpenStream opens a new outbound stream.
-func (s *Session) OpenStream() (*MuxStream, error) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return nil, s.err()
+// New creates a mux over t.
+func New(t Transport, client bool, lim protocol.Limits, onStream func(*Stream)) *Mux {
+	return &Mux{t: t, client: client, window: lim.StreamWindow, max: lim.MaxStreams, onStream: onStream,
+		streams: make(map[uint32]*Stream), nextID: 1}
+}
+
+// Open opens a stream.
+func (m *Mux) Open() (*Stream, error) {
+	if !m.client {
+		return nil, errors.New("multipath: only the client opens streams")
 	}
-	id := s.nextID
-	s.nextID += 2
-	st := newMuxStream(s, id)
-	s.streams[id] = st
-	s.mu.Unlock()
-	if err := s.writeFrame(muxSyn, id, nil); err != nil {
-		s.removeStream(id)
+	// Ids must reach the server in increasing order, so allocating one and sending its SYN happen
+	// under one lock. It is not mu, which the session's end takes through Close.
+	m.openMu.Lock()
+	defer m.openMu.Unlock()
+	m.mu.Lock()
+	if m.err != nil {
+		m.mu.Unlock()
+		return nil, m.err
+	}
+	st := newStream(m, m.nextID)
+	m.nextID += 2
+	m.streams[st.id] = st
+	m.mu.Unlock()
+	if err := m.t.Send(protocol.EncodeMux(protocol.MuxSyn, st.id, nil), true); err != nil {
+		m.remove(st.id)
 		return nil, err
 	}
 	return st, nil
 }
 
-// AcceptStream returns the next inbound stream opened by the peer.
-func (s *Session) AcceptStream() (*MuxStream, error) {
-	st, ok := <-s.accept
-	if !ok {
-		return nil, s.err()
+// Close fails every stream with why.
+func (m *Mux) Close(why string) {
+	m.mu.Lock()
+	if m.err != nil {
+		m.mu.Unlock()
+		return
 	}
-	return st, nil
-}
-
-// Close tears down the session, its transport, and every stream.
-func (s *Session) Close() error {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return nil
-	}
-	s.closed = true
-	if s.closeErr == nil {
-		s.closeErr = ErrSessionClosed
-	}
-	streams := make([]*MuxStream, 0, len(s.streams))
-	for _, st := range s.streams {
-		streams = append(streams, st)
-	}
-	close(s.accept)
-	s.mu.Unlock()
+	m.err = fmt.Errorf("multipath: session ended: %s", why)
+	streams := m.streams
+	m.streams = map[uint32]*Stream{}
+	m.mu.Unlock()
 	for _, st := range streams {
-		st.shutdown(ErrSessionClosed)
+		st.fail(m.err)
 	}
-	return s.transport.Close()
 }
 
-func (s *Session) err() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closeErr != nil {
-		return s.closeErr
-	}
-	return ErrSessionClosed
+func (m *Mux) remove(id uint32) {
+	m.mu.Lock()
+	delete(m.streams, id)
+	m.mu.Unlock()
 }
 
-func (s *Session) removeStream(id uint32) {
-	s.mu.Lock()
-	delete(s.streams, id)
-	s.mu.Unlock()
+func (m *Mux) get(id uint32) *Stream {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.streams[id]
 }
 
-func (s *Session) writeFrame(typ byte, id uint32, payload []byte) error {
-	hdr := make([]byte, muxHdrLen)
-	hdr[0] = typ
-	binary.BigEndian.PutUint32(hdr[1:], id)
-	binary.BigEndian.PutUint32(hdr[5:], uint32(len(payload)))
-	s.wmu.Lock()
-	defer s.wmu.Unlock()
-	if s.isClosed() {
-		return s.err()
-	}
-	if _, err := s.transport.Write(hdr); err != nil {
-		return err
-	}
-	if len(payload) > 0 {
-		if _, err := s.transport.Write(payload); err != nil {
+// Feed consumes in-order session bytes.
+func (m *Mux) Feed(p []byte) error {
+	m.buf = append(m.buf, p...)
+	for {
+		f, n, err := protocol.ParseMux(m.buf)
+		if err != nil {
 			return err
 		}
+		if n == 0 {
+			// Keep only the partial frame, so the buffer never holds more than one frame.
+			m.buf = append(m.buf[:0:0], m.buf...)
+			return nil
+		}
+		if err := m.handle(f); err != nil {
+			return err
+		}
+		m.buf = m.buf[n:]
 	}
+}
+
+func (m *Mux) handle(f protocol.MuxFrame) error {
+	switch f.Type {
+	case protocol.MuxSyn:
+		return m.onSyn(f.Stream)
+	case protocol.MuxData:
+		if len(f.Body) == 0 || len(f.Body) > protocol.MaxMuxData {
+			return fmt.Errorf("mux data of %d bytes on stream %d", len(f.Body), f.Stream)
+		}
+		if st := m.get(f.Stream); st != nil {
+			return st.deliver(f.Body)
+		}
+	case protocol.MuxFin:
+		if st := m.get(f.Stream); st != nil {
+			st.remoteFin()
+		}
+	case protocol.MuxRst:
+		why, err := protocol.DecodeReason(f.Body)
+		if err != nil {
+			return err
+		}
+		if st := m.get(f.Stream); st != nil {
+			msg := "multipath: stream reset by peer"
+			if why != "" {
+				msg += ": " + why
+			}
+			st.fail(errors.New(msg))
+			m.remove(f.Stream)
+		}
+	case protocol.MuxWindow:
+		if len(f.Body) != 4 {
+			return fmt.Errorf("mux window of %d bytes on stream %d", len(f.Body), f.Stream)
+		}
+		if st := m.get(f.Stream); st != nil {
+			return st.grant(binary.BigEndian.Uint32(f.Body))
+		}
+	}
+	// Frames for a stream that is already gone are dropped (they crossed our RST), and unknown
+	// types are skipped: later versions may add them.
 	return nil
 }
 
-func (s *Session) isClosed() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.closed
+func (m *Mux) onSyn(id uint32) error {
+	if m.client {
+		return fmt.Errorf("mux syn %d from the server", id)
+	}
+	m.mu.Lock()
+	if id%2 == 0 || id <= m.lastID {
+		m.mu.Unlock()
+		return fmt.Errorf("mux syn %d after %d", id, m.lastID)
+	}
+	m.lastID = id
+	if m.err != nil {
+		m.mu.Unlock()
+		return nil
+	}
+	if len(m.streams) >= m.max {
+		m.mu.Unlock()
+		return m.t.Send(protocol.EncodeMux(protocol.MuxRst, id, []byte("too many streams")), true)
+	}
+	st := newStream(m, id)
+	m.streams[id] = st
+	m.mu.Unlock()
+	m.onStream(st)
+	return nil
 }
 
-// readLoop demultiplexes frames off the transport into per-stream buffers.
-func (s *Session) readLoop() {
-	var hdr [muxHdrLen]byte
-	for {
-		if _, err := io.ReadFull(s.transport, hdr[:]); err != nil {
-			s.fail(err)
-			return
-		}
-		typ := hdr[0]
-		id := binary.BigEndian.Uint32(hdr[1:])
-		n := binary.BigEndian.Uint32(hdr[5:])
-		var payload []byte
-		if n > 0 {
-			payload = make([]byte, n)
-			if _, err := io.ReadFull(s.transport, payload); err != nil {
-				s.fail(err)
-				return
-			}
-		}
-		switch typ {
-		case muxSyn:
-			s.onSyn(id)
-		case muxData:
-			s.onData(id, payload)
-		case muxFin:
-			if st := s.getStream(id); st != nil {
-				st.remoteFin()
-			}
-		case muxRst:
-			if st := s.getStream(id); st != nil {
-				err := ErrStreamReset
-				if len(payload) > 0 {
-					err = fmt.Errorf("multipath: stream reset: %s", payload)
-				}
-				st.shutdown(err)
-				s.removeStream(id)
-			}
-		case muxWindow:
-			if st := s.getStream(id); st != nil && len(payload) == 4 {
-				st.grantSend(binary.BigEndian.Uint32(payload))
-			}
-		}
-	}
+// StreamStat is one stream in a Streams snapshot.
+type StreamStat struct {
+	ID         uint32
+	BytesIn    int64 // bytes received
+	BytesOut   int64 // bytes sent
+	Buffered   int   // received bytes not yet read
+	SendCredit int   // bytes the peer still accepts
 }
 
-func (s *Session) onSyn(id uint32) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return
-	}
-	if _, exists := s.streams[id]; exists {
-		s.mu.Unlock()
-		return
-	}
-	st := newMuxStream(s, id)
-	s.streams[id] = st
-	s.mu.Unlock()
-	select {
-	case s.accept <- st:
-	default:
-		// Accept backlog full: refuse the stream rather than block the read loop.
-		s.removeStream(id)
-		_ = s.writeFrame(muxRst, id, nil)
-	}
-}
-
-func (s *Session) onData(id uint32, payload []byte) {
-	st := s.getStream(id)
-	if st == nil {
-		return // unknown/closed stream — drop
-	}
-	st.deliver(payload)
-}
-
-func (s *Session) getStream(id uint32) *MuxStream {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.streams[id]
-}
-
-func (s *Session) fail(err error) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return
-	}
-	s.closed = true
-	s.closeErr = err
-	streams := make([]*MuxStream, 0, len(s.streams))
-	for _, st := range s.streams {
+// Streams returns a snapshot of the open streams.
+func (m *Mux) Streams() []StreamStat {
+	m.mu.Lock()
+	streams := make([]*Stream, 0, len(m.streams))
+	for _, st := range m.streams {
 		streams = append(streams, st)
 	}
-	close(s.accept)
-	s.mu.Unlock()
+	m.mu.Unlock()
+	out := make([]StreamStat, 0, len(streams))
 	for _, st := range streams {
-		st.shutdown(err)
+		st.mu.Lock()
+		out = append(out, StreamStat{ID: st.id, BytesIn: st.bytesIn, BytesOut: st.bytesOut, Buffered: len(st.inbox), SendCredit: st.sendCredit})
+		st.mu.Unlock()
 	}
-	_ = s.transport.Close()
+	return out
 }
 
-// MuxStream is one logical connection within a Session. It implements io.ReadWriteCloser.
-type MuxStream struct {
-	sess *Session
-	id   uint32
+// Stream is one stream of a mux.
+type Stream struct {
+	m  *Mux
+	id uint32
 
-	mu        sync.Mutex
-	readable  *sync.Cond
-	writable  *sync.Cond
-	inbox     []byte
-	sendWin   int   // credit the peer has granted us (starts at the default receive window)
-	remoteEOF bool  // peer sent FIN
-	localFIN  bool  // we sent FIN
-	err       error // set on reset/session failure
-	closed    bool
+	mu         sync.Mutex
+	readable   *sync.Cond
+	writable   *sync.Cond
+	inbox      []byte
+	sendCredit int   // bytes we may still send
+	recvCredit int   // bytes the peer may still send
+	consumed   int   // bytes read but not yet returned as credit
+	remoteFIN  bool  // the peer will send no more
+	localFIN   bool  // we will send no more
+	err        error // set on reset or session end
+	bytesIn    int64
+	bytesOut   int64
 }
 
-func newMuxStream(sess *Session, id uint32) *MuxStream {
-	st := &MuxStream{sess: sess, id: id, sendWin: muxDefWindow}
+func newStream(m *Mux, id uint32) *Stream {
+	st := &Stream{m: m, id: id, sendCredit: m.window, recvCredit: m.window}
 	st.readable = sync.NewCond(&st.mu)
 	st.writable = sync.NewCond(&st.mu)
 	return st
 }
 
-func (st *MuxStream) deliver(p []byte) {
+// ID returns the stream id.
+func (st *Stream) ID() uint32 { return st.id }
+
+func (st *Stream) deliver(p []byte) error {
 	st.mu.Lock()
-	if st.closed || st.err != nil {
-		st.mu.Unlock()
-		return
+	defer st.mu.Unlock()
+	if len(p) > st.recvCredit {
+		return fmt.Errorf("mux stream %d sent %d bytes with %d of credit", st.id, len(p), st.recvCredit)
+	}
+	st.recvCredit -= len(p)
+	if st.err != nil || st.remoteFIN {
+		return nil
 	}
 	st.inbox = append(st.inbox, p...)
+	st.bytesIn += int64(len(p))
 	st.readable.Broadcast()
-	st.mu.Unlock()
+	return nil
 }
 
-func (st *MuxStream) remoteFin() {
+func (st *Stream) grant(n uint32) error {
 	st.mu.Lock()
-	st.remoteEOF = true
-	st.readable.Broadcast()
-	st.mu.Unlock()
-	st.cleanupIfClosed()
+	defer st.mu.Unlock()
+	if int64(st.sendCredit)+int64(n) > 1<<31 {
+		return fmt.Errorf("mux stream %d credit overflow", st.id)
+	}
+	st.sendCredit += int(n)
+	st.writable.Broadcast()
+	return nil
 }
 
-// cleanupIfClosed frees a stream's slot once both sides have half-closed. A cleanly finished stream
-// must not be aborted with RST to reclaim it: the peer may still be draining buffered DATA, and an
-// RST discards it. So both-FIN is the graceful teardown, and Reset stays for the abnormal case only.
-func (st *MuxStream) cleanupIfClosed() {
+func (st *Stream) remoteFin() {
 	st.mu.Lock()
-	done := st.localFIN && st.remoteEOF
+	st.remoteFIN = true
+	done := st.localFIN
+	st.readable.Broadcast()
 	st.mu.Unlock()
 	if done {
-		st.sess.removeStream(st.id)
+		st.m.remove(st.id)
 	}
 }
 
-func (st *MuxStream) grantSend(n uint32) {
-	st.mu.Lock()
-	st.sendWin += int(n)
-	st.writable.Broadcast()
-	st.mu.Unlock()
-}
-
-func (st *MuxStream) shutdown(err error) {
+func (st *Stream) fail(err error) {
 	st.mu.Lock()
 	if st.err == nil {
 		st.err = err
@@ -358,15 +318,15 @@ func (st *MuxStream) shutdown(err error) {
 	st.mu.Unlock()
 }
 
-// Read returns delivered bytes in order, replenishing the peer's send window as data is consumed.
-func (st *MuxStream) Read(p []byte) (int, error) {
+// Read returns received bytes in order, then io.EOF after the peer's FIN.
+func (st *Stream) Read(p []byte) (int, error) {
 	st.mu.Lock()
-	for len(st.inbox) == 0 && st.err == nil && !st.remoteEOF {
+	for len(st.inbox) == 0 && st.err == nil && !st.remoteFIN {
 		st.readable.Wait()
 	}
 	if len(st.inbox) == 0 {
 		err := st.err
-		if err == nil && st.remoteEOF {
+		if err == nil {
 			err = io.EOF
 		}
 		st.mu.Unlock()
@@ -374,39 +334,51 @@ func (st *MuxStream) Read(p []byte) (int, error) {
 	}
 	n := copy(p, st.inbox)
 	st.inbox = st.inbox[n:]
+	st.consumed += n
+	// Credit goes back in batches, or at once when everything has been read, so a request and its
+	// response do not wait on each other and a bulk transfer does not send a WINDOW per read.
+	var grant int
+	if st.consumed >= st.m.window/4 || len(st.inbox) == 0 {
+		grant, st.consumed = st.consumed, 0
+		st.recvCredit += grant
+	}
 	st.mu.Unlock()
-	// Replenish flow-control credit for what we just consumed.
-	_ = st.sess.writeFrame(muxWindow, st.id, u32bytes(uint32(n)))
+	if grant > 0 && !st.finished() {
+		if err := st.m.t.Send(protocol.EncodeMux(protocol.MuxWindow, st.id, binary.BigEndian.AppendUint32(nil, uint32(grant))), true); err != nil {
+			return n, err
+		}
+	}
 	return n, nil
 }
 
-// Write sends bytes, chunked and flow-controlled; blocks while the peer's window is exhausted.
-func (st *MuxStream) Write(p []byte) (int, error) {
+// finished reports whether the peer will send nothing more, so credit is of no use to it.
+func (st *Stream) finished() bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.remoteFIN || st.err != nil
+}
+
+// Write sends p, waiting for credit as needed.
+func (st *Stream) Write(p []byte) (int, error) {
 	total := 0
 	for len(p) > 0 {
 		st.mu.Lock()
-		for st.sendWin == 0 && st.err == nil && !st.closed && !st.localFIN {
+		for st.sendCredit == 0 && st.err == nil && !st.localFIN {
 			st.writable.Wait()
 		}
-		if st.err != nil || st.closed || st.localFIN {
-			e := st.err
-			if e == nil {
-				e = io.ErrClosedPipe
+		if st.err != nil || st.localFIN {
+			err := st.err
+			if err == nil {
+				err = io.ErrClosedPipe
 			}
 			st.mu.Unlock()
-			return total, e
+			return total, err
 		}
-		n := len(p)
-		if n > st.sendWin {
-			n = st.sendWin
-		}
-		if n > muxMaxChunk {
-			n = muxMaxChunk
-		}
-		st.sendWin -= n
+		n := min(len(p), st.sendCredit, protocol.MaxMuxData)
+		st.sendCredit -= n
+		st.bytesOut += int64(n)
 		st.mu.Unlock()
-
-		if err := st.sess.writeFrame(muxData, st.id, p[:n]); err != nil {
+		if err := st.m.t.Send(protocol.EncodeMux(protocol.MuxData, st.id, p[:n]), false); err != nil {
 			return total, err
 		}
 		p = p[n:]
@@ -415,54 +387,30 @@ func (st *MuxStream) Write(p []byte) (int, error) {
 	return total, nil
 }
 
-// Close half-closes the write side (sends FIN). Reads may continue until the peer's FIN/EOF.
-func (st *MuxStream) Close() error {
+// Close sends FIN; the stream is released once the peer has sent FIN too.
+func (st *Stream) Close() error {
 	st.mu.Lock()
-	if st.localFIN || st.closed {
+	if st.localFIN || st.err != nil {
 		st.mu.Unlock()
 		return nil
 	}
 	st.localFIN = true
+	done := st.remoteFIN
 	st.writable.Broadcast()
 	st.mu.Unlock()
-	err := st.sess.writeFrame(muxFin, st.id, nil)
-	st.cleanupIfClosed()
+	err := st.m.t.Send(protocol.EncodeMux(protocol.MuxFin, st.id, nil), true)
+	if done {
+		st.m.remove(st.id)
+	}
 	return err
 }
 
-// Reset aborts the stream immediately in both directions.
-func (st *MuxStream) Reset() error { return st.ResetWithReason("") }
-
-// ResetWithReason aborts the stream and, if reason is non-empty, sends it so the peer's Read returns
-// an error carrying it — the origin uses this to say why it refused a stream (e.g. "unknown
-// service: X") instead of a bare, indistinguishable-from-a-network-drop reset.
-func (st *MuxStream) ResetWithReason(reason string) error {
-	st.mu.Lock()
-	st.closed = true
-	if st.err == nil {
-		if reason != "" {
-			st.err = fmt.Errorf("multipath: stream reset: %s", reason)
-		} else {
-			st.err = ErrStreamReset
-		}
+// Reset aborts the stream in both directions and tells the peer why.
+func (st *Stream) Reset(why string) error {
+	st.fail(errors.New("multipath: stream reset: " + why))
+	st.m.remove(st.id)
+	if len(why) > protocol.MaxReason {
+		why = why[:protocol.MaxReason]
 	}
-	st.readable.Broadcast()
-	st.writable.Broadcast()
-	st.mu.Unlock()
-	st.sess.removeStream(st.id)
-	var payload []byte
-	if reason != "" {
-		r := reason
-		if len(r) > maxHeaderField {
-			r = r[:maxHeaderField]
-		}
-		payload = []byte(r)
-	}
-	return st.sess.writeFrame(muxRst, st.id, payload)
-}
-
-func u32bytes(v uint32) []byte {
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, v)
-	return b
+	return st.m.t.Send(protocol.EncodeMux(protocol.MuxRst, st.id, []byte(why)), true)
 }
