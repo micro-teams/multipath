@@ -25,7 +25,7 @@ server is never an open relay. The wire protocol is defined in [`PROTOCOL.md`](.
 | `go/` packages | `protocol` (frames, limits, line list), `link` (WebSocket links, HTTP proxies), `session` (the redundant byte stream), `mux` (streams with credit), `server`, `client`. |
 | `spec/vectors/` | Encodings of every frame, shared by all implementations. |
 | `conformance/` | A fault-injecting proxy and scenarios that run the real binaries through broken lines and attacks. |
-| `js/` | Legacy: the browser client of protocol version 2, kept buildable until its successor exists. It does not speak version 3. |
+| `js/` | `@micro-teams/multipath`, the JavaScript client for browsers, service workers, React Native and Node: `Client` (HTTP exchanges and WebSockets as streams) and the service worker's line router. |
 
 ## Running the server
 
@@ -103,8 +103,99 @@ curl -H 'Host: example.app' http://127.0.0.1:7000/
 
 The client dials every line and keeps redialling a failed one with backoff (200 ms to 5 s) for the
 whole session. Liveness timings come from the server: the client pings every 0.5 s and drops a
-link that is silent for 1 s, or whose acknowledgements stop for 1 s while it has data in flight.
+link that is silent for 1 s, or whose acknowledgements stop for 3 s while it has data in flight.
+Each stream grants the server 1 MiB of credit, so one download moves up to 1 MiB per round trip.
 When the last link dies, every open stream fails at once and the client starts a new session.
+
+## The JavaScript client
+
+`js/` is the npm package `@micro-teams/multipath` (published to GitHub Packages from release tags).
+It speaks the same protocol as the Go client, inside the program instead of as a local port: a page,
+a service worker or an app holds one `Client`, and every request it sends is one stream of one
+session over every line.
+
+```ts
+import { Client } from '@micro-teams/multipath';
+
+const client = new Client({
+  entry: 'https://example.app', // the line list comes from here, and replaces any earlier one
+  onEvent: (e) => console.log(e), // line up/down, session start/end, router fallbacks
+});
+const res = await client.fetch('/api/items'); // one HTTP/1.1 exchange on a fresh stream
+const ws = await client.openWebSocket('/updates', ['v1']); // a WebSocket on a fresh stream
+console.log(client.stats()); // the same shape as the Go client's /status
+await client.close(); // GOODBYE
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `entry` | (required) | Origin the line list is fetched from. An `https` entry accepts only `https` lines. |
+| `site` | the entry's host | Every line must be on this host or a subdomain of it; `null` allows any host. |
+| `store` | none | Keeps the last list across restarts; it is dialled at once while the fresh list is fetched. |
+| `linkPath`, `linesPath` | the server's defaults | Paths on the lines and on the entry. |
+| `refreshMs` | 10 minutes | Interval of line list refreshes. |
+| `waitMs` | 10 s | How long a request waits for a live session before it fails. |
+| `recvWindow` | 1 MiB | Receive credit of each stream (PROTOCOL.md section 6). |
+| `compression` | `true` | Ask for gzip and decode it with `DecompressionStream`. |
+| `buffered` | `false` | Read each response whole before returning it, for platforms whose `Response` cannot stream. |
+| `log` | `console.info` | One line per event. |
+
+How it behaves:
+
+- `fetch` resolves as soon as the response head arrives and streams the body. The stream is reset
+  as soon as the body is complete or the caller abandons it, so no request holds a stream, or the
+  server a target connection, beyond its answer. The request side is not half-closed after the
+  request: nginx takes a client's half-close for an abort and answers a proxied request with 499.
+- With `compression`, a request without its own `Accept-Encoding` asks for gzip and the body is
+  decoded before the caller sees it (without `Content-Encoding` and `Content-Length`, as `fetch`
+  would hand it over). The target decides whether to compress: for nginx, `gzip on` with
+  `gzip_types` for scripts, stylesheets, JSON and fonts. Over a slow line a first load shrinks to
+  roughly a quarter.
+- Every link writes from a queue of its own, handing frames to the WebSocket only while its
+  `bufferedAmount` is below 256 KiB, so frames another link has already delivered are skipped rather
+  than sent. Queue plus `bufferedAmount` is bounded by the window plus 128 KiB, and a link whose
+  socket stops draining for 1 s is closed.
+
+Platforms:
+
+- Browsers and service workers need nothing special. A page and its service worker each hold their
+  own client: the worker carries the requests the browser makes (documents, scripts, fonts), the
+  page everything it fetches itself.
+- React Native: pass `compression: false` and `buffered: true` (there is no `DecompressionStream`,
+  and its `Response` cannot take a stream; the constructor refuses the defaults rather than
+  degrading quietly). Its WebSocket keeps no reliable `bufferedAmount`, so frames go to the socket at
+  once: the queue bound then covers only the client's own queue, and a link that stops writing is
+  caught by the liveness rules (1 s without a byte, or 3 s without acknowledgement progress).
+- Node 22 and later: the built-in `WebSocket` and `fetch` are used. Browsers throttle timers in
+  background tabs; a session that misses its pings there ends and is replaced, as after a network
+  change.
+
+### The service worker's line router
+
+```ts
+import { cacheLineStore, createLineRouter } from '@micro-teams/multipath';
+
+const router = createLineRouter({
+  entry: self.location.origin,
+  store: cacheLineStore('lines', new URL('__lines', self.location.href).href),
+  fallbackAfterMs: 3000, // no live session by then: send requests to the network
+  requestTimeoutMs: 10000, // a GET without an answer head by then: send it to the network
+  integrity: [
+    { pattern: /\/_expo\/static\/fonts\/[^/]+\.([0-9a-f]{32})\.\w+$/, algorithm: 'SHA-256' },
+    { pattern: /\/_expo\/static\/(?:js|css|assets)\/.*[-.]([0-9a-f]{32})\.\w+$/, algorithm: 'MD5' },
+  ],
+});
+self.addEventListener('fetch', (e) => e.respondWith(router.fetch(e.request)));
+```
+
+- A request goes to the network instead, logged and reported as a `fallback` event with its reason,
+  when no session is live, or for a GET or HEAD when the lines fail it or do not answer in time. Any
+  other method is sent at most once over the lines.
+- Integrity: a file whose path matches a rule carries a hash of its content in its name (the
+  capture group, a prefix of the hex digest). Its body streams through at once except the last
+  piece, which is released only once the digest matches; on a mismatch the body fails, so no cache
+  stores it, and that URL goes to the network from then on. `MD5`, `SHA-1`, `SHA-256`, `SHA-384`
+  and `SHA-512` are supported.
 
 ## Observability
 
@@ -128,24 +219,32 @@ reader and one writer goroutine and at most `window + 128 KiB` of queued bytes; 
 target connection and two splice goroutines; all timers run on one shared clock. A connection that
 does not finish its handshake within 5 seconds is closed.
 
-One stream moves at most `stream-window` bytes per round trip of its fastest line; raise
-`-stream-window` for high-latency lines that carry bulk transfers.
+`-stream-window` is the credit the server grants each stream, and so bounds what it buffers per
+stream for uploads; downloads move as much per round trip as the client grants (1 MiB in both
+clients, PROTOCOL.md section 6).
 
 ## Development
 
 - `cd go && go vet ./... && go test -race ./...` runs the unit tests.
-- `conformance/run.sh` builds both binaries and runs the conformance scenarios against them: impaired
-  lines, a stalled line, links cut hundreds of times, server restarts, a network switch, a long
-  session, and attacks. It prints the measured recovery times and resource counts at the end.
+- `cd js && npm ci && npm test` runs the JavaScript unit tests, including the shared vectors;
+  `npm run lint`, `npm run format:check` and `npm run build` are what CI runs besides.
+- `conformance/run.sh` builds both binaries and the JavaScript package and runs the conformance
+  scenarios against them, first with the Go client, then with the JavaScript client in Node:
+  impaired lines, a stalled line, links cut hundreds of times, server restarts, a network switch, a
+  long session, a slow distant line, and attacks. `MP_BROWSER=1` adds the Chromium leg (after
+  `npx playwright install chromium` in `js/`). It prints the measured recovery times and resource
+  counts at the end.
 - A change to the wire changes `PROTOCOL.md`, `spec/vectors/frames.json` and the code together.
   `go test ./protocol -run Vectors -update` rewrites the vectors' hex from their fields.
 - Read [`AGENTS.md`](./AGENTS.md) for the repository's rules.
 
 ## Releasing
 
-`scripts/version.sh` sets the version in `VERSION` and in the Go implementation string, and its
-header describes how a release is tagged. CI refuses a tag that disagrees with either. The Go module
-needs no publishing: `go get github.com/micro-teams/multipath/go@go/v<version>` resolves the tag.
+`scripts/version.sh` sets the version in `VERSION`, the Go and JavaScript implementation strings and
+`js/package.json`, and its header describes how a release is tagged. CI refuses a tag that disagrees
+with any of them, and publishes `@micro-teams/multipath` to GitHub Packages from the tag; nothing is
+published from a branch. The Go module needs no publishing:
+`go get github.com/micro-teams/multipath/go@go/v<version>` resolves the tag.
 
 ## License
 
