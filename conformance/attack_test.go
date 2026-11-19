@@ -167,16 +167,18 @@ func TestAttackOversizedLengths(t *testing.T) {
 			return a.c.WriteMessage(protocol.EncodeAck(1 << 40))
 		},
 		"stream data beyond its credit": func(a *attacker) error {
-			if err := a.send(protocol.EncodeMux(protocol.MuxSyn, 1, nil)); err != nil {
-				return err
-			}
+			// Four times the credit goes out ahead of the SYN, so it waits in the reorder buffer and
+			// reaches the mux in one burst when the SYN fills the gap: the stream's target connection
+			// cannot drain it fast enough to return the credit, which would make the excess depend on
+			// timing.
+			syn := protocol.EncodeMux(protocol.MuxSyn, 1, nil)
 			chunk := protocol.EncodeMux(protocol.MuxData, 1, make([]byte, protocol.MaxMuxData))
-			for range lim.StreamWindow/protocol.MaxMuxData + 1 {
-				if err := a.send(chunk); err != nil {
+			for i := 4*lim.StreamWindow/protocol.MaxMuxData - 1; i >= 0; i-- {
+				if err := a.c.WriteMessage(protocol.EncodeData(uint64(len(syn)+i*len(chunk)), chunk)); err != nil {
 					return err
 				}
 			}
-			return nil
+			return a.c.WriteMessage(protocol.EncodeData(0, syn))
 		},
 	}
 	for name, hostile := range cases {
