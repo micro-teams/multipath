@@ -1,237 +1,305 @@
-// L4 — many logical streams over the one redundant stream, the browser's async mirror of the Go/JVM
-// mux. Frame: type:u8 | streamID:u32 | length:u32 | payload. The opener uses odd stream IDs (a
-// browser client opens; the origin accepts), a per-stream credit window bounds one stream's grab of
-// the shared transport, FIN half-closes and RST aborts, and a stream fully half-closed both ways is
-// freed without an RST so a graceful close never discards the peer's buffered bytes.
+// Streams over one session (PROTOCOL.md section 6), the client's half of the Go package `mux`: SYN
+// opens a stream, DATA carries its bytes, FIN half-closes it, RST aborts it, and WINDOW returns
+// credit. Every stream has its own credit in each direction, enforced by the receiver, so one stream
+// can neither starve the others nor make the receiver buffer without bound.
+//
+// Feeding never waits: feed() only appends to stream buffers and sends control frames, which the
+// session never makes wait. A write waits for the stream's credit and for room in the session window.
+// Credit goes back in batches, when a quarter of the window has been read or everything has, so a
+// bulk transfer does not cost a WINDOW per read.
+//
+// A stream's receive credit starts at the server's streamWindow. A client may grant more right after
+// the SYN (Mux's recvWindow): the server's send buffer is bounded by the session window whatever the
+// credit, so the extra credit costs the server nothing, and it lets one download use more than
+// streamWindow per round trip. The client's own buffer per stream is then bounded by recvWindow.
+//
+//   - Transport: what the mux writes to; Session implements it.
+//
+//   - new Mux(transport, limits, recvWindow) creates the client side of a mux; recvWindow is each
+//     stream's receive credit, at least limits.streamWindow.
+//
+//   - mux.feed(bytes) consumes in-order session bytes; it throws on a protocol violation (a SYN from
+//     the server, DATA beyond the credit, a malformed frame), which ends the session.
+//
+//   - mux.open() opens a stream. mux.close(why) fails every stream at once; the client calls it when
+//     the session ends. mux.streams() is a snapshot (StreamStat) of the open streams. mux.remove(id)
+//     forgets a released stream; streams call it themselves.
+//
+//   - Stream: read() resolves with the next chunk, or null after the peer's FIN, and rejects once the
+//     stream is reset or the session ended. write(bytes) resolves once every byte is sent, waiting for
+//     credit as needed; writes are kept in order. closeWrite() sends FIN; reads continue until the
+//     peer's FIN. reset(why) aborts both directions and tells the peer why. id is the stream id;
+//     released says whether both sides have sent FIN or the stream was reset, after which it holds
+//     nothing on either side. deliver, grant, remoteFin, fail and stat are the mux's side of a stream.
+//
+//     const mux = new Mux(session, limits, 1 << 20);
+//     const st = mux.open();
+//     await st.write(request);
+//     st.closeWrite();
+//     for (let c = await st.read(); c !== null; c = await st.read()) use(c);
+import {
+  MAX_MUX_DATA,
+  MAX_REASON,
+  MuxType,
+  decodeReason,
+  encodeMux,
+  parseMux,
+  type Limits,
+} from './protocol.js';
+import { SessionEndedError } from './session.js';
 
-import { RedundantStream } from './session.js';
+export interface Transport {
+  send(frame: Uint8Array, control: boolean): void;
+  fits(n: number): boolean;
+  room(n: number): Promise<void>;
+}
 
-const Mux = { Syn: 0x01, Data: 0x02, Fin: 0x03, Rst: 0x04, Window: 0x05 } as const;
-const rstDecoder = new TextDecoder();
-const MUX_HDR = 9;
-const MUX_MAX_CHUNK = 16 * 1024;
-const STREAM_WINDOW = 256 * 1024;
+export interface StreamStat {
+  id: number;
+  bytesIn: number;
+  bytesOut: number;
+  buffered: number;
+  sendCredit: number;
+}
 
-export class MuxSession {
-  private streams = new Map<number, MuxStream>();
-  private parseBuf = new Uint8Array(0);
-  private nextId: number;
-  private writeChain: Promise<void> = Promise.resolve();
+const MUX_HEADER = 7;
+
+export class Mux {
+  private streamMap = new Map<number, Stream>();
+  private nextId = 1;
   private failure: Error | null = null;
+  private buf = new Uint8Array(0);
 
-  private constructor(
-    private transport: RedundantStream,
-    client: boolean,
+  constructor(
+    readonly transport: Transport,
+    private limits: Limits,
+    readonly recvWindow: number,
   ) {
-    this.nextId = client ? 1 : 2;
-    transport.onDeliver = (bytes) => this.onBytes(bytes);
-    // When the transport closes (e.g. every line rejected by the origin), fail the streams with its
-    // reason so a pending read/write returns fast instead of hanging.
-    transport.onClose = (err) => this.failAll(err ?? new Error('multipath: transport closed'));
+    if (recvWindow < limits.streamWindow)
+      throw new Error('multipath: recvWindow below the streamWindow');
   }
 
-  static client(transport: RedundantStream): MuxSession {
-    return new MuxSession(transport, true);
-  }
-
-  openStream(): MuxStream {
-    const id = this.nextId;
+  open(): Stream {
+    if (this.failure) throw this.failure;
+    const st = new Stream(this, this.nextId, this.limits.streamWindow, this.recvWindow);
     this.nextId += 2;
-    const st = new MuxStream(this, id);
-    this.streams.set(id, st);
-    void this.send(Mux.Syn, id, null);
+    this.streamMap.set(st.id, st);
+    this.transport.send(encodeMux(MuxType.Syn, st.id), true);
+    const extra = this.recvWindow - this.limits.streamWindow;
+    if (extra > 0) this.transport.send(encodeMux(MuxType.Window, st.id, u32(extra)), true);
     return st;
   }
 
-  close(): void {
-    this.failAll(new Error('multipath: mux session closed'));
-    this.transport.close();
+  close(why: string): void {
+    if (this.failure) return;
+    this.failure = new Error(`multipath: session ended: ${why}`);
+    const streams = [...this.streamMap.values()];
+    this.streamMap.clear();
+    for (const st of streams) st.fail(this.failure);
   }
 
-  /** Serializes every frame write so complete frames reach the transport in order. */
-  send(type: number, id: number, payload: Uint8Array | null): Promise<void> {
-    const frame = new Uint8Array(MUX_HDR + (payload?.length ?? 0));
-    const v = new DataView(frame.buffer);
-    frame[0] = type;
-    v.setUint32(1, id);
-    v.setUint32(5, payload?.length ?? 0);
-    if (payload) frame.set(payload, MUX_HDR);
-    this.writeChain = this.writeChain.then(() => this.transport.write(frame)).catch(() => {});
-    return this.writeChain;
+  remove(id: number): void {
+    this.streamMap.delete(id);
   }
 
-  removeStream(id: number): void {
-    this.streams.delete(id);
-  }
-
-  private onBytes(chunk: Uint8Array): void {
-    const next = new Uint8Array(this.parseBuf.length + chunk.length);
-    next.set(this.parseBuf);
-    next.set(chunk, this.parseBuf.length);
-    this.parseBuf = next;
-
-    while (this.parseBuf.length >= MUX_HDR) {
-      const v = new DataView(
-        this.parseBuf.buffer,
-        this.parseBuf.byteOffset,
-        this.parseBuf.byteLength,
-      );
-      const type = this.parseBuf[0];
-      const id = v.getUint32(1);
-      const n = v.getUint32(5);
-      if (this.parseBuf.length < MUX_HDR + n) break;
-      const payload = this.parseBuf.slice(MUX_HDR, MUX_HDR + n);
-      this.parseBuf = this.parseBuf.slice(MUX_HDR + n);
-      this.dispatch(type, id, payload);
+  feed(chunk: Uint8Array): void {
+    const buf = this.buf.length ? concat(this.buf, chunk) : chunk;
+    let at = 0;
+    for (;;) {
+      const parsed = parseMux(buf, at);
+      if (parsed === null) break;
+      this.handle(parsed.frame.type, parsed.frame.stream, parsed.frame.body);
+      at += parsed.n;
     }
+    // Only a partial frame is kept, copied, so the buffer never holds more than one frame.
+    this.buf = buf.slice(at);
   }
 
-  private dispatch(type: number, id: number, payload: Uint8Array): void {
-    const st = this.streams.get(id);
+  private handle(type: number, id: number, body: Uint8Array): void {
+    const st = this.streamMap.get(id);
     switch (type) {
-      case Mux.Data:
-        st?.onData(payload);
-        break;
-      case Mux.Fin:
-        st?.remoteFin();
-        break;
-      case Mux.Rst:
-        if (st) {
-          // A non-empty RST payload is a UTF-8 reason (e.g. "unknown service") the origin sent so
-          // the client's read throws it instead of a bare, cause-less reset.
-          const reason = payload.length > 0 ? rstDecoder.decode(payload) : '';
-          st.onReset(reason ? new Error(`multipath: stream reset: ${reason}`) : undefined);
-          this.streams.delete(id);
+      case MuxType.Syn:
+        throw new Error(`mux syn ${id} from the server`);
+      case MuxType.Data:
+        if (body.length === 0 || body.length > MAX_MUX_DATA) {
+          throw new Error(`mux data of ${body.length} bytes on stream ${id}`);
         }
-        break;
-      case Mux.Window:
-        if (st && payload.length === 4)
-          st.grantSend(new DataView(payload.buffer, payload.byteOffset).getUint32(0));
-        break;
-      // Syn is the accept side; a browser client only opens, so an inbound Syn is ignored.
+        st?.deliver(body);
+        return;
+      case MuxType.Fin:
+        st?.remoteFin();
+        return;
+      case MuxType.Rst: {
+        const why = decodeReason(body);
+        if (st) {
+          st.fail(new Error(`multipath: stream reset by peer${why ? `: ${why}` : ''}`));
+          this.remove(id);
+        }
+        return;
+      }
+      case MuxType.Window:
+        if (body.length !== 4)
+          throw new Error(`mux window of ${body.length} bytes on stream ${id}`);
+        st?.grant(new DataView(body.buffer, body.byteOffset, 4).getUint32(0));
+        return;
     }
+    // Frames for a stream that is gone crossed its RST and are dropped; unknown types are skipped.
   }
 
-  private failAll(err: Error): void {
-    this.failure = err;
-    for (const st of this.streams.values()) st.onReset(err);
-    this.streams.clear();
-  }
-
-  get failed(): Error | null {
-    return this.failure;
+  streams(): StreamStat[] {
+    return [...this.streamMap.values()].map((st) => st.stat());
   }
 }
 
-export class MuxStream {
+export class Stream {
   private inbox: Uint8Array[] = [];
-  private inboxLen = 0;
-  private remoteEOF = false;
+  private inboxBytes = 0;
+  private consumed = 0;
+  private remoteFIN = false;
   private localFIN = false;
   private err: Error | null = null;
-  private sendWin = STREAM_WINDOW;
-  private readWaiters: Array<() => void> = [];
-  private writeWaiters: Array<() => void> = [];
+  private readers: (() => void)[] = [];
+  private writers: (() => void)[] = [];
+  private writing: Promise<void> = Promise.resolve();
+  private bytesIn = 0;
+  private bytesOut = 0;
 
   constructor(
-    private sess: MuxSession,
+    private mux: Mux,
     readonly id: number,
+    private sendCredit: number,
+    private recvCredit: number,
   ) {}
 
-  /** Reads the next chunk of delivered bytes, or null at a clean EOF; throws on reset. */
-  async read(): Promise<Uint8Array | null> {
-    for (;;) {
-      if (this.inbox.length > 0) {
-        const chunk = this.inbox.shift()!;
-        this.inboxLen -= chunk.length;
-        void this.sess.send(0x05, this.id, u32(chunk.length)); // WINDOW: replenish the peer's credit
-        return chunk;
-      }
-      if (this.err) throw this.err;
-      if (this.remoteEOF) return null;
-      await new Promise<void>((resolve) => this.readWaiters.push(resolve));
-    }
+  stat(): StreamStat {
+    return {
+      id: this.id,
+      bytesIn: this.bytesIn,
+      bytesOut: this.bytesOut,
+      buffered: this.inboxBytes,
+      sendCredit: this.sendCredit,
+    };
   }
 
-  /** Writes bytes, chunked and flow-controlled; awaits the peer's window when it is exhausted. */
-  async write(bytes: Uint8Array): Promise<void> {
-    let p = 0;
-    while (p < bytes.length) {
-      while (this.sendWin === 0 && this.err === null && !this.localFIN) {
-        await new Promise<void>((resolve) => this.writeWaiters.push(resolve));
+  deliver(p: Uint8Array): void {
+    if (p.length > this.recvCredit) {
+      throw new Error(
+        `mux stream ${this.id} sent ${p.length} bytes with ${this.recvCredit} of credit`,
+      );
+    }
+    this.recvCredit -= p.length;
+    if (this.err || this.remoteFIN) return;
+    this.inbox.push(p.slice());
+    this.inboxBytes += p.length;
+    this.bytesIn += p.length;
+    wakeAll(this.readers);
+  }
+
+  grant(n: number): void {
+    if (this.sendCredit + n > 2 ** 31) throw new Error(`mux stream ${this.id} credit overflow`);
+    this.sendCredit += n;
+    wakeAll(this.writers);
+  }
+
+  remoteFin(): void {
+    this.remoteFIN = true;
+    wakeAll(this.readers);
+    if (this.localFIN) this.mux.remove(this.id);
+  }
+
+  fail(err: Error): void {
+    this.err ??= err;
+    wakeAll(this.readers);
+    wakeAll(this.writers);
+  }
+
+  async read(): Promise<Uint8Array | null> {
+    while (this.inbox.length === 0) {
+      if (this.err) throw this.err;
+      if (this.remoteFIN) return null;
+      await new Promise<void>((r) => this.readers.push(r));
+    }
+    const chunk = this.inbox.shift()!;
+    this.inboxBytes -= chunk.length;
+    this.consumed += chunk.length;
+    if (
+      (this.consumed >= this.mux.recvWindow / 4 || this.inbox.length === 0) &&
+      !this.remoteFIN &&
+      !this.err
+    ) {
+      const grant = this.consumed;
+      this.consumed = 0;
+      this.recvCredit += grant;
+      this.mux.transport.send(encodeMux(MuxType.Window, this.id, u32(grant)), true);
+    }
+    return chunk;
+  }
+
+  write(bytes: Uint8Array): Promise<void> {
+    const next = this.writing.then(() => this.writeNow(bytes));
+    // The chain continues after a failed write; that write's caller sees its error.
+    this.writing = next.catch(() => undefined);
+    return next;
+  }
+
+  private async writeNow(bytes: Uint8Array): Promise<void> {
+    for (let p = 0; p < bytes.length;) {
+      while (this.sendCredit === 0 && !this.err && !this.localFIN) {
+        await new Promise<void>((r) => this.writers.push(r));
       }
       if (this.err) throw this.err;
-      if (this.localFIN) throw new Error('multipath: write after close');
-      const n = Math.min(bytes.length - p, this.sendWin, MUX_MAX_CHUNK);
-      this.sendWin -= n;
-      await this.sess.send(0x02, this.id, bytes.subarray(p, p + n));
+      if (this.localFIN) throw new Error('multipath: write after closeWrite');
+      const n = Math.min(bytes.length - p, this.sendCredit, MAX_MUX_DATA);
+      if (!this.mux.transport.fits(n + MUX_HEADER)) {
+        await this.mux.transport.room(n + MUX_HEADER);
+        continue; // credit and state may have changed meanwhile
+      }
+      this.sendCredit -= n;
+      this.bytesOut += n;
+      this.mux.transport.send(encodeMux(MuxType.Data, this.id, bytes.subarray(p, p + n)), false);
       p += n;
     }
   }
 
-  /** Half-closes the write side (FIN); reads may continue until the peer's EOF. */
+  get released(): boolean {
+    return (this.localFIN && this.remoteFIN) || this.err !== null;
+  }
+
   closeWrite(): void {
-    if (this.localFIN) return;
+    if (this.localFIN || this.err) return;
     this.localFIN = true;
-    this.wakeWriters();
-    void this.sess.send(0x03, this.id, null);
-    this.cleanupIfClosed();
+    wakeAll(this.writers);
+    this.mux.transport.send(encodeMux(MuxType.Fin, this.id), true);
+    if (this.remoteFIN) this.mux.remove(this.id);
   }
 
-  /** Aborts the stream in both directions (RST). */
-  reset(): void {
-    if (this.err === null) this.err = new Error('multipath: stream reset');
-    this.wakeReaders();
-    this.wakeWriters();
-    this.sess.removeStream(this.id);
-    void this.sess.send(0x04, this.id, null);
+  reset(why: string): void {
+    if (this.err) return;
+    this.fail(new Error(`multipath: stream reset: ${why}`));
+    this.mux.remove(this.id);
+    const reason = new TextEncoder().encode(why).subarray(0, MAX_REASON);
+    try {
+      this.mux.transport.send(encodeMux(MuxType.Rst, this.id, reason), true);
+    } catch (err) {
+      // The session ended this very moment, which released the stream on both sides as well.
+      if (!(err instanceof SessionEndedError)) throw err;
+    }
   }
+}
 
-  onData(payload: Uint8Array): void {
-    if (this.err || this.remoteEOF) return;
-    this.inbox.push(payload);
-    this.inboxLen += payload.length;
-    this.wakeReaders();
-  }
-
-  remoteFin(): void {
-    this.remoteEOF = true;
-    this.wakeReaders();
-    this.cleanupIfClosed();
-  }
-
-  onReset(err?: Error): void {
-    if (this.err === null) this.err = err ?? new Error('multipath: stream reset');
-    this.wakeReaders();
-    this.wakeWriters();
-  }
-
-  grantSend(n: number): void {
-    this.sendWin += n;
-    this.wakeWriters();
-  }
-
-  // Frees the stream once both sides have half-closed: a clean close is torn down by the FINs, never
-  // by an RST, so the peer keeps whatever it has not yet drained.
-  private cleanupIfClosed(): void {
-    if (this.localFIN && this.remoteEOF) this.sess.removeStream(this.id);
-  }
-
-  private wakeReaders(): void {
-    const w = this.readWaiters;
-    this.readWaiters = [];
-    for (const r of w) r();
-  }
-
-  private wakeWriters(): void {
-    const w = this.writeWaiters;
-    this.writeWaiters = [];
-    for (const r of w) r();
-  }
+function wakeAll(waiters: (() => void)[]): void {
+  for (const w of waiters.splice(0)) w();
 }
 
 function u32(n: number): Uint8Array {
   const b = new Uint8Array(4);
   new DataView(b.buffer).setUint32(0, n);
   return b;
+}
+
+function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a);
+  out.set(b, a.length);
+  return out;
 }
