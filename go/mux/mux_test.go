@@ -300,3 +300,37 @@ func TestSpliceToTCP(t *testing.T) {
 		t.Fatalf("%d streams left open", n)
 	}
 }
+
+// A client that grants more receive credit lets the server send that much before any read, and no
+// more.
+func TestRecvWindowGrantedOnOpen(t *testing.T) {
+	lim := testLimits()
+	cli, accepted, _ := pair(t, lim)
+	cli.SetRecvWindow(4 * lim.StreamWindow)
+	st, err := cli.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := <-accepted
+	sent := make(chan int, 1)
+	go func() {
+		n, _ := srv.Write(make([]byte, 5*lim.StreamWindow)) // blocks at the credit; the count shows where
+		sent <- n
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if stats := cli.Streams(); len(stats) == 1 && stats[0].Buffered == 4*lim.StreamWindow {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("buffered %+v, want %d", cli.Streams(), 4*lim.StreamWindow)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case n := <-sent:
+		t.Fatalf("the server sent %d bytes past the credit", n)
+	case <-time.After(50 * time.Millisecond):
+	}
+	_ = st.Reset("test over") // releases the writer above
+}

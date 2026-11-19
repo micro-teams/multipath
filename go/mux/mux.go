@@ -20,6 +20,12 @@
 //
 //   - (*Mux).Open() opens a stream (client only).
 //
+//   - (*Mux).SetRecvWindow(n) makes every stream opened from then on grant the server n bytes of
+//     credit in all, with a WINDOW right after its SYN, instead of lim.StreamWindow (client only; n
+//     below the stream window changes nothing). The server's send buffer is bounded by the session
+//     window whatever the credit, so the grant costs it nothing, and one download may then move more
+//     than StreamWindow per round trip (PROTOCOL.md section 6).
+//
 //   - (*Mux).Close(why) fails every stream at once; the owner calls it when the session ends.
 //
 //   - (*Mux).Streams() is a snapshot of the open streams, one StreamStat each, for status pages.
@@ -55,6 +61,7 @@ type Mux struct {
 	t        Transport
 	client   bool
 	window   int
+	recv     int // receive credit of a new stream, at least window
 	max      int
 	onStream func(*Stream)
 
@@ -69,8 +76,15 @@ type Mux struct {
 
 // New creates a mux over t.
 func New(t Transport, client bool, lim protocol.Limits, onStream func(*Stream)) *Mux {
-	return &Mux{t: t, client: client, window: lim.StreamWindow, max: lim.MaxStreams, onStream: onStream,
+	return &Mux{t: t, client: client, window: lim.StreamWindow, recv: lim.StreamWindow, max: lim.MaxStreams, onStream: onStream,
 		streams: make(map[uint32]*Stream), nextID: 1}
+}
+
+// SetRecvWindow sets the receive credit of streams opened from now on.
+func (m *Mux) SetRecvWindow(n int) {
+	m.openMu.Lock()
+	defer m.openMu.Unlock()
+	m.recv = max(n, m.window)
 }
 
 // Open opens a stream.
@@ -94,6 +108,13 @@ func (m *Mux) Open() (*Stream, error) {
 	if err := m.t.Send(protocol.EncodeMux(protocol.MuxSyn, st.id, nil), true); err != nil {
 		m.remove(st.id)
 		return nil, err
+	}
+	if extra := m.recv - m.window; extra > 0 {
+		grant := binary.BigEndian.AppendUint32(nil, uint32(extra))
+		if err := m.t.Send(protocol.EncodeMux(protocol.MuxWindow, st.id, grant), true); err != nil {
+			m.remove(st.id)
+			return nil, err
+		}
 	}
 	return st, nil
 }
@@ -258,7 +279,7 @@ type Stream struct {
 }
 
 func newStream(m *Mux, id uint32) *Stream {
-	st := &Stream{m: m, id: id, sendCredit: m.window, recvCredit: m.window}
+	st := &Stream{m: m, id: id, sendCredit: m.window, recvCredit: m.recv}
 	st.readable = sync.NewCond(&st.mu)
 	st.writable = sync.NewCond(&st.mu)
 	return st
@@ -335,7 +356,7 @@ func (st *Stream) Read(p []byte) (int, error) {
 	// Credit goes back in batches, or at once when everything has been read, so a request and its
 	// response do not wait on each other and a bulk transfer does not send a WINDOW per read.
 	var grant int
-	if st.consumed >= st.m.window/4 || len(st.inbox) == 0 {
+	if st.consumed >= st.m.recv/4 || len(st.inbox) == 0 {
 		grant, st.consumed = st.consumed, 0
 		st.recvCredit += grant
 	}

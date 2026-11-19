@@ -102,7 +102,7 @@ func DefaultLimits() Limits {
 		Ping:         500 * time.Millisecond,
 		ClientDead:   time.Second,
 		ServerDead:   3 * time.Second,
-		Progress:     time.Second,
+		Progress:     3 * time.Second,
 	}
 }
 

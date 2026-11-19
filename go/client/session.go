@@ -25,6 +25,11 @@ import (
 	"github.com/micro-teams/multipath/go/session"
 )
 
+// recvWindow is the receive credit of every stream: the stream window alone would let one download
+// move only 256 KiB per round trip, which over a line of 0.6 to 0.9 s takes 9 s for 2.6 MB
+// instead of under 3 (PROTOCOL.md section 6).
+const recvWindow = 1 << 20
+
 type clientSession struct {
 	c       *Client
 	key     [16]byte
@@ -286,6 +291,7 @@ func (cs *clientSession) accept(w protocol.WelcomeFrame) error {
 	// The mux exists from the first WELCOME on, because its credit is the server's stream window;
 	// local connections wait for a live session, so no stream is opened earlier.
 	cs.m = mux.New(cs.s, true, w.Limits, nil)
+	cs.m.SetRecvWindow(recvWindow)
 	cs.maxLinks = w.Limits.MaxLinks
 	cs.server = w.Impl
 	for i, sl := range cs.slots {

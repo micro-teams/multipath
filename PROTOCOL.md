@@ -54,13 +54,18 @@ line list from the entry, and links each line by issuing a WebSocket upgrade to
 Rules for the client:
 
 - The fetched list **replaces** the previous one; lines are never accumulated from earlier lists.
-- The client fetches the list before every new session and refreshes it periodically (the Go client
-  every 10 minutes). A refresh applies to the running session: links of removed lines are closed,
-  added lines are dialled.
+- The client fetches the list for every new session and refreshes it periodically (both clients
+  every 10 minutes). A client that kept an earlier list (from the previous session, or stored across
+  restarts) MAY dial it while the fetch runs, so that a slow or unreachable entry delays nothing; the
+  fetched list then applies to that session. A list applies to the running session: added lines are
+  dialled and links of removed lines are closed, which a client MAY defer until a line still in the
+  list is up, so that a replaced list never ends a working session.
 - When the entry is `https`, every line MUST be `https`; a list that mixes in `http` lines is
   refused, so that a tampered or misconfigured list cannot downgrade confidentiality.
 - A client uses only lines from its entry's list. It uses at most `maxLinks` lines (section 4.2);
   further lines are logged and ignored.
+- A browser client additionally accepts only lines on its own site (the JavaScript client: the
+  entry's host or a configured parent domain, and its subdomains) and refuses any other list.
 
 ## 3. Link layer
 
@@ -203,7 +208,7 @@ The values are announced in WELCOME; the defaults are:
 | The server answers each PING with a PONG carrying the same nonce; it never sends PING itself | |
 | Client: a link with no inbound byte for `clientDeadMs` is dead | 1000 ms |
 | Server: a link with no inbound byte for `serverDeadMs` is dead | 3000 ms |
-| Progress: while a link carries sent-but-unacknowledged data, the ACK received on that link must advance within `progressMs`, else the link is dead | 1000 ms |
+| Progress: while a link carries sent-but-unacknowledged data, the ACK received on that link must advance within `progressMs`, else the link is dead | 3000 ms |
 
 Only the client pings, because the client is the side that can act on a dead link (redial it), and
 one ping stream per link is enough to prove both directions: the client hears the PONG, the server
@@ -211,8 +216,18 @@ hears the PING. The server allows three ping periods of silence before closing a
 late ping does not cost a client a link.
 
 The progress rule catches a link that carries bytes in one direction only, or whose data stopped
-moving while control frames still flow. A consequence of the fixed 1 second: under load, a line whose
-round trip exceeds about one second is dropped and redialled.
+moving while control frames still flow. Its deadline covers more than a round trip: an ACK waits in
+the line behind every byte queued ahead of it in that direction, so on a line that is both distant and
+slow an ACK can take well over a second while the line works. Measured with one line of 600 to
+900 ms round trip capped at 1 MB/s carrying a 2.6 MB download, a 1 s deadline ended the session
+within about a second in half of the runs, with the Go and the JavaScript client alike (and with 256
+KiB/s in every run); 3 s carried every run at 1 MB/s and 512 KB/s. The deadline must exceed the
+round trip plus the bytes in flight divided by the line's rate: in flight are at most the receive
+credit of the streams in use, and never more than `window` (2 MiB), so a line slower than about
+700 KB/s can still be dropped while several downloads fill the window at once (one stream with 2 MiB
+of credit over 512 KB/s was). Silence still kills a link after 1 s on the client, so a link that
+dies outright is noticed as fast as before. A line whose round trip itself exceeds
+`clientDeadMs` cannot hold a link: its first PONG comes too late.
 
 A dead link is closed. Each link has its own writer with a bounded send queue of `window + 131072`
 bytes (enough for a full replay with its frame headers); a full queue, or a single write blocked for longer than the side's dead time, closes only
@@ -255,6 +270,12 @@ type: u8 | length: u16 | stream: u32 | body: length - 4 bytes
 - A stream starts with `streamWindow` bytes of credit in each direction. The sender MUST NOT send more
   DATA than its credit; the **receiver enforces it** and treats an excess as a violation. The
   receiver returns credit with WINDOW as the application consumes bytes.
+- A receiver MAY grant more credit than it has consumed, at any time. Both clients grant each stream
+  1 MiB in all, with a WINDOW right after its SYN. One stream moves at most its credit per round
+  trip: with 256 KiB a 2.6 MB download over a line of 600 to 900 ms round trip takes about 9 s, with
+  1 MiB about 2.7 s (2 MiB: 1.8 s). The grant costs the server nothing, since what it sends waits in
+  its send buffer, bounded by `window`, whatever the credit; the credit the server grants
+  (`streamWindow`), which bounds what it buffers for each stream, stays 256 KiB.
 - SYN, FIN, RST and WINDOW are control frames: they are sent even when the session window is full
   (section 5.1).
 - A stream is released when both sides have sent FIN, or when either side sends RST. The server
@@ -271,6 +292,7 @@ type: u8 | length: u16 | stream: u32 | body: length - 4 bytes
 | reorder buffer | 2 x `window` | | receiver closes the link |
 | link send queue | `window` + 128 KiB | | sender closes the link |
 | `streamWindow` (mux credit) | 256 KiB | 64 KiB to 16 MiB | sender waits; receiver ends the session |
+| client receive credit per stream | 1 MiB | at least `streamWindow` | client ends the session |
 | `maxStreams` per session | 256 | 1 to 65535 | server resets the stream |
 | `maxLinks` per session | 8 | 1 to 255 | server REJECTs |
 | handshake | 5 s | | both close the link |

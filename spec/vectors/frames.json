@@ -27,7 +27,7 @@
     },
     {
       "name": "welcome created with defaults",
-      "hex": "02002a000301ffff002000000004000001000801f403e80bb803e86d756c7469706174682d676f2f302e332e30",
+      "hex": "02002a000301ffff002000000004000001000801f403e80bb80bb86d756c7469706174682d676f2f302e332e30",
       "type": "WELCOME",
       "fields": {
         "clientDeadMs": 1000,
@@ -37,7 +37,7 @@
         "maxPayload": 65535,
         "maxStreams": 256,
         "pingMs": 500,
-        "progressMs": 1000,
+        "progressMs": 3000,
         "serverDeadMs": 3000,
         "streamWindow": 262144,
         "version": 3,
