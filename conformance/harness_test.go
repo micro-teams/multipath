@@ -1,8 +1,9 @@
-// The conformance harness: it runs the real multipath-server and multipath-client binaries (built by
-// run.sh into $MP_BIN) with their production timeouts, puts a fault proxy (package faultproxy) on
-// every line, and gives each scenario a target HTTP server with known answers. Everything listens on
-// fresh loopback ports and is stopped when the scenario ends; a failing scenario prints the tail of
-// both processes' logs.
+// The conformance harness: it runs the real multipath-server and a real client with their production
+// timeouts: the multipath-client binary (built by run.sh into $MP_BIN), or with MP_CLIENT=js the
+// JavaScript client's process (js/conformance/client.mjs, same flags). It puts a fault proxy (package
+// faultproxy) on every line and gives each scenario a target HTTP server with known answers.
+// Everything listens on fresh loopback ports and is stopped when the scenario ends; a failing scenario
+// prints the tail of both processes' logs.
 //
 // The target answers:
 //
@@ -11,6 +12,8 @@
 //	GET  /stream?ms=T      64 KiB every 10 ms for T milliseconds
 //	GET  /hold?ms=T        "ok" after T milliseconds
 //	POST /echo             the hex SHA-256 of the request body
+//	GET  /file/<name>      fileSample, whatever the name
+//	GET  /ws               a WebSocket that echoes every binary message
 //
 // Scenarios report numbers with measure(), as lines starting with "MEASURE", which run.sh collects.
 package conformance
@@ -37,6 +40,7 @@ import (
 
 	"github.com/micro-teams/multipath/conformance/faultproxy"
 	"github.com/micro-teams/multipath/go/client"
+	"github.com/micro-teams/multipath/go/link"
 	"github.com/micro-teams/multipath/go/server"
 )
 
@@ -48,8 +52,17 @@ func bin(t *testing.T, name string) string {
 	return filepath.Join(dir, name)
 }
 
+// jsClient is the JavaScript client's process (MP_CLIENT=js), relative to this directory; with
+// MP_RECV_WINDOW it gets that per-stream receive credit.
+const jsClient = "../js/conformance/client.mjs"
+
+// measure reports a number, naming the client that produced it (MP_CLIENT, "go" by default).
 func measure(t *testing.T, format string, args ...any) {
-	t.Logf("MEASURE %s: %s", t.Name(), fmt.Sprintf(format, args...))
+	client := os.Getenv("MP_CLIENT")
+	if client == "" {
+		client = "go"
+	}
+	t.Logf("MEASURE %s client, %s: %s", client, t.Name(), fmt.Sprintf(format, args...))
 }
 
 func freeAddr(t *testing.T) string {
@@ -60,6 +73,9 @@ func freeAddr(t *testing.T) string {
 	defer ln.Close()
 	return ln.Addr().String()
 }
+
+// fileSample is the answer of /file/; the browser leg names it by its MD5.
+var fileSample = strings.Repeat("multipath integrity sample\n", 1000)
 
 // pattern is the byte at offset i of a /big answer.
 func pattern(i int) byte { return byte(i*31 + i>>13) }
@@ -118,6 +134,20 @@ func startTarget(t *testing.T) *target {
 			return
 		}
 		_, _ = io.WriteString(w, hex.EncodeToString(sum.Sum(nil))) // the client checks the answer
+	})
+	h.HandleFunc("/file/", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, fileSample) }) // the client checks the answer
+	h.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		c, err := link.Accept(w, r)
+		if err != nil {
+			return // Accept has answered the failed upgrade
+		}
+		defer c.Close()
+		for {
+			msg, err := c.ReadMessage(1 << 20)
+			if err != nil || c.WriteMessage(msg) != nil {
+				return // the client went away; the client side checks what it got
+			}
+		}
 	})
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -235,8 +265,15 @@ func newServerOnly(t *testing.T, n int) *stack {
 func newStack(t *testing.T, n int) *stack {
 	s := newServerOnly(t, n)
 	s.clientAddr, s.clientStatus = freeAddr(t), freeAddr(t)
-	s.client = startProc(t, "client.log", bin(t, "multipath-client"), "-listen", s.clientAddr,
-		"-entry", "http://"+s.serverAddr, "-status", s.clientStatus)
+	args := []string{"-listen", s.clientAddr, "-entry", "http://" + s.serverAddr, "-status", s.clientStatus}
+	if os.Getenv("MP_CLIENT") == "js" {
+		if w := os.Getenv("MP_RECV_WINDOW"); w != "" {
+			args = append(args, "-recv-window", w)
+		}
+		s.client = startProc(t, "client.log", "node", append([]string{jsClient}, args...)...)
+	} else {
+		s.client = startProc(t, "client.log", bin(t, "multipath-client"), args...)
+	}
 	s.waitLinesUp(n, 10*time.Second)
 	return s
 }

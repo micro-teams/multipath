@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -288,5 +289,36 @@ func TestLongSessionReturnsToBaseline(t *testing.T) {
 		took.Round(time.Millisecond), failures.Load(), base, peak.Goroutines, st, s.target.open.Load())
 	if failures.Load() != 0 || s.clientState().SessionsStarted != 1 {
 		t.Fatalf("%d failures, %d sessions", failures.Load(), s.clientState().SessionsStarted)
+	}
+}
+
+// One slow line alone, as a CDN line from far away: 300 ms one way plus up to 150 ms of jitter (a
+// round trip of 600 to 900 ms) and 1 MB/s, carrying a first load of 2.6 MB twice and small requests.
+// Every byte must arrive in one session: the acknowledgement-progress deadline has to cover an ACK
+// queued behind a download on such a line, and the stream credit decides how long the load takes.
+func TestSlowLine(t *testing.T) {
+	s := newStack(t, 1)
+	s.lines[0].Set(faultproxy.Fault{Mode: faultproxy.Pass, Delay: 300 * time.Millisecond, Jitter: 150 * time.Millisecond, BPS: 1 << 20}, faultproxy.ScopeAll)
+	var loads []string
+	for range 2 {
+		t0 := time.Now()
+		if err := s.big(2600<<10, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		loads = append(loads, time.Since(t0).Round(time.Millisecond).String())
+	}
+	var worst time.Duration
+	for range 10 {
+		t0 := time.Now()
+		if string(s.mustGet("/small")) != "ok" {
+			t.Fatal("wrong answer")
+		}
+		worst = max(worst, time.Since(t0))
+	}
+	st := s.clientState()
+	measure(t, "2.6 MB in %s; slowest of 10 small requests %v; reconnects %d, last reason %q; sessions %d",
+		strings.Join(loads, " and "), worst.Round(time.Millisecond), st.Lines[0].Reconnects, st.Lines[0].LastReason, st.SessionsStarted)
+	if st.SessionsStarted != 1 {
+		t.Fatalf("%d sessions started", st.SessionsStarted)
 	}
 }
