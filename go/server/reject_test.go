@@ -1,101 +1,81 @@
-package multipath
+// Tests for the handshake table of PROTOCOL.md section 4.2: a new session is created and later
+// links join it, and every HELLO the server cannot accept is answered with REJECT and the code that
+// says why, never with a silent close.
+package server
 
 import (
-	"context"
-	"io"
-	"net"
-	"strings"
-	"sync"
 	"testing"
-	"time"
+
+	"github.com/micro-teams/multipath/go/protocol"
 )
 
-func dialTCP(addr string) func(context.Context, int) (io.ReadWriteCloser, error) {
-	return func(ctx context.Context, i int) (io.ReadWriteCloser, error) {
-		return net.Dial("tcp", addr)
+func expectReject(t *testing.T, url string, h protocol.HelloFrame, code byte) {
+	t.Helper()
+	c, typ, p := handshake(t, url, h)
+	defer c.Close()
+	if typ != protocol.Reject {
+		t.Fatalf("answer 0x%02x, want REJECT", typ)
+	}
+	r, err := protocol.DecodeReject(p)
+	if err != nil || r.Code != code {
+		t.Fatalf("reject %+v %v, want code %d", r, err, code)
+	}
+	t.Logf("rejected: %s", r.Reason)
+}
+
+func TestNewThenJoin(t *testing.T) {
+	srv, _, url := newServer(t, "127.0.0.1:1", nil)
+	key := newKey()
+	for i, want := range []bool{true, false, false} {
+		mode := protocol.ModeNew
+		if i == 2 {
+			mode = protocol.ModeJoin
+		}
+		c, typ, p := handshake(t, url, protocol.HelloFrame{Session: key, Link: uint8(i), Mode: mode})
+		defer c.Close()
+		w, err := protocol.DecodeWelcome(p)
+		if typ != protocol.Welcome || err != nil || w.Created != want {
+			t.Fatalf("link %d: answer 0x%02x %+v %v", i, typ, w, err)
+		}
+	}
+	waitFor(t, "three links on one session", func() bool { st := srv.Status(); return st.Sessions == 1 && st.Links == 3 })
+}
+
+func TestJoinOfAnUnknownSessionIsRejected(t *testing.T) {
+	srv, _, url := newServer(t, "127.0.0.1:1", nil)
+	expectReject(t, url, protocol.HelloFrame{Session: newKey(), Mode: protocol.ModeJoin}, protocol.RejectUnknownSession)
+	if n := srv.Status().Sessions; n != 0 {
+		t.Fatalf("%d sessions after a rejected join", n)
 	}
 }
 
-// TestRejectOutOfRangeLinkReportedNotRetried: a link whose HELLO index the origin refuses is reported
-// down with the origin's reason (not a bare "connection closed") and is not retried, while an
-// in-range link on the same stream stays up.
-func TestRejectOutOfRangeLinkReportedNotRetried(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	srv := Listen(ln, fastOpts(1, nil)) // origin accepts index 0 only
-	go func() { _, _ = srv.Accept() }()
-
-	var mu sync.Mutex
-	var events []LinkState
-	copt := fastOpts(2, dialTCP(ln.Addr().String())) // client offers index 0 and 1; 1 is out of range
-	copt.OnLinkState = func(e LinkState) {
-		mu.Lock()
-		events = append(events, e)
-		mu.Unlock()
-	}
-	cli, err := DialRedundant(context.Background(), copt)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer cli.Close()
-
-	waitFor(t, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		for _, e := range events {
-			if e.Index == 1 && !e.Up && strings.Contains(e.Reason, "out of range") {
-				return true
-			}
-		}
-		return false
-	}, "link 1 reported down with the origin's out-of-range reason")
-
-	// Link 0 stays up; link 1 stays rejected and is not retried (no reconnect churn).
-	waitFor(t, func() bool {
-		for _, s := range cli.Stats() {
-			if s.Index == 0 && s.State == "up" {
-				return true
-			}
-		}
-		return false
-	}, "link 0 up")
-	time.Sleep(200 * time.Millisecond)
-	if r := cli.Stats()[1].Reconnects; r != 0 {
-		t.Fatalf("rejected link 1 was retried %d times; it must not be", r)
-	}
+func TestLinkIndexOutOfRangeIsRejected(t *testing.T) {
+	_, _, url := newServer(t, "127.0.0.1:1", nil)
+	expectReject(t, url, protocol.HelloFrame{Session: newKey(), Link: uint8(protocol.DefaultLimits().MaxLinks)}, protocol.RejectLimit)
 }
 
-// TestRejectAllLinksFailsFast reproduces the expensive bug: the origin refuses every link, Dial still
-// returns success (it only wrote HELLO), and without the fix every request hangs forever with no log.
-// With it, the stream closes with the origin's reason so the next read/write fails fast.
-func TestRejectAllLinksFailsFast(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+func TestOtherVersionIsRejected(t *testing.T) {
+	_, _, url := newServer(t, "127.0.0.1:1", nil)
+	expectReject(t, url, protocol.HelloFrame{Version: 2, Session: newKey()}, protocol.RejectVersion)
+}
+
+func TestMalformedHelloIsRejected(t *testing.T) {
+	_, _, url := newServer(t, "127.0.0.1:1", nil)
+	c, typ, _ := handshake(t, url, protocol.HelloFrame{Session: newKey()})
+	_ = c.Close() // only a fresh link matters below
+	if typ != protocol.Welcome {
+		t.Fatal("a valid hello was not welcomed")
+	}
+	raw, err := dialRaw(url)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
-	_ = Listen(ln, RedundantOptions{N: 0}) // origin accepts no index at all → rejects every link
-
-	cli, err := DialRedundant(context.Background(), fastOpts(1, dialTCP(ln.Addr().String())))
-	if err != nil {
-		t.Fatalf("dial should still succeed (HELLO written): %v", err)
+	defer raw.Close()
+	if err := raw.WriteMessage(protocol.EncodePing(1)); err != nil {
+		t.Fatal(err)
 	}
-	defer cli.Close()
-
-	done := make(chan error, 1)
-	go func() {
-		_, e := cli.Read(make([]byte, 16))
-		done <- e
-	}()
-	select {
-	case e := <-done:
-		if e == nil || !strings.Contains(e.Error(), "rejected") {
-			t.Fatalf("want a reject error, got %v", e)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Read hung instead of failing fast when every link was rejected")
+	msg, err := raw.ReadMessage(1 << 16)
+	if err != nil || msg[0] != protocol.Reject || msg[protocol.HeaderLen] != protocol.RejectMalformed {
+		t.Fatalf("answer % x, %v", msg, err)
 	}
 }
