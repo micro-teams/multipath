@@ -33,6 +33,8 @@ func TestRestartedServerRejectsTheOldSession(t *testing.T) {
 func TestShutdownSaysGoodbye(t *testing.T) {
 	srv, _, url := newServer(t, "127.0.0.1:1", nil)
 	_, s := clientMux(t, url)
+	// The client has its WELCOME a moment before the server has attached the link.
+	waitFor(t, "the link to attach", func() bool { return srv.Status().Links == 1 })
 	srv.Shutdown()
 	select {
 	case <-s.Done():
