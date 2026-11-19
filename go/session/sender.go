@@ -73,6 +73,11 @@ func (s *Session) fanoutLocked(f []byte, end uint64) []*link {
 // onAck handles an ACK received on link l.
 func (s *Session) onAck(l *link, off uint64) {
 	s.mu.Lock()
+	if s.closed {
+		// The send buffer is released when the session ends; a late ACK has nothing to release.
+		s.mu.Unlock()
+		return
+	}
 	if off > s.sendNext {
 		s.mu.Unlock()
 		s.drop(l, fmt.Sprintf("protocol violation: ack %d beyond the %d bytes sent", off, s.sendNext))
