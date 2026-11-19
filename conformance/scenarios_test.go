@@ -1,0 +1,292 @@
+// Conformance scenarios: the real client and server over fault-injecting lines, with production
+// timeouts. Each scenario states what it reproduces and what it requires. The three stalls of the
+// version-2 implementation (a replay overtaken by a newer frame, a line whose reader stopped, a
+// server restart under a live session) must recover, either without the application noticing or
+// by ending the session within about two seconds and starting a new one.
+package conformance
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"net/http"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/micro-teams/multipath/conformance/faultproxy"
+)
+
+// Requests of every shape over three healthy lines arrive intact, and nothing is left behind.
+func TestBaseline(t *testing.T) {
+	s := newStack(t, 3)
+	base := s.mustServer().Goroutines
+	for range 200 {
+		if string(s.mustGet("/small")) != "ok" {
+			t.Fatal("wrong answer")
+		}
+	}
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := s.big(256<<10, 30*time.Second); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	start := time.Now()
+	if err := s.big(64<<20, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	down := time.Since(start)
+	start = time.Now()
+	if err := s.echo(make([]byte, 16<<20), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	up := time.Since(start)
+	st := s.waitIdle(base, 4)
+	measure(t, "64 MiB down in %v (%.0f MiB/s), 16 MiB up in %v; idle server: %+v", down.Round(time.Millisecond),
+		64/down.Seconds(), up.Round(time.Millisecond), st)
+	if n := s.clientState().SessionsStarted; n != 1 {
+		t.Fatalf("%d sessions started", n)
+	}
+}
+
+// Slow, jittery, capped and lossy lines together still carry every byte.
+func TestImpairedLines(t *testing.T) {
+	s := newStack(t, 3)
+	s.lines[0].Set(faultproxy.Fault{Mode: faultproxy.Pass, Delay: 100 * time.Millisecond, Jitter: 50 * time.Millisecond}, faultproxy.ScopeAll)
+	s.lines[1].Set(faultproxy.Fault{Mode: faultproxy.Pass, BPS: 1 << 20}, faultproxy.ScopeAll)
+	s.lines[2].Set(faultproxy.Fault{Mode: faultproxy.Loss, LossRate: 0.05, LossPause: 300 * time.Millisecond}, faultproxy.ScopeAll)
+	start := time.Now()
+	if err := s.big(16<<20, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.echo(make([]byte, 4<<20), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	var worst time.Duration
+	for range 50 {
+		t0 := time.Now()
+		if string(s.mustGet("/small")) != "ok" {
+			t.Fatal("wrong answer")
+		}
+		worst = max(worst, time.Since(t0))
+	}
+	st := s.clientState()
+	measure(t, "16 MiB down + 4 MiB up in %v; slowest of 50 small requests %v; reconnects per line %d/%d/%d; sessions %d",
+		time.Since(start).Round(time.Millisecond), worst.Round(time.Millisecond),
+		st.Lines[0].Reconnects, st.Lines[1].Reconnects, st.Lines[2].Reconnects, st.SessionsStarted)
+	if st.SessionsStarted != 1 {
+		t.Fatalf("%d sessions started", st.SessionsStarted)
+	}
+}
+
+// streamGaps reads /stream for d and returns the longest pause between two reads.
+func streamGaps(s *stack, d time.Duration) (time.Duration, int64, error) {
+	hc := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: d + 10*time.Second}
+	resp, err := hc.Get(fmt.Sprintf("http://%s/stream?ms=%d", s.clientAddr, d.Milliseconds()))
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+	r := bufio.NewReaderSize(resp.Body, 64<<10)
+	buf := make([]byte, 64<<10)
+	var worst time.Duration
+	var total int64
+	last := time.Now()
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			worst = max(worst, time.Since(last))
+			last = time.Now()
+			total += int64(n)
+		}
+		if err == io.EOF {
+			return worst, total, nil
+		}
+		if err != nil {
+			return worst, total, err
+		}
+	}
+}
+
+// One line stops reading in both directions while another stays healthy (the version-2 stall in
+// which a blocked write froze the whole session). The stream must keep flowing, and the stuck link
+// must be dropped. With ScopeAll the reconnects of that line are stalled too.
+func TestStalledReaderOnOneLine(t *testing.T) {
+	for name, scope := range map[string]faultproxy.Scope{"existing": faultproxy.ScopeExisting, "all": faultproxy.ScopeAll} {
+		t.Run(name, func(t *testing.T) {
+			s := newStack(t, 2)
+			go func() {
+				time.Sleep(2 * time.Second)
+				s.lines[0].Set(faultproxy.Fault{Mode: faultproxy.Stall}, scope)
+			}()
+			worst, total, err := streamGaps(s, 8*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			st := s.clientState()
+			measure(t, "longest pause %v over %d MiB; line0: %s, %d reconnects, last reason %q", worst.Round(time.Millisecond),
+				total>>20, st.Lines[0].State, st.Lines[0].Reconnects, st.Lines[0].LastReason)
+			if worst > 1500*time.Millisecond {
+				t.Fatalf("the stream paused for %v", worst)
+			}
+			if st.Lines[0].LastReason == "" || st.SessionsStarted != 1 {
+				t.Fatalf("the stalled link was not dropped, or the session restarted: %+v", st)
+			}
+		})
+	}
+}
+
+// Links are cut over and over while requests run (the version-2 stall in which a reattached link
+// carried a newer frame ahead of its replay). Every request must succeed, quickly, in one session.
+func TestReplayUnderManyReconnects(t *testing.T) {
+	s := newStack(t, 2)
+	stop := make(chan struct{})
+	var drops atomic.Int64
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			case <-time.After(150 * time.Millisecond):
+			}
+			// Only cut a line while the other is up; losing both ends the session by design.
+			st := s.clientState()
+			if len(st.Lines) == 2 && st.Lines[0].State == "up" && st.Lines[1].State == "up" {
+				drops.Add(int64(s.lines[i%2].Drop()))
+			}
+		}
+	}()
+	var worst time.Duration
+	var n int
+	for end := time.Now().Add(20 * time.Second); time.Now().Before(end); n++ {
+		t0 := time.Now()
+		if err := s.echo(make([]byte, 256<<10), 10*time.Second); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.big(1<<20, 10*time.Second); err != nil {
+			t.Fatal(err)
+		}
+		worst = max(worst, time.Since(t0))
+	}
+	close(stop)
+	st := s.clientState()
+	measure(t, "%d request pairs during %d link cuts; slowest pair %v; sessions %d", n, drops.Load(), worst.Round(time.Millisecond), st.SessionsStarted)
+	if st.SessionsStarted != 1 || worst > 2*time.Second {
+		t.Fatalf("not seamless: %d sessions, slowest pair %v", st.SessionsStarted, worst)
+	}
+}
+
+// firstSuccess polls /small until it succeeds and returns how long that took.
+func firstSuccess(s *stack, from time.Time, limit time.Duration) (time.Duration, error) {
+	for time.Since(from) < limit {
+		if b, err := s.request("GET", "/small", nil, 3*time.Second); err == nil && string(b) == "ok" {
+			return time.Since(from), nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return 0, fmt.Errorf("no request succeeded within %v", limit)
+}
+
+// The server process is killed or stopped under a live session and comes back on the same port
+// (the version-2 stall in which a reconnect was silently taken for a new session at offset 0). A
+// request in flight must fail promptly rather than hang, and new requests must succeed within about
+// two seconds of the server being back.
+func TestServerRestart(t *testing.T) {
+	for name, sig := range map[string]syscall.Signal{"kill": syscall.SIGKILL, "graceful": syscall.SIGTERM} {
+		t.Run(name, func(t *testing.T) {
+			s := newStack(t, 2)
+			s.mustGet("/small")
+			inflight := make(chan time.Duration, 1)
+			go func() {
+				t0 := time.Now()
+				_, err := s.request("GET", "/hold?ms=5000", nil, 20*time.Second)
+				if err == nil {
+					t.Error("a request held across the restart succeeded; its stream should have failed")
+				}
+				inflight <- time.Since(t0)
+			}()
+			time.Sleep(300 * time.Millisecond)
+			s.server.stop(sig)
+			stopped := time.Now()
+			s.startServer()
+			back := time.Since(stopped)
+			recovery, err := firstSuccess(s, stopped, 10*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			failed := <-inflight
+			st := s.clientState()
+			measure(t, "server back after %v; first request after %v; the in-flight request (started 300 ms before the stop) failed after %v; sessions %d",
+				back.Round(time.Millisecond), recovery.Round(time.Millisecond), failed.Round(time.Millisecond), st.SessionsStarted)
+			if recovery-back > 2500*time.Millisecond {
+				t.Fatalf("recovery took %v after the server was back", recovery-back)
+			}
+			if failed > 2500*time.Millisecond {
+				t.Fatalf("the in-flight request hung for %v", failed)
+			}
+		})
+	}
+}
+
+// Every line goes silent at once while new connections work, as when a laptop moves to another
+// network. The client must notice within its dead time, start a new session and serve requests
+// within about two seconds; the server must drop the old session within its own dead time (3 s of
+// silence, or 1 s when it was waiting for an acknowledgement).
+func TestNetworkSwitch(t *testing.T) {
+	s := newStack(t, 3)
+	s.mustGet("/small")
+	before := s.clientState().SessionsStarted
+	cut := time.Now()
+	for _, l := range s.lines {
+		l.Set(faultproxy.Fault{Mode: faultproxy.Blackhole}, faultproxy.ScopeExisting)
+	}
+	recovery, err := firstSuccess(s, cut, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := s.waitFor("the server to drop the old session", 10*time.Second, func() bool { return s.mustServer().Sessions == 1 })
+	st := s.clientState()
+	measure(t, "first request after the switch %v; server dropped the old session %v after the switch; sessions %d -> %d; last end %q",
+		recovery.Round(time.Millisecond), (recovery + old).Round(time.Millisecond), before, st.SessionsStarted, st.LastSessionEnd)
+	if recovery > 2500*time.Millisecond {
+		t.Fatalf("recovery took %v", recovery)
+	}
+}
+
+// Thousands of requests in one session leave no goroutine, stream or target connection behind.
+func TestLongSessionReturnsToBaseline(t *testing.T) {
+	s := newStack(t, 3)
+	s.mustGet("/small")
+	base := s.mustServer().Goroutines
+	start := time.Now()
+	var wg sync.WaitGroup
+	var failures atomic.Int64
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 200 {
+				if b, err := s.request("GET", "/small", nil, 10*time.Second); err != nil || string(b) != "ok" {
+					failures.Add(1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	took := time.Since(start)
+	peak := s.mustServer()
+	st := s.waitIdle(base, 4)
+	measure(t, "4000 requests in %v (%d failed); server goroutines %d before, %d right after; idle %+v; target connections open %d",
+		took.Round(time.Millisecond), failures.Load(), base, peak.Goroutines, st, s.target.open.Load())
+	if failures.Load() != 0 || s.clientState().SessionsStarted != 1 {
+		t.Fatalf("%d failures, %d sessions", failures.Load(), s.clientState().SessionsStarted)
+	}
+}
