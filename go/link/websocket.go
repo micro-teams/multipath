@@ -9,8 +9,8 @@
 //     error. The request is left to the caller, which reads the client address from its headers.
 //
 //   - (*Conn).ReadMessage(max) returns the payload of the next binary message, answering pings and
-//     skipping pongs on the way. A message longer than max fails before its payload is read; a text
-//     message or a close fails too, since neither belongs on a link.
+//     skipping pongs on the way. A message longer than max fails with ErrTooLarge before its payload
+//     is read; a text message or a close fails too, since neither belongs on a link.
 //
 //   - (*Conn).WriteMessage(p) writes p as one binary message. Writes are serialised; callers bound
 //     their duration with SetWriteDeadline.

@@ -92,7 +92,7 @@ func TestSingleStreamRoundTrip(t *testing.T) {
 	if _, err := st.Write(msg); err != nil {
 		t.Fatal(err)
 	}
-	_ = st.Close()
+	_ = st.Close() // the echo below shows whether the FIN arrived
 	if got, _ := io.ReadAll(st); !bytes.Equal(got, msg) {
 		t.Fatalf("echo %q", got)
 	}
@@ -146,14 +146,14 @@ func TestStreamsAreIndependent(t *testing.T) {
 			t.Fatalf("read b: %q %v", buf, err)
 		}
 	}
-	_ = sa
+	_ = sa // a's peer never reads, which is the point
 }
 
 func TestResetReachesThePeerWithItsReason(t *testing.T) {
 	cli, accepted, _ := pair(t, testLimits())
 	st, _ := cli.Open()
 	peer := <-accepted
-	_ = st.Reset("going away")
+	_ = st.Reset("going away") // the peer's read below checks it arrived
 	if _, err := peer.Read(make([]byte, 8)); err == nil || !strings.Contains(err.Error(), "going away") {
 		t.Fatalf("peer read after reset: %v", err)
 	}
@@ -271,9 +271,9 @@ func TestSpliceToTCP(t *testing.T) {
 		if err != nil {
 			return
 		}
-		req, _ := io.ReadAll(c) // the reply below shows what arrived
-		_, _ = c.Write(append([]byte("got "), req...))
-		_ = c.Close()
+		req, _ := io.ReadAll(c)                        // the reply below shows what arrived
+		_, _ = c.Write(append([]byte("got "), req...)) // the client checks the answer
+		_ = c.Close()                                  // the client checks the answer
 	}()
 	cli, accepted, _ := pair(t, testLimits())
 	spliced := make(chan error, 1)
@@ -287,8 +287,8 @@ func TestSpliceToTCP(t *testing.T) {
 		spliced <- Splice(st, c)
 	}()
 	st, _ := cli.Open()
-	_, _ = st.Write([]byte("request"))
-	_ = st.Close()
+	_, _ = st.Write([]byte("request")) // the answer below checks it arrived
+	_ = st.Close()                     // the answer below checks it arrived
 	got, _ := io.ReadAll(st)
 	if string(got) != "got request" {
 		t.Fatalf("got %q", got)

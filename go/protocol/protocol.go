@@ -7,13 +7,16 @@
 //   - Version is the protocol version (3); Implementation is the impl string sent in HELLO and
 //     WELCOME, for example "multipath-go/0.3.0-dev". ImplVersion comes from version.go.
 //
-//   - The link frame types (Hello ... Goodbye), the HELLO modes (ModeNew, ModeJoin) and the REJECT
-//     codes (RejectVersion ... RejectMalformed) are the values of PROTOCOL.md section 4.
+//   - The link frame types (Hello, Welcome, Reject, Data, Ack, Ping, Pong, Goodbye), the HELLO modes
+//     (ModeNew, ModeJoin) and the REJECT codes (RejectVersion, RejectUnknownSession, RejectLimit,
+//     RejectMalformed) are the values of PROTOCOL.md section 4.
 //
-//   - MaxData, MaxReason, MaxImpl, ControlSlack and HandshakeTimeout are fixed by the protocol.
+//   - HeaderLen, MaxData, DataOverhead, MaxReason, MaxImpl, ControlSlack and HandshakeTimeout are
+//     fixed by the protocol.
 //
 //   - Limits is what a server announces in WELCOME and both sides then enforce. DefaultLimits returns
 //     the defaults of PROTOCOL.md section 7; Validate checks a Limits against the protocol's bounds.
+//     MinWindow is the smallest window a server may announce, which a client uses until WELCOME.
 //
 //     l := protocol.DefaultLimits()
 //     l.Window = 4 << 20

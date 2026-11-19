@@ -72,8 +72,8 @@ jobs:
       - run: npm run format:check
       - run: npm run lint
       - run: npm run build
-      # The cross-language tests need an origin this repository no longer builds; they skip
-      # without one and the unit tests run.
+      # The cross-language tests need a version-2 origin, which this repository does not build;
+      # they skip without one, and the unit tests run.
       - run: npm test
 
   release:

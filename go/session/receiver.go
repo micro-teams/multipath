@@ -24,7 +24,7 @@ type dataError struct {
 
 func (e *dataError) Error() string { return e.why }
 
-// onData takes one DATA frame's bytes, which the caller no longer uses.
+// onData takes one DATA frame's bytes, which the caller does not keep.
 func (s *Session) onData(off uint64, data []byte) *dataError {
 	s.rmu.Lock()
 	defer s.rmu.Unlock()

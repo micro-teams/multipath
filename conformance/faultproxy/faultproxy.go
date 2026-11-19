@@ -20,7 +20,8 @@
 //
 //   - Listen(target) starts a line on a free loopback port; (*Line).Addr() is its address.
 //
-//   - (*Line).Set(f, scope) applies a Fault to existing connections, new ones, or all (ScopeAll).
+//   - (*Line).Set(f, scope) applies a Fault to existing connections (ScopeExisting), new ones
+//     (ScopeNew), or both (ScopeAll).
 //
 //   - (*Line).Drop() hard-disconnects every existing connection; it returns how many.
 //

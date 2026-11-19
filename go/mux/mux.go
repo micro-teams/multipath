@@ -22,11 +22,11 @@
 //
 //   - (*Mux).Close(why) fails every stream at once; the owner calls it when the session ends.
 //
-//   - (*Mux).Streams() is a snapshot of the open streams, for status pages.
+//   - (*Mux).Streams() is a snapshot of the open streams, one StreamStat each, for status pages.
 //
 //   - *Stream is an io.ReadWriteCloser: Read returns bytes in order and returns credit as they are
 //     consumed; Write waits for credit; Close sends FIN (reads continue until the peer's FIN);
-//     Reset(why) aborts both directions and tells the peer why.
+//     Reset(why) aborts both directions and tells the peer why; ID() is its stream id.
 //
 //   - Splice(st, conn) (splice.go) relays a stream and a TCP connection until both are done.
 //
@@ -44,9 +44,6 @@ import (
 
 	"github.com/micro-teams/multipath/go/protocol"
 )
-
-// ErrClosed is returned once the mux has closed and no reason is known.
-var ErrClosed = errors.New("multipath: mux closed")
 
 // Transport carries mux frames; control frames must never wait.
 type Transport interface {

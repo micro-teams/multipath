@@ -247,7 +247,7 @@ func (s *Server) reject(c *link.Conn, from string, code byte, why string) {
 
 func (s *Server) newSession(h protocol.HelloFrame, from string, r *http.Request) *serverSession {
 	ss := &serverSession{id: hex.EncodeToString(h.Session[:4]), key: h.Session, client: from, started: time.Now()}
-	ss.local, _ = r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+	ss.local, _ = r.Context().Value(http.LocalAddrContextKey).(net.Addr) // nil makes the PROXY header LOCAL
 	var m *mux.Mux
 	ss.s = session.New(session.Options{
 		Limits:  s.cfg.Limits,

@@ -149,7 +149,7 @@ func TestCloseDoesNotWaitForAStuckWrite(t *testing.T) {
 	go func() { _ = c.WriteMessage(make([]byte, 1<<16)) }() // blocks: nobody reads b
 	time.Sleep(50 * time.Millisecond)
 	done := make(chan struct{})
-	go func() { _ = c.Close(); close(done) }()
+	go func() { _ = c.Close(); close(done) }() // only the return matters here
 	select {
 	case <-done:
 	case <-time.After(time.Second):

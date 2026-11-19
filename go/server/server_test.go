@@ -181,7 +181,7 @@ func TestStreamReachesTargetAndIsReleased(t *testing.T) {
 		if err := req.Write(st); err != nil {
 			t.Fatal(err)
 		}
-		_ = st.Close()
+		_ = st.Close() // the response below shows whether the request arrived
 		resp, err := http.ReadResponse(bufio.NewReader(st), req)
 		if err != nil {
 			t.Fatal(err)

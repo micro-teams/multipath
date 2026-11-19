@@ -81,7 +81,7 @@ type target struct {
 func startTarget(t *testing.T) *target {
 	tg := &target{}
 	h := http.NewServeMux()
-	h.HandleFunc("/small", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "ok") })
+	h.HandleFunc("/small", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "ok") }) // the client checks the answer
 	h.HandleFunc("/big", func(w http.ResponseWriter, r *http.Request) {
 		n, _ := strconv.Atoi(r.URL.Query().Get("n"))
 		w.Header().Set("Content-Length", strconv.Itoa(n))
@@ -109,7 +109,7 @@ func startTarget(t *testing.T) *target {
 	h.HandleFunc("/hold", func(w http.ResponseWriter, r *http.Request) {
 		ms, _ := strconv.Atoi(r.URL.Query().Get("ms"))
 		time.Sleep(time.Duration(ms) * time.Millisecond)
-		_, _ = io.WriteString(w, "ok")
+		_, _ = io.WriteString(w, "ok") // the client checks the answer
 	})
 	h.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
 		sum := sha256.New()
@@ -117,7 +117,7 @@ func startTarget(t *testing.T) *target {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		_, _ = io.WriteString(w, hex.EncodeToString(sum.Sum(nil)))
+		_, _ = io.WriteString(w, hex.EncodeToString(sum.Sum(nil))) // the client checks the answer
 	})
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -132,8 +132,8 @@ func startTarget(t *testing.T) *target {
 			tg.open.Add(-1)
 		}
 	}}
-	go func() { _ = hs.Serve(ln) }() // ends with Close below
-	t.Cleanup(func() { _ = hs.Close() })
+	go func() { _ = hs.Serve(ln) }()     // ends with Close below
+	t.Cleanup(func() { _ = hs.Close() }) // the scenario is over; a close error changes nothing
 	return tg
 }
 

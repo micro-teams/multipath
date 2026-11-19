@@ -2,7 +2,7 @@
 // arrives in pieces of any size, so the decoder works on a buffer and reports how much of it one
 // frame used, or that the frame is not complete yet.
 //
-//   - MuxSyn ... MuxWindow are the mux frame types; MaxMuxData bounds one DATA body.
+//   - MuxSyn, MuxData, MuxFin, MuxRst and MuxWindow are the mux frame types; MaxMuxData bounds one DATA body.
 //
 //   - EncodeMux(typ, stream, body) returns one whole mux frame. A sender writes it to the session in
 //     one piece, so it travels as one DATA frame.

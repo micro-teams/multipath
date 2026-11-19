@@ -96,13 +96,13 @@ for every frame keeps one parser for everything: every frame of this protocol fi
 
 | Type | Name | Direction | Payload |
 |---|---|---|---|
-| 0x01 | HELLO | client → server | `version: u16, session: [16]u8, link: u8, mode: u8, impl: UTF-8` |
-| 0x02 | WELCOME | server → client | `version: u16, flags: u8, maxPayload: u16, window: u32, streamWindow: u32, maxStreams: u16, maxLinks: u8, pingMs: u16, clientDeadMs: u16, serverDeadMs: u16, progressMs: u16, impl: UTF-8` |
-| 0x03 | REJECT | server → client | `code: u8, reason: UTF-8` |
+| 0x01 | HELLO | client -> server | `version: u16, session: [16]u8, link: u8, mode: u8, impl: UTF-8` |
+| 0x02 | WELCOME | server -> client | `version: u16, flags: u8, maxPayload: u16, window: u32, streamWindow: u32, maxStreams: u16, maxLinks: u8, pingMs: u16, clientDeadMs: u16, serverDeadMs: u16, progressMs: u16, impl: UTF-8` |
+| 0x03 | REJECT | server -> client | `code: u8, reason: UTF-8` |
 | 0x04 | DATA | both | `offset: u64, crc32: u32, bytes` |
 | 0x05 | ACK | both | `offset: u64` |
-| 0x06 | PING | client → server | `nonce: u64` |
-| 0x07 | PONG | server → client | `nonce: u64` |
+| 0x06 | PING | client -> server | `nonce: u64` |
+| 0x07 | PONG | server -> client | `nonce: u64` |
 | 0x08 | GOODBYE | both | `reason: UTF-8` |
 
 Sizes and bounds:
@@ -171,7 +171,7 @@ Each side numbers the bytes it sends from offset 0. A DATA frame carries the byt
   offset is a duplicate and is dropped. A frame partly below it delivers only its new tail.
 - A frame above the delivered offset is kept in a **reorder buffer** until the gap is filled. The
   reorder buffer accepts only frames that end at most `window + 65536` bytes past the delivered
-  offset, and holds at most `2 × window` bytes. A frame outside these bounds closes that link.
+  offset, and holds at most `2 x window` bytes. A frame outside these bounds closes that link.
 
 ### 5.2 Acknowledgements
 
@@ -217,7 +217,8 @@ round trip exceeds about one second is dropped and redialled.
 A dead link is closed. Each link has its own writer with a bounded send queue of `window + 131072`
 bytes (enough for a full replay with its frame headers); a full queue, or a single write blocked for longer than the side's dead time, closes only
 that link. A slow link never blocks the session or the other links. A link's writer MAY skip DATA
-frames that have been acknowledged meanwhile.
+frames that have been acknowledged meanwhile, and SHOULD drop them from a full queue before
+declaring it full, so that a slow link only carries bytes the peer still lacks.
 
 ### 5.5 Lifecycle
 
@@ -267,7 +268,7 @@ type: u8 | length: u16 | stream: u32 | body: length - 4 bytes
 |---|---|---|---|
 | `maxPayload` (frame payload) | 65535 | at least 32780 | both, per frame |
 | `window` (session send window, reorder span) | 2 MiB | 256 KiB to 64 MiB | sender waits; receiver closes the link |
-| reorder buffer | 2 × `window` | | receiver closes the link |
+| reorder buffer | 2 x `window` | | receiver closes the link |
 | link send queue | `window` + 128 KiB | | sender closes the link |
 | `streamWindow` (mux credit) | 256 KiB | 64 KiB to 16 MiB | sender waits; receiver ends the session |
 | `maxStreams` per session | 256 | 1 to 65535 | server resets the stream |
@@ -283,7 +284,7 @@ number of live TCP connections times a constant**.
 - A session needs at least one live link, and a link is one TCP connection; a session ends when its
   last link dies.
 - Per link: one reader and one writer task, and at most `window + 128 KiB` of queued bytes.
-- Per session: at most `window` of unacknowledged bytes, `2 × window` of reorder buffer, and at most
+- Per session: at most `window` of unacknowledged bytes, `2 x window` of reorder buffer, and at most
   `maxStreams` streams, each with at most `streamWindow` of received bytes and one target connection
   with one splice task per direction. There are no per-session threads or goroutines.
 - All timers (pings, liveness, delayed ACKs) run on one shared timer for the whole process.

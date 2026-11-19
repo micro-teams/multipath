@@ -1,9 +1,10 @@
 // The client's status: what a person or a supervising program needs to tell a healthy client from a
 // wedged one, without reading logs. MicroTeams shows it in `microteams status`.
 //
-//   - Status is the snapshot: the current session (id, state, age, offsets, unacknowledged bytes),
-//     every line of it (state, time since its last byte, bytes in and out, reconnects, last reason),
-//     every open stream (bytes in and out, buffered bytes, send credit), the number of sessions
+//   - Status is the snapshot: the current session (SessionStatus: id, state, age, offsets,
+//     unacknowledged bytes), every line of it (LineStatus: state, time since its last byte, bytes in
+//     and out, reconnects, last reason), every open stream (StreamStatus: bytes in and out, buffered
+//     bytes, send credit), the number of sessions
 //     started and why the previous one ended, and the number of local connections being served.
 //   - (*Client).Status() returns it; (*Client).StatusHandler() serves it as JSON, for a status port
 //     bound to a local address.

@@ -7,9 +7,9 @@ breaks. When every line dies at once (a laptop changing networks, a server resta
 notices within a second and starts over.
 
 ```
-  program ──TCP──▶ multipath-client ══ line A (CDN) ═════╗
-  (any TCP,         127.0.0.1:7000  ══ line B (direct) ══╬══▶ multipath-server ──TCP──▶ target
-   e.g. HTTP)                       ══ line C (tunnel) ══╝     (behind nginx/CDN)       (e.g. nginx:80)
+  program --TCP--> multipath-client === line A (CDN) ======+
+  (any TCP,         127.0.0.1:7000  === line B (direct) ===+===> multipath-server --TCP--> target
+   e.g. HTTP)                       === line C (tunnel) ===+     (behind nginx/CDN)        (e.g. nginx:80)
 ```
 
 Each TCP connection a program opens to the client's local port becomes one stream; the server

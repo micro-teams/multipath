@@ -160,7 +160,7 @@ func (sl *slot) set(state, reason string) {
 	sl.mu.Unlock()
 }
 
-// errServerLost marks a handshake that shows the server no longer holds the session.
+// errServerLost marks a handshake that shows the server does not hold the session.
 var errServerLost = errors.New("the server lost the session")
 
 // runSlot keeps one line linked for as long as ctx lasts.

@@ -12,6 +12,9 @@
 // Stats); sender.go the send window and replay; receiver.go reordering, delivery and ACKs; link.go a
 // link's queue, reader, writer and liveness; clock.go the one shared timer.
 //
+//   - Conn is what Attach takes: a link whose handshake is done, one message per frame; *link.Conn
+//     implements it. ErrEnded is what Send and Attach return once the session has ended.
+//
 //   - Options: the limits, the role, and three callbacks. Deliver receives the in-order bytes, one
 //     call at a time; it must not block, and an error from it ends the session (the mux reports
 //     protocol violations this way). OnLink reports each link coming up or going down with a reason;
@@ -38,7 +41,8 @@
 //   - (*Session).Done() is closed when the session has ended; Reason() then says why. A session
 //     ended by the peer's GOODBYE has a reason starting with PeerGoodbye.
 //
-//   - (*Session).Stats() is a snapshot of offsets and per-link counters, for status pages.
+//   - (*Session).Stats() is a snapshot of offsets and per-link counters (Stats, with one LinkStat per
+//     live link), for status pages.
 //
 //     var m *mux.Mux
 //     s := session.New(session.Options{Limits: protocol.DefaultLimits(), Client: true,
