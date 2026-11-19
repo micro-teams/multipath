@@ -2,6 +2,8 @@
 // draining a bounded send queue, and the liveness rules the clock applies to it. Each link writes on
 // its own, so a link whose peer stopped reading fills only its own queue and is closed when the queue
 // is full or a write is stuck past the dead time; it never blocks the session or the other links.
+// Acknowledged DATA is dropped from a queue rather than sent, so a slow link only ever carries what
+// the peer still lacks.
 //
 // Nothing here is exported. The session creates links in Attach; the clock calls (*Session).tick.
 
@@ -23,11 +25,35 @@ type queue struct {
 	frames [][]byte
 	bytes  int
 	limit  int
-	ready  chan struct{} // holds a token while frames may be waiting
+	acked  *atomic.Uint64 // the session's acknowledged offset
+	ready  chan struct{}  // holds a token while frames may be waiting
+}
+
+// dataEnd returns the stream offset after a DATA frame, or 0 for any other frame.
+func dataEnd(f []byte) uint64 {
+	if f[0] != protocol.Data {
+		return 0
+	}
+	return binary.BigEndian.Uint64(f[protocol.HeaderLen:]) + uint64(len(f)-protocol.HeaderLen-protocol.DataOverhead)
 }
 
 func (q *queue) push(f []byte) bool {
 	q.mu.Lock()
+	if q.bytes+len(f) > q.limit {
+		// DATA that a faster link has already delivered need not be sent; dropping it first means
+		// only bytes the peer still lacks count against the limit, so a slow link keeps up.
+		acked := q.acked.Load()
+		kept := q.frames[:0]
+		for _, g := range q.frames {
+			if end := dataEnd(g); end > 0 && end <= acked {
+				q.bytes -= len(g)
+				continue
+			}
+			kept = append(kept, g)
+		}
+		clear(q.frames[len(kept):])
+		q.frames = kept
+	}
 	if q.bytes+len(f) > q.limit {
 		q.mu.Unlock()
 		return false
@@ -101,7 +127,7 @@ func newLink(s *Session, index int, c Conn, lim protocol.Limits, now time.Time) 
 	if s.opt.Client {
 		l.dead, l.ping = lim.ClientDead, lim.Ping
 	}
-	l.q = queue{limit: lim.Window + 2*protocol.ControlSlack, ready: make(chan struct{}, 1)}
+	l.q = queue{limit: lim.Window + 2*protocol.ControlSlack, acked: &s.acked, ready: make(chan struct{}, 1)}
 	l.lastIn.Store(now.UnixNano())
 	return l
 }
@@ -124,11 +150,8 @@ func (l *link) writeLoop() {
 		}
 		// A DATA frame the peer has acknowledged meanwhile (through a faster link) is not worth
 		// sending; skipping it lets a slow link catch up instead of overflowing.
-		if f[0] == protocol.Data {
-			end := binary.BigEndian.Uint64(f[protocol.HeaderLen:]) + uint64(len(f)-protocol.HeaderLen-protocol.DataOverhead)
-			if end <= l.s.acked.Load() {
-				continue
-			}
+		if end := dataEnd(f); end > 0 && end <= l.s.acked.Load() {
+			continue
 		}
 		if err := l.conn.SetWriteDeadline(time.Now().Add(l.dead)); err != nil {
 			l.s.drop(l, "set write deadline: "+err.Error())

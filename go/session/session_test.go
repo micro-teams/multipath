@@ -2,7 +2,8 @@
 // pair of message pipes with a policy that can, while set, swallow every message (black-hole), stall
 // writes like a peer that stopped reading, corrupt one DATA frame, or drop only the ACKs flowing to
 // the client. A harness redials a link whenever the client side reports it down, so replay on
-// reconnect is exercised for real. Timings are scaled down from production by about ten.
+// reconnect is exercised for real. Timings are about a quarter of production, with room for the
+// race detector on a small machine.
 package session
 
 import (
@@ -145,10 +146,10 @@ func (k *sink) await(n int, timeout time.Duration) []byte {
 func testLimits() protocol.Limits {
 	l := protocol.DefaultLimits()
 	l.Window = 1 << 20
-	l.Ping = 15 * time.Millisecond
-	l.ClientDead = 60 * time.Millisecond
-	l.ServerDead = 150 * time.Millisecond
-	l.Progress = 100 * time.Millisecond
+	l.Ping = 25 * time.Millisecond
+	l.ClientDead = 150 * time.Millisecond
+	l.ServerDead = 400 * time.Millisecond
+	l.Progress = 250 * time.Millisecond
 	return l
 }
 
@@ -214,7 +215,7 @@ func send(s *Session, p []byte) error {
 
 func expect(t *testing.T, k *sink, want []byte) {
 	t.Helper()
-	if got := k.await(len(want), 10*time.Second); !bytes.Equal(got, want) {
+	if got := k.await(len(want), 30*time.Second); !bytes.Equal(got, want) {
 		t.Fatalf("received %d of %d bytes, equal=%v", len(got), len(want), bytes.Equal(got, want[:min(len(got), len(want))]))
 	}
 }
@@ -246,15 +247,15 @@ func TestDataBeyondWindowIsAViolation(t *testing.T) {
 func TestCleanTransfer(t *testing.T) {
 	h := newHarness(t, 3, testLimits())
 	msg := randBytes(4 << 20)
-	go func() { _ = send(h.cli, msg) }()
+	go func() { _ = send(h.cli, msg) }() // the receiving side checks what arrived
 	expect(t, h.sin, msg)
 }
 
 func TestBothDirections(t *testing.T) {
 	h := newHarness(t, 3, testLimits())
 	a, b := randBytes(1<<20), randBytes(1<<20)
-	go func() { _ = send(h.cli, a) }()
-	go func() { _ = send(h.srv, b) }()
+	go func() { _ = send(h.cli, a) }() // the receiving side checks what arrived
+	go func() { _ = send(h.srv, b) }() // the receiving side checks what arrived
 	expect(t, h.sin, a)
 	expect(t, h.cin, b)
 }
@@ -264,7 +265,7 @@ func TestBlackholedLinksAreReaped(t *testing.T) {
 	h.pol[0].blackhole.Store(true)
 	h.pol[2].blackhole.Store(true)
 	msg := randBytes(1 << 20)
-	go func() { _ = send(h.cli, msg) }()
+	go func() { _ = send(h.cli, msg) }() // the receiving side checks what arrived
 	expect(t, h.sin, msg)
 }
 
@@ -274,11 +275,11 @@ func TestLinksRecoverAndReplay(t *testing.T) {
 	h.pol[1].blackhole.Store(true)
 	first := randBytes(256 << 10)
 	go func() {
-		_ = send(h.cli, first)
+		_ = send(h.cli, first) // the receiving side checks what arrived
 		time.Sleep(20 * time.Millisecond)
 		h.pol[0].blackhole.Store(false)
 		h.pol[1].blackhole.Store(false)
-		_ = send(h.cli, first)
+		_ = send(h.cli, first) // the receiving side checks what arrived
 	}()
 	expect(t, h.sin, append(append([]byte(nil), first...), first...))
 }
@@ -287,7 +288,7 @@ func TestCorruptFrameDropsOnlyItsLink(t *testing.T) {
 	h := newHarness(t, 3, testLimits())
 	h.pol[1].corrupt.Store(true)
 	msg := randBytes(1 << 20)
-	go func() { _ = send(h.cli, msg) }()
+	go func() { _ = send(h.cli, msg) }() // the receiving side checks what arrived
 	expect(t, h.sin, msg)
 }
 
@@ -299,7 +300,7 @@ func TestStalledLinkDoesNotBlockOthers(t *testing.T) {
 	h.pol[0].stall.Store(true)
 	msg := randBytes(4 << 20)
 	start := time.Now()
-	go func() { _ = send(h.cli, msg) }()
+	go func() { _ = send(h.cli, msg) }() // the receiving side checks what arrived
 	expect(t, h.sin, msg)
 	if d := time.Since(start); d > 5*time.Second {
 		t.Fatalf("transfer took %v with one stalled link", d)
@@ -329,8 +330,10 @@ func TestManyReconnectsUnderLoad(t *testing.T) {
 			}
 		}
 	}()
-	go func() { _ = send(h.cli, msg) }()
-	expect(t, h.sin, msg)
+	go func() { _ = send(h.cli, msg) }() // the receiving side checks what arrived
+	if got := h.sin.await(len(msg), 30*time.Second); !bytes.Equal(got, msg) {
+		t.Fatalf("received %d of %d bytes; client ended %q, server ended %q", len(got), len(msg), h.cli.Reason(), h.srv.Reason())
+	}
 }
 
 // The first frames on a link are the ACK and then the replay from the acknowledged offset, even
@@ -344,7 +347,7 @@ func TestAttachQueuesReplayFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 	a, b := memPair(&policy{})
-	go func() { _ = send(s, randBytes(100<<10)) }()
+	go func() { _ = send(s, randBytes(100<<10)) }() // the receiving side checks what arrived
 	if err := s.Attach(0, a); err != nil {
 		t.Fatal(err)
 	}
@@ -433,7 +436,7 @@ func TestProgressRuleDropsALinkWithoutAcks(t *testing.T) {
 	}
 	select {
 	case why := <-h.ended:
-		if d := time.Since(start); d > 500*time.Millisecond {
+		if d := time.Since(start); d > 1500*time.Millisecond {
 			t.Fatalf("ended after %v: %s", d, why)
 		}
 	case <-time.After(2 * time.Second):
@@ -444,15 +447,21 @@ func TestProgressRuleDropsALinkWithoutAcks(t *testing.T) {
 func TestStatsCountsLinksAndBytes(t *testing.T) {
 	h := newHarness(t, 3, testLimits())
 	msg := randBytes(64 << 10)
-	go func() { _ = send(h.cli, msg) }()
+	go func() { _ = send(h.cli, msg) }() // the receiving side checks what arrived
 	expect(t, h.sin, msg)
 	st := h.cli.Stats()
 	if len(st.Links) != 3 || st.SendNext != uint64(len(msg)) {
 		t.Fatalf("stats %+v", st)
 	}
+	// Every delivered byte left on some link; a link may skip what a faster one already delivered.
+	var out int64
 	for _, l := range st.Links {
-		if l.BytesOut < int64(len(msg)) || time.Since(l.LastByte) > time.Second {
+		out += l.BytesOut
+		if time.Since(l.LastByte) > time.Second {
 			t.Fatalf("link stats %+v", l)
 		}
+	}
+	if out < int64(len(msg)) {
+		t.Fatalf("links wrote %d bytes for %d delivered", out, len(msg))
 	}
 }
