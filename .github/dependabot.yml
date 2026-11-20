@@ -1,7 +1,6 @@
-# Keeps each client's third-party dependencies current. Weekly, and minor and patch releases of one
-# ecosystem arrive together as one PR: a library this size has few dependencies, and five PRs a
-# week for five patch bumps is noise nobody reads. A major release still comes on its own, because
-# it is the one that can break the build and deserves its own red CI.
+# Keeps third-party dependencies current. Weekly, and minor and patch releases of one ecosystem
+# arrive together as one pull request; a major release comes on its own, because it is the one that
+# can break the build.
 version: 2
 updates:
   - package-ecosystem: 'gomod'
@@ -13,27 +12,11 @@ updates:
         update-types: ['minor', 'patch']
 
   - package-ecosystem: 'npm'
-    directory: '/ts'
+    directory: '/js'
     schedule:
       interval: 'weekly'
     groups:
-      ts-minor:
-        update-types: ['minor', 'patch']
-
-  - package-ecosystem: 'pub'
-    directory: '/dart'
-    schedule:
-      interval: 'weekly'
-    groups:
-      dart-minor:
-        update-types: ['minor', 'patch']
-
-  - package-ecosystem: 'maven'
-    directory: '/jvm'
-    schedule:
-      interval: 'weekly'
-    groups:
-      jvm-minor:
+      js-minor:
         update-types: ['minor', 'patch']
 
   - package-ecosystem: 'github-actions'

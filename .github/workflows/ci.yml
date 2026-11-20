@@ -1,276 +1,123 @@
+# Continuous integration: every part of the repository is checked in parallel on pull requests, on
+# main, and on release tags.
+#
+#   go           formatting, vet, build, and the unit tests under the race detector
+#   js           the JavaScript package: formatting, lint, build, and the unit tests
+#   conformance  the real server with the Go client, the JavaScript client in Node and in Chromium,
+#                through the fault proxy and the attack scenarios, with production timeouts: the
+#                job that decides whether MultiPath works
+#   release      on a v* tag only: the tag agrees with every committed version, then the JavaScript
+#                package is published to GitHub Packages. Nothing is published from a branch. Go
+#                needs no publishing, since the tag is what `go get` resolves.
+#
+# Nothing here depends on anything outside this repository.
+
 name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: ["main"]
     tags: ["v*"]
   pull_request:
     branches: ["main"]
   merge_group:
   workflow_dispatch:
 
-# One workflow, following the microteams convention: every part of the repository is checked in
-# parallel, and publishing hangs off the same run rather than off a second workflow that could
-# disagree with it about whether the code was any good.
-#
-#   go / ts / dart / jvm   check each package on its own, because each is released on its own
-#   e2e                     the whole substrate over the wire: a real JVM origin, every client (Go,
-#                           browser, Dart), and a per-link fault middlebox cutting links underneath —
-#                           the job that decides whether MultiPath works, not just whether it compiles
-#   publish-*               only after all five are green
-#
-# Nothing here depends on anything outside this repository: no consumer application, no database,
-# no external service.
-
 permissions:
   contents: read
-  packages: write
 
 jobs:
   go:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: go
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: go/go.mod
-      - run: gofmt -l . | tee /tmp/unformatted && [ ! -s /tmp/unformatted ]
+      - name: Formatting
+        run: |
+          unformatted="$(gofmt -l go conformance)"
+          if [ -n "$unformatted" ]; then echo "run gofmt -w on: $unformatted"; exit 1; fi
       - run: go vet ./...
+        working-directory: go
+      - run: go vet ./...
+        working-directory: conformance
       - run: go build ./...
-      # -race, because the redundant stream and the mux are written by several goroutines at once; a
-      # data race there would surface as an occasional lost byte, the kind of bug blamed on the
-      # network for weeks. The cross-language legs are skipped here (no JVM classpath) and run in e2e.
-      - run: go test -race -skip XLang ./...
+        working-directory: go
+      # The session, mux and links are driven by several goroutines at once; a data race there
+      # would surface as an occasional lost byte.
+      - run: go test -race -count=1 ./...
+        working-directory: go
 
-  ts:
+  js:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: ts
+        working-directory: js
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
           cache: "npm"
-          cache-dependency-path: ts/package-lock.json
+          cache-dependency-path: js/package-lock.json
       - run: npm ci
       - run: npm run format:check
       - run: npm run lint
       - run: npm run build
-      # The cross-language legs skip here (no JVM classpath) and run in e2e; this is the unit level.
       - run: npm test
 
-  dart:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: dart
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dart-lang/setup-dart@v1
-        with:
-          sdk: stable
-      - run: dart pub get
-      - run: dart format --output=none --set-exit-if-changed .
-      - run: dart analyze --fatal-infos
-      # The cross-language leg skips without a JVM classpath and runs in e2e; this is the unit level.
-      - run: dart test test/codecs_test.dart
-
-  jvm:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: jvm
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-java@v6
-        with:
-          java-version: "21"
-          distribution: "temurin"
-          cache: "maven"
-          cache-dependency-path: jvm/pom.xml
-      - run: ./mvnw -B verify
-      # spotless runs as part of the build, so a formatting mistake shows up as a dirty tree rather
-      # than as a separate check that can disagree with the build.
-      - name: Check formatting was applied
-        run: |
-          if [[ -n $(git status --porcelain) ]]; then
-            git status
-            git diff
-            echo "Uncommitted changes: run './mvnw spotless:apply' in jvm/ and commit."
-            exit 1
-          fi
-
-  # The substrate is proven the only way that matters: a real JVM origin process and a real Go
-  # client, driving both routed paths (a tunnel and a normal HTTP exchange) across a per-link fault
-  # middlebox that black-holes, one-directionally cuts, and hard-disconnects links. Compiling both
-  # halves proves nothing about whether they interoperate on the wire under loss; this job does.
-  # It also runs the Dart client leg twice — once natively (link_io.dart, dart:io) and once inside a
-  # real headless Chrome (link_web.dart, package:web) — since the web L2 link is JS-interop code a
-  # unit test on the Dart VM can't exercise at all.
-  e2e:
+  conformance:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-java@v6
-        with:
-          java-version: "21"
-          distribution: "temurin"
-          cache: "maven"
-          cache-dependency-path: jvm/pom.xml
       - uses: actions/setup-go@v7
         with:
           go-version-file: go/go.mod
       - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
           cache: "npm"
-          cache-dependency-path: ts/package-lock.json
-      - uses: dart-lang/setup-dart@v1
-        with:
-          sdk: stable
-      # Explicit rather than relying on whatever Chrome the runner image happens to ship — the Dart
-      # web leg (link_web.dart, a real browser-native L2 link) needs a real browser, not a stub.
-      - uses: browser-actions/setup-chrome@v2
-        with:
-          chrome-version: stable
-      - name: Build the origin and run the cross-language substrate e2e
-        run: ./testbed/run.sh
-
-  # ---------------------------------------------------------------------------------------------
-  # Publishing. Two shapes, one workflow.
-  #
-  #   a branch build  ->  a moving pointer that tracks that branch, for consumers who want to
-  #                       develop against unreleased work
-  #   a v* tag        ->  an immutable release
-  #
-  # Go needs no publishing step at all: `go get github.com/micro-teams/multipath/go@<ref>` resolves
-  # straight from the commit. The JVM (Maven) and browser (npm) packages are pushed to registries.
-  # ---------------------------------------------------------------------------------------------
-
-  publish-branch:
-    needs: [go, ts, dart, jvm, e2e]
-    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "22"
-          cache: "npm"
-          cache-dependency-path: ts/package-lock.json
-          registry-url: "https://npm.pkg.github.com"
-          scope: "@micro-teams"
-      - uses: actions/setup-java@v6
-        with:
-          java-version: "21"
-          distribution: "temurin"
-          cache: "maven"
-          cache-dependency-path: jvm/pom.xml
-          server-id: github
-          server-username: MAVEN_USERNAME
-          server-password: MAVEN_PASSWORD
-
-      - name: Derive the branch label
-        id: label
-        run: echo "value=$(echo '${{ github.ref_name }}' | tr '/_' '--' | tr -cd '[:alnum:]-')" >> "$GITHUB_OUTPUT"
-
-      # npm refuses to replace a version, so a branch build gets a unique prerelease number and the
-      # *dist-tag* is the moving pointer: install @micro-teams/multipath@<branch> for the newest.
-      - name: Publish the browser package
-        working-directory: ts
-        run: |
-          set -euo pipefail
-          base="$(node -p "require('./package.json').version")"
-          version="${base}-${{ steps.label.outputs.value }}.${{ github.run_number }}"
-          npm ci
-          npm run build
-          npm version "$version" --no-git-tag-version
-          npm publish --tag "${{ steps.label.outputs.value }}"
+          cache-dependency-path: js/package-lock.json
+      - run: npm ci
+        working-directory: js
+      - run: npx playwright install --with-deps chromium
+        working-directory: js
+      - run: conformance/run.sh
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MP_BROWSER: "1"
 
-      # A -SNAPSHOT version is expected to be replaced, and resolvers re-check it, so the branch
-      # label goes in the version and the snapshot suffix does the rest — no per-run number, no
-      # accumulating garbage. The bump is never committed; the version in git stays the release one.
-      - name: Publish the JVM package
-        working-directory: jvm
-        run: |
-          set -euo pipefail
-          base="$(./mvnw -q -B help:evaluate -Dexpression=project.version -DforceStdout)"
-          version="${base%-SNAPSHOT}-${{ steps.label.outputs.value }}-SNAPSHOT"
-          ./mvnw -B versions:set -DnewVersion="$version" -DgenerateBackupPoms=false
-          ./mvnw -B deploy -DskipTests
-          echo "published app.microteams:multipath:$version"
-        env:
-          MAVEN_USERNAME: ${{ github.actor }}
-          MAVEN_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Go needs no registry
-        run: echo 'go get github.com/micro-teams/multipath/go@${{ github.ref_name }}'
-
-  publish-release:
-    needs: [go, ts, dart, jvm, e2e]
+  release:
+    needs: [go, js, conformance]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
           cache: "npm"
-          cache-dependency-path: ts/package-lock.json
+          cache-dependency-path: js/package-lock.json
           registry-url: "https://npm.pkg.github.com"
           scope: "@micro-teams"
-      - uses: actions/setup-java@v6
-        with:
-          java-version: "21"
-          distribution: "temurin"
-          cache: "maven"
-          cache-dependency-path: jvm/pom.xml
-          server-id: github
-          server-username: MAVEN_USERNAME
-          server-password: MAVEN_PASSWORD
-
-      # A tag that disagrees with a committed version would publish a release nobody asked for, and
-      # an npm version cannot be replaced once taken — so this comes before any publish.
-      #
-      # EVERY component, not just the two that are published from here. It used to check jvm/pom.xml
-      # and ts/package.json alone, and the ones nothing looked at drifted exactly as you would
-      # expect: rc.4 and rc.5 were both cut by hand and both left dart/pubspec.yaml and the npm
-      # lockfile behind at 0.2.0. scripts/version.sh is what sets them all at once; this is what
-      # makes forgetting to run it impossible.
+      # An npm version cannot be replaced once published, so a tag that disagrees with any committed
+      # version stops here, before anything is published.
       - name: Check the tag matches every committed version
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
+          scripts/version.sh
           file="$(tr -d '[:space:]' < VERSION)"
-          pom="$(cd jvm && ./mvnw -q -B help:evaluate -Dexpression=project.version -DforceStdout)"
-          pkg="$(node -p "require('./ts/package.json').version")"
-          lock="$(node -p "require('./ts/package-lock.json').version")"
-          dart="$(sed -n 's/^version: *//p' dart/pubspec.yaml)"
-          for pair in "VERSION:$file" "jvm/pom.xml:$pom" "ts/package.json:$pkg" \
-                      "ts/package-lock.json:$lock" "dart/pubspec.yaml:$dart"; do
-            [[ "$tag" == "${pair#*:}" ]] || { echo "tag $tag != ${pair%%:*} ${pair#*:}" >&2; exit 1; }
-          done
-          echo "tag $tag agrees with every component"
-
-      - name: Publish the browser package
-        working-directory: ts
+          [[ "$tag" == "$file" ]] || { echo "tag $tag != VERSION $file" >&2; exit 1; }
+          echo "tag $tag agrees with every committed version"
+      - name: Publish the JavaScript package
+        working-directory: js
         run: |
           npm ci
           npm run build
           npm publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Publish the JVM package
-        working-directory: jvm
-        run: ./mvnw -B deploy -DskipTests
-        env:
-          MAVEN_USERNAME: ${{ github.actor }}
-          MAVEN_PASSWORD: ${{ secrets.GITHUB_TOKEN }}

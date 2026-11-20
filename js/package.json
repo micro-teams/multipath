@@ -1,0 +1,30 @@
+{
+  "name": "@micro-teams/multipath",
+  "version": "0.3.0-dev",
+  "description": "MultiPath client for browsers, service workers, React Native and Node: one session over every line of an entry, with HTTP exchanges and WebSockets as streams (protocol version 3).",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/micro-teams/multipath.git"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "format:check": "prettier --check .",
+    "format": "prettier --write .",
+    "lint": "oxlint src test"
+  },
+  "devDependencies": {
+    "oxlint": "^1.93.0",
+    "prettier": "^3.10.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0",
+    "playwright": "1.65.0"
+  }
+}
