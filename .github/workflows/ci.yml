@@ -118,6 +118,11 @@ jobs:
         run: |
           npm ci
           npm run build
-          npm publish
+          # A version with a pre-release part (0.3.0-rc.1) is published under the next tag, so that
+          # latest keeps pointing at the newest final release; npm refuses a pre-release without a tag.
+          case "$(node -p "require('./package.json').version")" in
+            *-*) npm publish --tag next ;;
+            *) npm publish ;;
+          esac
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
