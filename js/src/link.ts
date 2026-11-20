@@ -23,7 +23,9 @@
 //     Node's and React Native's all fit.
 //   - RejectedError: the server refused the link; code is the REJECT code.
 //   - Link.dial(url, hello, WebSocket, timeoutMs) resolves with the link and the WELCOME, or rejects
-//     with a RejectedError or the reason the handshake failed.
+//     with a RejectedError or the reason the handshake failed. A socket error is "connection failed",
+//     followed by the platform's message when the error event has one (React Native's does: a TLS
+//     or DNS failure names itself there; a browser's error event says nothing).
 //   - link.start(handlers, limit, acked): sets the queue's bound (limit) and the peer's acknowledged
 //     offset (acked()), and from the next microtask on delivers messages to handlers.onMessage, those
 //     that arrived since the WELCOME first; handlers.onClose(reason) is called when the socket closes
@@ -86,6 +88,13 @@ export interface LinkHandlers {
   onClose(reason: string): void;
 }
 
+function failed(ev: unknown): string {
+  const message = (ev as { message?: unknown } | null)?.message;
+  return typeof message === 'string' && message !== ''
+    ? `connection failed: ${message}`
+    : 'connection failed';
+}
+
 function bytesOf(data: unknown): Uint8Array | null {
   return data instanceof ArrayBuffer ? new Uint8Array(data) : null;
 }
@@ -117,7 +126,7 @@ export class Link {
       if (this.handlers) this.handlers.onMessage(msg);
       else this.early.push(msg);
     };
-    ws.onerror = () => this.fail('connection failed');
+    ws.onerror = (ev) => this.fail(failed(ev));
     ws.onclose = (ev) => this.fail(`connection closed (code ${ev.code ?? 'none'})`);
   }
 
@@ -144,7 +153,7 @@ export class Link {
       );
       ws.onopen = () => ws.send(encodeHello(hello));
       // A browser's error event carries no detail; the close event that follows has the code.
-      ws.onerror = () => fail(new Error('connection failed'));
+      ws.onerror = (ev) => fail(new Error(failed(ev)));
       ws.onclose = (ev) => fail(new Error(`connection closed (code ${ev.code ?? 'none'})`));
       ws.onmessage = (ev) => {
         try {
