@@ -135,11 +135,9 @@ describe('cache line store', () => {
       }),
     };
     const store = cacheLineStore('c', 'https://x/__lines', caches);
-    expect(await store.load()).toEqual([]);
-    const lines = [{ id: 'a', url: 'https://a.example' }];
-    await store.save(lines);
-    expect(await store.load()).toEqual(lines);
-    entries.set('https://x/__lines', new Response('[{"id":"a"}]'));
-    await expect(store.load()).rejects.toThrow(/invalid line list/);
+    expect(await store.load()).toBeNull();
+    const stored = { entry: 'https://x', lines: [{ id: 'a', url: 'https://a.example' }] };
+    await store.save(stored);
+    expect(await store.load()).toEqual(stored);
   });
 });

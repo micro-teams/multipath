@@ -57,7 +57,9 @@ Rules for the client:
 - The client fetches the list for every new session and refreshes it periodically (both clients
   every 10 minutes). A client that kept an earlier list (from the previous session, or stored across
   restarts) MAY dial it while the fetch runs, so that a slow or unreachable entry delays nothing; the
-  fetched list then applies to that session. A list applies to the running session: added lines are
+  fetched list then applies to that session. Both clients do, and ask an entry that does not answer
+  again with backoff (1 s to 30 s) until it does. A kept list MUST have been served by the same
+  entry, and passes the same checks as a fetched one. A list applies to the running session: added lines are
   dialled and links of removed lines are closed, which a client MAY defer until a line still in the
   list is up, so that a replaced list never ends a working session.
 - When the entry is `https`, every line MUST be `https`; a list that mixes in `http` lines is
@@ -240,7 +242,8 @@ declaring it full, so that a slow link only carries bytes the peer still lacks.
 - A session exists only while at least one of its links is alive. When the last link dies, the
   session **ends for good** on that side: every stream fails at once, and all of its state is
   released. There is no detached or orphaned session and no grace period.
-- The client then starts a **new** session with a new id. It re-fetches the line list first.
+- The client then starts a **new** session with a new id, over the line list it fetches again
+  (section 2), or the list it kept while that fetch runs.
 - GOODBYE ends a session explicitly. The client sends it on every link when it shuts down; the server
   sends it on every link when it shuts down, and the client then reconnects after the random delay of
   section 4.2. The receiver of a GOODBYE ends the session at once.

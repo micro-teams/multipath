@@ -10,7 +10,9 @@ compatible with 0.2 on the wire and is served on its own path, so a 0.2 origin c
   counters as JSON; GOODBYE to every session on shutdown.
 - `multipath-client`: every connection to a local port becomes one stream over all lines; lines are
   redialled for the whole session; the line list is fetched from one entry and replaces the old one
-  on every new session and every refresh; HTTP proxies are honoured; status as JSON.
+  on every new session and every refresh; the last list is kept (in memory, and across restarts
+  with `-lines-cache`) and starts a session at once while the entry is asked again, so an
+  unreachable entry does not stop working lines; HTTP proxies are honoured; status as JSON.
 - Frames: one envelope (`type`, `u16 length`, payload) for everything; unknown types are skipped.
   The handshake (HELLO, WELCOME, REJECT) carries the protocol and implementation versions, and the
   server's limits and liveness timings.

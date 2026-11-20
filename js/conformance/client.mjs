@@ -7,11 +7,13 @@
 //   node js/conformance/client.mjs -listen 127.0.0.1:7000 -entry http://127.0.0.1:8080 -status 127.0.0.1:7001
 //
 // -recv-window n sets the client's per-stream receive credit (default: the client's own), for
-// measuring its effect on slow lines.
+// measuring its effect on slow lines. -lines-cache path keeps the line list in that file across
+// restarts (the client's store), as multipath-client's flag of the same name does.
 //
 // A request the client fails before the response head is answered 502 with the reason; one that
 // fails during the body is cut off, so the caller sees a broken response, never a short one. SIGTERM
 // or SIGINT closes the client (GOODBYE) and exits.
+import { readFile, rename, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { Client } from '../dist/index.js';
 
@@ -31,7 +33,23 @@ for (const flag of ['listen', 'entry', 'status']) {
 
 const log = (m) => console.log(`${new Date().toISOString()} ${m}`);
 const recvWindow = args['recv-window'] ? Number(args['recv-window']) : undefined;
-const client = new Client({ entry: args.entry, log, recvWindow });
+// fileStore is a LineStore in one file, replaced by a rename so a reader never sees half a list.
+const fileStore = (path) => ({
+  async load() {
+    try {
+      return JSON.parse(await readFile(path, 'utf8'));
+    } catch (err) {
+      if (err.code === 'ENOENT') return null; // nothing stored yet
+      throw err;
+    }
+  },
+  async save(stored) {
+    await writeFile(`${path}.tmp`, JSON.stringify(stored));
+    await rename(`${path}.tmp`, path);
+  },
+});
+const store = args['lines-cache'] ? fileStore(args['lines-cache']) : undefined;
+const client = new Client({ entry: args.entry, log, recvWindow, store });
 
 // Headers the local hop owns, or that fetch() sets itself.
 const HOP = new Set([

@@ -9,9 +9,12 @@
 // after the server lost the session or said goodbye it first waits a random 0 to 2 s, so the clients
 // of a restarted server do not all return in the same instant. The line list is fetched again for
 // every session and every refreshMs, and the fetched list replaces the old one: new lines are
-// dialled, and the links of lines that left it are closed as soon as a line still in it is up. A list kept from before (the store, or the previous
-// session) is dialled at once while the fetch runs, so a slow or unreachable entry delays nothing
-// when the lines themselves work. Every event is logged with the session's first 8 hex digits.
+// dialled, and the links of lines that left it are closed as soon as a line still in it is up. The
+// last list the entry served is kept (in memory, and in the store across restarts). A new session
+// dials the kept list at once while the entry is asked again, so a slow or unreachable entry delays
+// nothing when the lines themselves work; the entry is asked again with backoff (1 s to 30 s) until
+// it answers, and its answer replaces the kept list in that session. A stored list is used only by a
+// client of the entry that served it. Every event is logged with the session's first 8 hex digits.
 //
 // Options (ClientOptions):
 //   entry        the origin the line list is fetched from, e.g. "https://example.app" (required)
@@ -19,7 +22,8 @@
 //   linesPath    path of the line list on the entry; default "/multipath/v3/lines"
 //   site         lines must be on this host or its subdomains; default the entry's hostname, null for
 //                any host (PROTOCOL.md section 10). An https entry accepts only https lines.
-//   store        keeps the last fetched list across restarts (LineStore: load() and save(lines))
+//   store        keeps the last fetched list across restarts (LineStore: load() and save(stored), of
+//                a StoredLines: the entry and its lines; load() resolves null when nothing is kept)
 //   refreshMs    interval of line list refreshes; default 10 minutes
 //   waitMs       how long a request waits for a live session before it fails; default 10 s
 //   recvWindow   receive credit of each stream; default 1 MiB (see mux.ts and PROTOCOL.md section 6)
@@ -70,9 +74,16 @@ import {
 import { PEER_GOODBYE, Session } from './session.js';
 import { MultipathWebSocket } from './websocket.js';
 
+// What a LineStore keeps: the last list and the entry that served it. A loaded one is untrusted
+// until the client has checked it.
+export interface StoredLines {
+  entry: string;
+  lines: Line[];
+}
+
 export interface LineStore {
-  load(): Promise<Line[]>;
-  save(lines: Line[]): Promise<void>;
+  load(): Promise<StoredLines | null>;
+  save(stored: StoredLines): Promise<void>;
 }
 
 export type ClientEvent =
@@ -220,23 +231,25 @@ export class Client {
     if (this.opts.store) this.lines = await this.loadStored();
     let retry = 250;
     while (!signal.aborted) {
-      const fetching = this.fetchList();
-      if (this.lines === null) {
+      const kept = this.lines !== null;
+      if (!kept) {
         // Nothing known yet: the list has to come first.
-        if (!(await fetching)) {
+        if (!(await this.fetchList())) {
           await sleep(retry, signal);
           retry = Math.min(2 * retry, 30_000);
           continue;
         }
+        retry = 250;
       }
-      retry = 250;
       if (signal.aborted) return;
       const cs = new ClientSession(this.ctx, this.lines!);
       this.current = cs;
       this.sessionsStarted++;
       this.notify();
-      // A list fetched while the session starts replaces the one it started with.
-      void fetching.then((fresh) => fresh && cs.applyLines(this.lines!));
+      if (kept) {
+        this.ctx.log(`session ${cs.id} uses the kept line list while the entry is asked again`);
+        void this.renew(cs);
+      }
       const why = await cs.ended;
       this.lastSessionEnd = why;
       this.notify();
@@ -248,12 +261,31 @@ export class Client {
     }
   }
 
+  // renew asks the entry for the list until it answers or the session ends, and applies the answer
+  // to the session, which until then runs on the kept list.
+  private async renew(cs: ClientSession): Promise<void> {
+    let retry = 1000;
+    while (!cs.session.ended && !this.stop.signal.aborted) {
+      if (await this.fetchList()) {
+        cs.applyLines(this.lines!);
+        return;
+      }
+      this.ctx.log(`session ${cs.id} stays on the kept line list, asking again in ${retry} ms`);
+      await sleep(retry, cs.signal);
+      retry = Math.min(2 * retry, 30_000);
+    }
+  }
+
   private async loadStored(): Promise<Line[] | null> {
     try {
-      const lines = await this.opts.store!.load();
-      if (lines.length === 0) return null;
-      const checked = parseLines({ lines });
+      const stored = await this.opts.store!.load();
+      if (stored === null) return null;
+      if (stored.entry !== this.entry) {
+        throw new Error(`it holds the list of entry ${String(stored.entry)}, not ${this.entry}`);
+      }
+      const checked = parseLines(stored);
       checkLines(checked, this.entry, this.site);
+      this.ctx.log(`stored line list: ${checked.length} lines`);
       return checked;
     } catch (err) {
       this.ctx.log(`stored line list unusable, waiting for the entry's: ${String(err)}`);
@@ -276,7 +308,7 @@ export class Client {
       this.lines = lines;
       if (this.opts.store) {
         await this.opts.store
-          .save(lines)
+          .save({ entry: this.entry, lines })
           .catch((err: unknown) => this.ctx.log(`could not store the line list: ${String(err)}`));
       }
       return true;
@@ -408,6 +440,7 @@ class ClientSession {
   serverGone = false;
 
   private stop = new AbortController();
+  readonly signal = this.stop.signal; // aborted when the session ends
   private welcomed = false;
   private createdSeen = false;
   private maxLinks = defaultLimits().maxLinks;

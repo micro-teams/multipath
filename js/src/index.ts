@@ -2,8 +2,8 @@
 // 3 (PROTOCOL.md): everything a page, a service worker, a React Native app or a Node program uses,
 // and nothing of the layers underneath.
 //
-//   - Client, with ClientOptions, ClientEvent, ClientStats and LineStore (client.ts): one session
-//     over every line of an entry; fetch(), openWebSocket(), live(), stats(), close().
+//   - Client, with ClientOptions, ClientEvent, ClientStats, LineStore and StoredLines (client.ts):
+//     one session over every line of an entry; fetch(), openWebSocket(), live(), stats(), close().
 //   - MultipathWebSocket (websocket.ts): what openWebSocket resolves with.
 //   - createLineRouter and cacheLineStore, with LineRouter, LineRouterOptions, RouterClient and
 //     IntegrityRule (router.ts): the service worker's router, with static-file integrity.
@@ -19,6 +19,7 @@ export {
   type ClientOptions,
   type ClientStats,
   type LineStore,
+  type StoredLines,
 } from './client.js';
 export type { HashAlgorithm } from './hash.js';
 export type { Line } from './lines.js';
