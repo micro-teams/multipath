@@ -1,68 +1,299 @@
 # MultiPath
 
-MultiPath carries one client's traffic redundantly over several network paths ("lines") to one
-server, so that the traffic survives lines dying. Every byte is sent on every live line and the
-receiver keeps the first copy of each byte; as long as one line works, nothing stalls and nothing
-breaks. When every line dies at once (a laptop changing networks, a server restart), the client
-notices within a second and starts over.
+MultiPath keeps a client connected to one server over several cheap, individually unreliable
+network paths at once. Every byte travels on every path; the receiver keeps the first copy. As long
+as one path works, the client does not notice that the others stalled or died.
 
+It is two small programs and a library:
+
+- `multipath-server`, which sits beside your application and forwards everything to it;
+- `multipath-client`, a local TCP port that any program can use as if it were the application;
+- `@micro-teams/multipath`, the same client inside a browser page, a service worker, a React Native
+  app or Node.
+
+The wire protocol is specified in [`PROTOCOL.md`](./PROTOCOL.md); this document explains the idea
+and how to run it.
+
+## The problem
+
+You run one application server. Your users reach it over networks you do not control: a campus
+network that drops long connections, a mobile link that switches towers, a country whose routes to
+your host stall for minutes at a time. You can buy one premium path and hope it holds, or you can
+offer several ordinary ones:
+
+- a CDN in front of your domain,
+- a relay you rent somewhere (an frp tunnel, for example),
+- a direct address over IPv6,
+- a second domain on a different provider.
+
+Each of these fails now and then, and each fails for its own reasons, at its own times. Taken
+together, the chance that all of them fail at the same moment is small. What is missing is a way for
+a client to use all of them as one connection, so that a failing path costs nothing as long as
+another one works. That is what MultiPath does.
+
+In MultiPath's words, each path is a **line**.
+
+## How it works
+
+### The picture
+
+```mermaid
+flowchart LR
+  subgraph clients["Client machines"]
+    app["Browser or app<br/>with the JS Client"]
+    prog["Any program<br/>(curl, a CLI, ssh)"]
+    mpc["multipath-client<br/>127.0.0.1:7000"]
+    prog -- "plain TCP" --> mpc
+  end
+  subgraph lines["Lines"]
+    cdn["CDN edge<br/>cdn.example.app"]
+    frp["frp relay<br/>relay.example.app"]
+    v6["direct over IPv6<br/>v6.example.app"]
+  end
+  subgraph host["Your server"]
+    nginx["nginx<br/>(TLS ends here)"]
+    mps["multipath-server<br/>:8080"]
+    target["Target: the application<br/>(e.g. nginx:80)"]
+    nginx -- "/multipath/v3/" --> mps
+    mps -- "one TCP connection per stream" --> target
+  end
+  app --> cdn & frp & v6
+  mpc --> cdn & frp & v6
+  cdn & frp & v6 --> nginx
 ```
-  program --TCP--> multipath-client === line A (CDN) ======+
-  (any TCP,         127.0.0.1:7000  === line B (direct) ===+===> multipath-server --TCP--> target
-   e.g. HTTP)                       === line C (tunnel) ===+     (behind nginx/CDN)        (e.g. nginx:80)
+
+- Every line is an HTTPS origin that ends at the same `multipath-server` process. The server speaks
+  plain HTTP; TLS is done by whatever sits in front of it on each line (the CDN, nginx, the relay's
+  TLS endpoint).
+- The server forwards every connection to **one** fixed TCP address, its target, configured on its
+  command line. Usually the target is the application's own HTTP port, so a request that arrives
+  over the lines lands exactly where the same request over plain HTTP would.
+- A client is configured with one **entry**, an origin such as `https://example.app`. It asks the
+  entry for the **line list** (which lines exist), and then connects over all of them at once.
+
+### The layers
+
+```mermaid
+flowchart LR
+  subgraph C["Client"]
+    c1["local TCP connection"] --> cs1["stream 1"]
+    c2["local TCP connection"] --> cs3["stream 3"]
+    cs1 & cs3 --> cmux["mux"] --> csess["session"]
+  end
+  subgraph L["Lines"]
+    la["link over line A"]
+    lb["link over line B"]
+    lc["link over line C"]
+  end
+  subgraph S["multipath-server"]
+    ssess["session"] --> smux["mux"] --> ss1["stream 1"] & ss3["stream 3"]
+  end
+  csess --> la & lb & lc --> ssess
+  ss1 --> t1["TCP connection to the target"]
+  ss3 --> t3["TCP connection to the target"]
 ```
 
-Each TCP connection a program opens to the client's local port becomes one stream; the server
-splices every stream to its one configured target. There is no destination in the protocol, so the
-server is never an open relay. The wire protocol is defined in [`PROTOCOL.md`](./PROTOCOL.md).
+| Layer | What it is | What it guarantees |
+|---|---|---|
+| **link** | One WebSocket connection over one line. | Nothing on its own: it may stall or die at any moment. |
+| **session** | Up to 8 links joined into one ordered byte stream in each direction. Every byte is numbered by its offset and sent on every live link. | Bytes arrive in order, exactly once, as long as one link lives. |
+| **mux** | Many streams inside the session, each with its own flow control. | A slow stream does not hold up the others. |
+| **stream** | One conversation with the target. | Behaves like a TCP connection: ordered bytes, half-close, reset. |
 
-## Components
+**One local TCP connection is one stream.** When a program connects to `multipath-client`'s port,
+the client opens a stream; the server opens a TCP connection to its target for it, and the two are
+joined until either side closes. The program sees an ordinary TCP connection to the application. The
+JavaScript client does the same inside the program: each `fetch` and each WebSocket it carries is
+one stream.
 
-| Path | What it is |
+Nothing in a stream names a destination. Every stream of every session reaches the same target, so
+the server can never be used as an open proxy.
+
+### A session, step by step
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant P as Program
+  participant C as Client
+  participant E as Entry
+  participant S as multipath-server
+  participant T as Target
+
+  C->>E: GET /multipath/v3/lines
+  E-->>C: lines A and B
+  par line A
+    C->>S: [A] HELLO session X, link 0, new
+    S-->>C: [A] WELCOME created, limits and timings
+  and line B
+    C->>S: [B] HELLO session X, link 1, new
+    S-->>C: [B] WELCOME joined
+  end
+  Note over C,S: session X is live
+
+  P->>C: connect to 127.0.0.1:7000
+  C->>S: [A] DATA at offset 0: open stream 1, request bytes
+  C->>S: [B] the same DATA, a copy
+  Note over S: keeps the first copy, drops the second by its offset
+  S->>T: connect, send the request
+  S-->>C: [A] and [B] ACK up to the last offset received
+  T-->>S: response
+  S-->>C: [A] and [B] DATA: response bytes
+  C-->>P: response
+
+  Note over C: line A silent for 1 s: link A is dead
+  Note over C,S: line B alone carries everything, the program notices nothing
+  C->>S: [A] HELLO session X, link 0, join (redialled with backoff)
+  S-->>C: [A] WELCOME, ACK, then a replay of every unacknowledged byte
+
+  Note over C,S: lines A and B both die
+  Note over C,S: session X ends on both sides, every open stream fails, P sees its connection close
+  C->>S: [A] and [B] HELLO session Y, new
+  Note over C: Y starts from the kept line list while the entry is asked again
+```
+
+What happens, in words:
+
+1. **Discovery.** The client fetches the line list from its entry. The list replaces whatever list
+   the client had; it is never merged with an older one. The client keeps it (in memory, and on
+   disk or in a store if configured), so that the next session can start from it at once even when
+   the entry is down.
+2. **Handshake.** The client picks a random 16-byte session id and sends HELLO on every line. The
+   first line to arrive creates the session; the others join it. WELCOME carries the server's limits
+   and the liveness timings the client must use.
+3. **Redundant data.** Each side numbers the bytes it sends. A DATA frame carries an offset and a
+   piece of bytes and goes out on every live link. The receiver delivers each byte once, in order:
+   a copy it already has is dropped, a piece that arrives ahead of a gap waits in a bounded reorder
+   buffer.
+4. **Acknowledgements.** The receiver acknowledges the offset up to which it has everything. The
+   sender keeps every byte until it is acknowledged, and never has more than the session window
+   (2 MiB) unacknowledged.
+5. **A line dies.** The client pings on every link twice a second. A link that stays silent too
+   long, or whose acknowledgements stop moving, is closed and redialled with backoff (200 ms up to
+   5 s, with jitter) for as long as the session lasts. When it joins again, it first receives
+   every byte that is still unacknowledged (the replay), so it catches up before carrying new data.
+6. **All lines die.** A session lives only while it has a live link. When the last one dies, the
+   session ends on both sides, every open stream fails at once, and the client starts a new
+   session. Programs see their connections close and reconnect the way they would after any network
+   error.
+7. **The server goes away.** When the server shuts down it says GOODBYE on every session; when it
+   restarted without saying so, it rejects the old session id. Either way the client waits a random
+   0 to 2 s before its new session, so the clients of a restarted server do not all return in the
+   same instant.
+
+## Guarantees and limits
+
+**What survives.** Any line stalling, dying, reordering or corrupting data (every DATA frame carries
+a CRC-32), as long as at least one line works. Lines can come and go any number of times during a
+session; a replaced line list adds and removes lines in a running session.
+
+**What does not survive.** All lines failing at once: a laptop changing networks, a server restart.
+The session ends within about a second and open connections fail. A new session starts
+immediately, but MultiPath does not resend application requests; retrying is the application's
+business, exactly as with TCP.
+
+**How fast a dead line is noticed.** The server announces the timings in WELCOME; the defaults are:
+
+| Rule | Default |
 |---|---|
-| `go/cmd/multipath-server` | The server: a reverse proxy that accepts links on one HTTP port, serves the line list, and splices every stream to one TCP target. |
-| `go/cmd/multipath-client` | The client: a local TCP port whose every connection becomes one stream over all lines. |
-| `go/` packages | `protocol` (frames, limits, line list), `link` (WebSocket links, HTTP proxies), `session` (the redundant byte stream), `mux` (streams with credit), `server`, `client`. |
-| `spec/vectors/` | Encodings of every frame, shared by all implementations. |
-| `conformance/` | A fault-injecting proxy and scenarios that run the real binaries through broken lines and attacks. |
-| `js/` | `@micro-teams/multipath`, the JavaScript client for browsers, service workers, React Native and Node: `Client` (HTTP exchanges and WebSockets as streams) and the service worker's line router. |
+| The client pings every link | every 0.5 s |
+| Client: a link with no incoming byte is dead after | 1 s |
+| Server: a link with no incoming byte is dead after | 3 s |
+| A link carrying unacknowledged data must see its acknowledgement advance within | 3 s |
 
-## Running the server
+The progress deadline is longer than the silence deadline on purpose: on a distant, slow line an
+acknowledgement waits behind the bytes queued ahead of it, so it can take well over a second while
+the line works (PROTOCOL.md section 5.4 has the measurements). A line whose round trip itself
+exceeds 1 s cannot hold a link.
+
+**What it costs.** Every byte is sent on every line, so with three lines the server sends and
+receives up to three times the traffic. A slow line costs less than that: each link writes from its
+own queue and skips bytes the other side has already acknowledged, so a slow line only carries what
+the peer still lacks, and never holds up the fast ones. Redundancy buys latency and resilience, not
+throughput.
+
+**Security model.**
+
+- *One target.* The server forwards to the one address it was started with. A client cannot name
+  another destination.
+- *Line lists come from the entry only, and replace each other.* A client never accumulates lines
+  from older lists or other sources. A list kept across restarts is used only by a client of the
+  same entry, and passes the same checks as a fresh one.
+- *No downgrade.* An `https` entry accepts only `https` lines. The JavaScript client additionally
+  accepts only lines on the entry's site (its host and subdomains, unless configured otherwise).
+- *TLS is done by the fronts.* Each line's TLS ends at the CDN, relay or nginx in front of the
+  server; the server and its target speak plain TCP on a network you control.
+- *Session ids are secrets.* Whoever knows one can attach links to that session; ids are random,
+  16 bytes long, and travel only inside the links.
+
+**Resource bounds.** Every server resource is bounded by the number of live TCP connections times a
+constant (PROTOCOL.md section 8). A session needs a live link and ends with its last one, so there
+are no orphaned sessions. A link costs two goroutines and at most `window + 128 KiB` of queued
+bytes; a stream costs one target connection and two goroutines; at most 256 streams and 8 links per
+session; a connection that does not finish its handshake in 5 s is closed. Every length, offset and
+count received from a client is checked, and a violation closes the link or ends the session.
+Limiting connections per address is left to the front proxy.
+
+## Using it
+
+The binaries build with Go 1.24 or later:
 
 ```sh
-cd go && go build ./cmd/multipath-server
-./multipath-server -listen :8080 -target 127.0.0.1:80 -lines-file /etc/multipath/lines.json
+cd go
+go build ./cmd/multipath-server
+go build ./cmd/multipath-client
+```
+
+### 1. Run the server
+
+Write the line list: every public way to reach this server, each an origin with no path.
+
+```json
+{"lines": [
+  {"id": "cdn", "url": "https://cdn.example.app"},
+  {"id": "relay", "url": "https://relay.example.app"},
+  {"id": "v6", "url": "https://v6.example.app"}
+]}
+```
+
+`id` is a short unique name used in logs and status; `url` is `https://` or `http://`, a host and
+an optional port, nothing else. A list has 1 to 255 lines (a client uses at most 8, the
+`-max-links`); members other than `id` and `url` are ignored. The server refuses to start with an
+invalid file, and reads it again on every request, so lines can be added and removed without a
+restart (while the file is invalid, the list answers 500 and the reason is logged).
+
+Start the server next to the application:
+
+```sh
+./multipath-server -listen :8080 -target 127.0.0.1:80 -lines-file /etc/multipath/lines.json \
+    -status 127.0.0.1:9101
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-listen` | `:8080` | Plain HTTP address for links and the line list. TLS is terminated in front. |
-| `-target` | (required) | `host:port` every stream is spliced to. |
-| `-lines-file` | (required) | The line list served at `-lines-path`; read on every request, so it can change without a restart. |
-| `-link-path` | `/multipath/v3/link` | WebSocket endpoint for links. |
-| `-lines-path` | `/multipath/v3/lines` | Endpoint for the line list. |
-| `-proxy-protocol` | off | Prefix every target connection with a PROXY protocol v2 header carrying the client address. |
-| `-status` | off | Local address serving the counters as JSON. |
+| `-target` | (required) | `host:port` every stream is forwarded to. |
+| `-lines-file` | (required) | The line list, served at `-lines-path`. |
+| `-listen` | `:8080` | Plain HTTP address for links and the line list. |
+| `-link-path` | `/multipath/v3/link` | Path of the WebSocket link endpoint. |
+| `-lines-path` | `/multipath/v3/lines` | Path of the line list. |
+| `-status` | off | Local address serving the live counters as JSON. |
 | `-status-every` | `1m` | Interval of the counters log line; `0` turns it off. |
-| `-window`, `-stream-window`, `-max-streams`, `-max-links` | 2 MiB, 256 KiB, 256, 8 | Limits announced to clients (PROTOCOL.md section 7). |
+| `-proxy-protocol` | off | Start every target connection with a PROXY protocol v2 header carrying the client's address. |
+| `-window` | `2097152` (2 MiB) | Session window: unacknowledged bytes in flight, per direction. |
+| `-stream-window` | `262144` (256 KiB) | Credit the server grants each stream, which bounds what it buffers per upload. |
+| `-max-streams` | `256` | Open streams per session. |
+| `-max-links` | `8` | Links per session. |
 
-The line list names every public path to the server, each an origin without a path:
+The limits are announced to clients in WELCOME; PROTOCOL.md section 7 gives their allowed ranges.
 
-```json
-{"lines": [
-  {"id": "cf", "url": "https://cf.example.app"},
-  {"id": "direct", "url": "https://direct.example.app"},
-  {"id": "frp", "url": "https://frp.example.app"}
-]}
-```
-
-Every line reaches the same server process through whatever front it has. Behind nginx:
+**Put it behind every front.** Each line must reach the server's `-listen` port at the link and
+lines paths, with WebSocket upgrades passed through and no buffering. In nginx:
 
 ```nginx
 map $http_upgrade $connection_upgrade { default upgrade; '' close; }
 
 location /multipath/v3/ {
-    proxy_pass http://multipath-server:8080;
+    proxy_pass http://127.0.0.1:8080;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection $connection_upgrade;
@@ -71,113 +302,117 @@ location /multipath/v3/ {
 }
 ```
 
-With `-proxy-protocol`, the target must expect the header, for example an nginx server block with
-`listen 8081 proxy_protocol;` and `set_real_ip_from` the server's address; nginx cannot mix
-connections with and without the header on one port. The client address comes from
-`CF-Connecting-IP`, else the first `X-Forwarded-For` entry, else the socket peer; enable the option
-only when the server is reachable solely through fronts that set these headers.
-
-A version-2 origin (the JVM origin on `/mt/link`) can keep running beside this server during a
-migration: the paths differ, and each client speaks one version.
-
-On SIGINT or SIGTERM the server sends GOODBYE to every session and exits; clients start a new
-session with the next server process at once, after a random delay of up to two seconds.
-
-## Running the client
+A CDN in front of that nginx needs WebSockets enabled for the path; an frp relay forwards a port or
+a domain to nginx (or straight to the server, with TLS on the relay). Each line is checked on its
+own with two requests:
 
 ```sh
-cd go && go build ./cmd/multipath-client
-./multipath-client -listen 127.0.0.1:7000 -entry https://example.app -status 127.0.0.1:7001
-curl -H 'Host: example.app' http://127.0.0.1:7000/
+curl -fsS https://relay.example.app/multipath/v3/lines        # prints the line list
+curl -si -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+  -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  https://relay.example.app/multipath/v3/link | head -1       # HTTP/1.1 101 Switching Protocols
 ```
+
+**Health.** `-status` serves `{"sessions":…,"links":…,"streams":…,"targets":…,"goroutines":…}` on
+a local address (any path, e.g. `curl -s 127.0.0.1:9101`), and the same counters go to the log every
+`-status-every`. Keep the status address local: it is not meant for the public.
+
+**The client's address.** The target sees every connection coming from the server. With
+`-proxy-protocol`, each target connection starts with a PROXY protocol v2 header carrying the
+client's address, taken from the first link's `CF-Connecting-IP`, else the first `X-Forwarded-For`
+entry, else the socket peer. Enable it only when the server is reachable solely through fronts that
+set these headers, and only towards a target listener that expects the header (in nginx,
+`listen 8081 proxy_protocol;` with `set_real_ip_from` the server's address; nginx cannot mix
+connections with and without the header on one port).
+
+**Shutdown.** On SIGINT or SIGTERM the server says GOODBYE to every session and exits; clients
+start their next session with the next server process.
+
+### 2. Run `multipath-client`
+
+```sh
+./multipath-client -entry https://example.app -listen 127.0.0.1:7000 \
+    -status 127.0.0.1:7001 -lines-cache ~/.cache/multipath/lines.json
+```
+
+Now point any program at `127.0.0.1:7000` as if it were the server's target. If the target is an
+HTTP server, speak plain HTTP and name the site in `Host` (the lines carry the TLS):
+
+```sh
+curl -H 'Host: example.app' http://127.0.0.1:7000/api/items
+```
+
+The same works for any TCP protocol the target speaks: with an SSH server as the target,
+`ssh -p 7000 127.0.0.1` is an SSH session that survives lines dying. In Go, an `http.Client` whose
+transport dials `127.0.0.1:7000` for every request sends all of its traffic over the lines.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-entry` | (required) | The origin the line list is fetched from. An `https` entry accepts only `https` lines. |
+| `-entry` | (required) | Origin the line list is fetched from, such as `https://example.app`. |
 | `-listen` | `127.0.0.1:7000` | Local address programs connect to. |
 | `-status` | off | Local address serving `GET /status` as JSON. |
-| `-lines-cache` | off | File keeping the last line list the entry served, so that after a restart a session starts from it while the entry is unreachable. |
-| `-proxy` | from the environment | `http://` proxy for lines and the line list. Without it, `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` apply. |
-| `-link-path`, `-lines-path` | the server's defaults | Paths on the lines and on the entry. |
-| `-refresh` | `10m` | Interval of line list refreshes; a refreshed list replaces the old one. |
+| `-lines-cache` | off (memory only) | File that keeps the last line list across restarts. |
+| `-lines-path` | `/multipath/v3/lines` | Path of the line list on the entry. |
+| `-link-path` | `/multipath/v3/link` | Path of the link endpoint on every line. |
+| `-proxy` | from the environment | `http://` proxy for the lines and the line list. Without it, `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` apply. |
+| `-refresh` | `10m` | Interval of line list refreshes. |
 | `-wait` | `10s` | How long a local connection waits for a live session before it is closed. |
 
-The client dials every line and keeps redialling a failed one with backoff (200 ms to 5 s) for the
-whole session. Liveness timings come from the server: the client pings every 0.5 s and drops a
-link that is silent for 1 s, or whose acknowledgements stop for 3 s while it has data in flight.
-Each stream grants the server 1 MiB of credit, so one download moves up to 1 MiB per round trip.
-When the last link dies, every open stream fails at once and the client starts a new session.
+How the addresses fit together:
 
-The client keeps the last line list its entry served, in memory and in the `-lines-cache` file. A
-new session dials the kept list at once while the entry is asked again, so an entry that is down
-or slow does not stop the lines from working; the client logs that it runs on the kept list and
-asks the entry again with backoff (1 s to 30 s) until it answers. The answer replaces the kept
-list. The file holds the entry it came from, and a client of another entry ignores it.
+```mermaid
+flowchart LR
+  entry["entry<br/>example.app"] -- "with the lines path" --> list["line list<br/>example.app/multipath/v3/lines"]
+  list -- "each line with the link path" --> links["links (WebSocket)<br/>cdn.example.app/multipath/v3/link<br/>relay.example.app/multipath/v3/link<br/>v6.example.app/multipath/v3/link"]
+  list -- "kept in" --> cache["lines cache file<br/>(entry and lines)"]
+  cache -- "next start, entry down" --> links
+```
 
-## The JavaScript client
+- The entry is asked for the list at `-entry` + `-lines-path`. The entry is usually one of the lines
+  itself (the public origin), but it does not have to be.
+- Every line in the list is dialled at its `url` + `-link-path`, as `wss://` for `https` lines and
+  `ws://` for `http` lines. The paths must match the server's `-link-path` and `-lines-path`.
+- The last list the entry served is kept in memory and, with `-lines-cache`, in the file as
+  `{"entry": "...", "lines": [...]}`. A new session dials the kept list at once while the entry is
+  asked again, so an entry that is down or slow does not stop lines that work; the client logs that
+  it runs on the kept list and asks the entry again with backoff (1 s to 30 s) until it answers. Its
+  answer replaces the kept list. A file written for another entry is ignored. Only a client that has
+  never had a list waits for the entry.
+- The list is fetched again for every new session and every `-refresh`. Lines added to it are
+  dialled; links of lines removed from it are closed once a line still in the list is up.
 
-`js/` is the npm package `@micro-teams/multipath` (published to GitHub Packages from release tags).
-It speaks the same protocol as the Go client, inside the program instead of as a local port: a page,
-a service worker or an app holds one `Client`, and every request it sends is one stream of one
-session over every line.
+On SIGINT or SIGTERM the client says GOODBYE, so the server releases the session at once.
+
+### 3. Use the JavaScript client
+
+`js/` is the npm package `@micro-teams/multipath`, published to GitHub Packages from release tags
+(add `@micro-teams:registry=https://npm.pkg.github.com` to `.npmrc`). It is the same client as
+`multipath-client`, built into the program instead of being a local port: one `Client` holds one
+session, and every request it sends is a stream of that session.
+
+**In a page:**
 
 ```ts
 import { Client } from '@micro-teams/multipath';
 
 const client = new Client({
-  entry: 'https://example.app', // the line list comes from here, and replaces any earlier one
-  onEvent: (e) => console.log(e), // line up/down, session start/end, router fallbacks
+  entry: location.origin, // where the line list comes from
+  store: {
+    // keeps the last list across reloads, so the next visit can start without the entry
+    load: async () => JSON.parse(localStorage.getItem('multipath-lines') ?? 'null'),
+    save: async (stored) => localStorage.setItem('multipath-lines', JSON.stringify(stored)),
+  },
+  onEvent: (e) => console.log(e), // line up or down, session start or end
 });
+
 const res = await client.fetch('/api/items'); // one HTTP/1.1 exchange on a fresh stream
+const items = await res.json();
 const ws = await client.openWebSocket('/updates', ['v1']); // a WebSocket on a fresh stream
-console.log(client.stats()); // the same shape as the Go client's /status
-await client.close(); // GOODBYE
+console.log(client.stats()); // session, lines and streams, as multipath-client's /status
 ```
 
-| Option | Default | Meaning |
-|---|---|---|
-| `entry` | (required) | Origin the line list is fetched from. An `https` entry accepts only `https` lines. |
-| `site` | the entry's host | Every line must be on this host or a subdomain of it; `null` allows any host. |
-| `store` | none | Keeps the last list and its entry across restarts; it is dialled at once while the fresh list is fetched, and ignored by a client of another entry. |
-| `linkPath`, `linesPath` | the server's defaults | Paths on the lines and on the entry. |
-| `refreshMs` | 10 minutes | Interval of line list refreshes. |
-| `waitMs` | 10 s | How long a request waits for a live session before it fails. |
-| `recvWindow` | 1 MiB | Receive credit of each stream (PROTOCOL.md section 6). |
-| `compression` | `true` | Ask for gzip and decode it with `DecompressionStream`. |
-| `buffered` | `false` | Read each response whole before returning it, for platforms whose `Response` cannot stream. |
-| `log` | `console.info` | One line per event. |
-
-How it behaves:
-
-- `fetch` resolves as soon as the response head arrives and streams the body. The stream is reset
-  as soon as the body is complete or the caller abandons it, so no request holds a stream, or the
-  server a target connection, beyond its answer. The request side is not half-closed after the
-  request: nginx takes a client's half-close for an abort and answers a proxied request with 499.
-- With `compression`, a request without its own `Accept-Encoding` asks for gzip and the body is
-  decoded before the caller sees it (without `Content-Encoding` and `Content-Length`, as `fetch`
-  would hand it over). The target decides whether to compress: for nginx, `gzip on` with
-  `gzip_types` for scripts, stylesheets, JSON and fonts. Over a slow line a first load shrinks to
-  roughly a quarter.
-- Every link writes from a queue of its own, handing frames to the WebSocket only while its
-  `bufferedAmount` is below 256 KiB, so frames another link has already delivered are skipped rather
-  than sent. Queue plus `bufferedAmount` is bounded by the window plus 128 KiB, and a link whose
-  socket stops draining for 1 s is closed.
-
-Platforms:
-
-- Browsers and service workers need nothing special. A page and its service worker each hold their
-  own client: the worker carries the requests the browser makes (documents, scripts, fonts), the
-  page everything it fetches itself.
-- React Native: pass `compression: false` and `buffered: true` (there is no `DecompressionStream`,
-  and its `Response` cannot take a stream; the constructor refuses the defaults rather than
-  degrading quietly). Its WebSocket keeps no reliable `bufferedAmount`, so frames go to the socket at
-  once: the queue bound then covers only the client's own queue, and a link that stops writing is
-  caught by the liveness rules (1 s without a byte, or 3 s without acknowledgement progress).
-- Node 22 and later: the built-in `WebSocket` and `fetch` are used. Browsers throttle timers in
-  background tabs; a session that misses its pings there ends and is replaced, as after a network
-  change.
-
-### The service worker's line router
+**In a service worker**, the line router carries the requests the browser makes for the page
+(the document, scripts, fonts, images), and falls back to the network when the lines cannot:
 
 ```ts
 import { cacheLineStore, createLineRouter } from '@micro-teams/multipath';
@@ -185,24 +420,85 @@ import { cacheLineStore, createLineRouter } from '@micro-teams/multipath';
 const router = createLineRouter({
   entry: self.location.origin,
   store: cacheLineStore('lines', new URL('__lines', self.location.href).href),
-  fallbackAfterMs: 3000, // no live session by then: send requests to the network
-  requestTimeoutMs: 10000, // a GET without an answer head by then: send it to the network
-  integrity: [
-    { pattern: /\/_expo\/static\/fonts\/[^/]+\.([0-9a-f]{32})\.\w+$/, algorithm: 'SHA-256' },
-    { pattern: /\/_expo\/static\/(?:js|css|assets)\/.*[-.]([0-9a-f]{32})\.\w+$/, algorithm: 'MD5' },
-  ],
+  fallbackAfterMs: 3000, // no live session by then: requests go to the network
+  requestTimeoutMs: 10000, // a GET without a response head by then goes to the network
 });
 self.addEventListener('fetch', (e) => e.respondWith(router.fetch(e.request)));
 ```
 
-- A request goes to the network instead, logged and reported as a `fallback` event with its reason,
-  when no session is live, or for a GET or HEAD when the lines fail it or do not answer in time. Any
-  other method is sent at most once over the lines.
-- Integrity: a file whose path matches a rule carries a hash of its content in its name (the
-  capture group, a prefix of the hex digest). Its body streams through at once except the last
-  piece, which is released only once the digest matches; on a mismatch the body fails, so no cache
-  stores it, and that URL goes to the network from then on. `MD5`, `SHA-1`, `SHA-256`, `SHA-384`
-  and `SHA-512` are supported.
+A page and its service worker each hold their own client and their own session: the worker carries
+what the browser fetches, the page what it fetches itself.
+
+`Client` options:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `entry` | (required) | Origin the line list is fetched from. An `https` entry accepts only `https` lines. |
+| `site` | the entry's host | Every line must be on this host or a subdomain of it; `null` allows any host. |
+| `store` | none | A `LineStore` (`load()` and `save(stored)` of `{entry, lines}`) that keeps the last list across restarts. |
+| `linkPath`, `linesPath` | `/multipath/v3/link`, `/multipath/v3/lines` | Paths on the lines and on the entry. |
+| `refreshMs` | 10 minutes | Interval of line list refreshes. |
+| `waitMs` | 10 s | How long a request waits for a live session before it fails. |
+| `recvWindow` | 1 MiB | Receive credit of each stream. |
+| `compression` | `true` | Ask for gzip and decode it with `DecompressionStream`. |
+| `buffered` | `false` | Read each response whole before returning it, for platforms whose `Response` cannot stream. |
+| `onEvent` | none | Told about every line up or down, session start or end, and router fallback. |
+| `log` | `console.info` | One line per event. |
+
+`Client` methods: `fetch(input, init)` resolves when the response head arrives and streams the body;
+the stream is released as soon as the body is complete or abandoned, and an abort signal resets it.
+`openWebSocket(path, protocols)` opens a WebSocket to the entry's host. `live(timeoutMs)` resolves
+whether a session became live in time. `stats()` is a snapshot of the session, lines and streams.
+`close()` says GOODBYE and stops.
+
+`createLineRouter` takes the `Client` options plus:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `fallbackAfterMs` | 3000 | Without a live session this long after the router starts, requests go to the network. |
+| `requestTimeoutMs` | 10000 | A GET or HEAD without a response head this long after it was sent goes to the network. |
+| `fallback` | the platform's `fetch` | What "the network" is. |
+| `integrity` | none | Rules for static files that carry a hash of their content in their name (below). |
+
+Every fallback is logged and reported as a `fallback` event with its reason. A GET or HEAD that
+fails over the lines is sent to the network; any other method is sent at most once, over the lines.
+
+Integrity rules make sure a cache never keeps a corrupted static file. A rule is a pattern with one
+capture group, the hex hash in the file's name (a prefix of its digest), and an algorithm (`MD5`,
+`SHA-1`, `SHA-256`, `SHA-384` or `SHA-512`). A matching file's body streams through at once except
+its last piece, which is released only once the digest matches; on a mismatch the body fails and
+that URL goes to the network from then on.
+
+```ts
+integrity: [{ pattern: /\/static\/js\/[^/]+-([0-9a-f]{32})\.js$/, algorithm: 'MD5' }],
+```
+
+**Platforms.**
+
+- Browsers and service workers need nothing special. Browsers throttle timers in background tabs; a
+  session that misses its pings there ends and is replaced, as after a network change.
+- React Native: pass `compression: false` and `buffered: true` (there is no `DecompressionStream`,
+  and its `Response` cannot take a stream); the constructor refuses the defaults there rather than
+  degrade quietly.
+- Node 22 and later: the built-in `WebSocket` and `fetch` are used.
+
+With `compression`, the target decides what to compress: for nginx, `gzip on` with `gzip_types` for
+scripts, stylesheets, JSON and fonts. Over a slow line a first page load shrinks to about a quarter.
+
+### Adding a line
+
+1. Make the new path reach the server's link and lines paths: a DNS name on a CDN, a relay, a port.
+   For TLS, the front of that path terminates it.
+2. Check it on its own with the two `curl` commands above: the list is printed, and the link
+   endpoint answers `101 Switching Protocols`.
+3. Add it to the lines file: `{"id": "new", "url": "https://new.example.app"}`. No restart: the
+   server reads the file on every request.
+4. Clients pick it up with their next session or refresh (10 minutes by default) and dial it in the
+   running session. Removing a line works the same way: clients close its links once another line
+   is up.
+
+Browsers accept only lines on the entry's site, so a new line for a web client is a subdomain of the
+entry's host (or `site` is set to a parent domain).
 
 ## Observability
 
@@ -211,47 +507,60 @@ session start (with the peer's implementation and the client address), every lin
 the reason, every REJECT with the reason, stream failures, session end with the reason, and every
 limit violation. Nothing is retried or given up silently.
 
-- The server's `-status` endpoint and its periodic log line give the live counts of sessions, links,
-  streams, target connections and goroutines.
-- The client's `/status` gives the session (id, state, age, bytes sent, unacknowledged and received),
-  every line (state, milliseconds since its last byte, bytes in and out, reconnects, last reason),
-  every open stream (bytes in and out, buffered bytes, send credit), and why the previous session
-  ended.
+- The server: the `-status` counters and the periodic `status:` log line (sessions, links, streams,
+  target connections, goroutines).
+- The client: `GET /status` on its `-status` address (or `client.stats()` in JavaScript) gives the
+  session (id, state, age, bytes sent, unacknowledged and received), every line (state, milliseconds
+  since its last byte, bytes in and out, reconnects, last reason), every open stream (bytes in and
+  out, buffered bytes, send credit), the number of sessions started and why the previous one ended.
 
-## Resources and limits
+## The repository
 
-Every server resource is bounded by the number of live TCP connections times a constant
-(PROTOCOL.md section 8): a session needs a live link and ends with its last one; a link costs one
-reader and one writer goroutine and at most `window + 128 KiB` of queued bytes; a stream costs one
-target connection and two splice goroutines; all timers run on one shared clock. A connection that
-does not finish its handshake within 5 seconds is closed.
+| Path | What it is |
+|---|---|
+| [`PROTOCOL.md`](./PROTOCOL.md) | The normative wire protocol, version 3. |
+| `go/cmd/multipath-server`, `go/cmd/multipath-client` | The two programs. |
+| `go/protocol` | Frames, limits and the line list. |
+| `go/link` | WebSocket links and HTTP proxies. |
+| `go/session` | The redundant byte stream: offsets, acknowledgements, replay, liveness. |
+| `go/mux` | Streams with credit inside a session. |
+| `go/server`, `go/client` | The server and client as Go packages, used by the programs. |
+| `js/` | `@micro-teams/multipath`, the JavaScript client and the service worker's line router. |
+| `spec/vectors/` | The encoding of every frame, shared by all implementations' tests. |
+| `conformance/` | A fault-injecting proxy and scenarios that run the real programs through broken lines and attacks. |
 
-`-stream-window` is the credit the server grants each stream, and so bounds what it buffers per
-stream for uploads; downloads move as much per round trip as the client grants (1 MiB in both
-clients, PROTOCOL.md section 6).
+Tests:
 
-## Development
+```sh
+cd go && go vet ./... && go test -race ./...           # Go unit tests
+cd js && npm ci && npm test                            # JavaScript unit tests, with the shared vectors
+conformance/run.sh                                     # the real programs through faults
+MP_BROWSER=1 conformance/run.sh                        # also in Chromium (npx playwright install chromium in js/)
+```
 
-- `cd go && go vet ./... && go test -race ./...` runs the unit tests.
-- `cd js && npm ci && npm test` runs the JavaScript unit tests, including the shared vectors;
-  `npm run lint`, `npm run format:check` and `npm run build` are what CI runs besides.
-- `conformance/run.sh` builds both binaries and the JavaScript package and runs the conformance
-  scenarios against them, first with the Go client, then with the JavaScript client in Node:
-  impaired lines, a stalled line, links cut hundreds of times, server restarts, a network switch, a
-  long session, a slow distant line, and attacks. `MP_BROWSER=1` adds the Chromium leg (after
-  `npx playwright install chromium` in `js/`). It prints the measured recovery times and resource
-  counts at the end.
-- A change to the wire changes `PROTOCOL.md`, `spec/vectors/frames.json` and the code together.
-  `go test ./protocol -run Vectors -update` rewrites the vectors' hex from their fields.
-- Read [`AGENTS.md`](./AGENTS.md) for the repository's rules.
+The conformance suite builds both programs and the JavaScript package, then runs every scenario
+with production timeouts, first with the Go client and then with the JavaScript client in Node:
+impaired lines, a stalled line, links cut hundreds of times, server restarts, a network switch, a
+long session, a slow distant line, and attacks. It prints the measured recovery times and resource
+counts at the end. CI also runs `npm run lint`, `npm run format:check` and `npm run build` in
+`js/`.
 
-## Releasing
+A change to the wire changes `PROTOCOL.md`, `spec/vectors/frames.json` and the code together;
+`go test ./protocol -run Vectors -update` rewrites the vectors' hex from their fields. The
+repository's rules are in [`AGENTS.md`](./AGENTS.md).
+
+## Versions and releases
+
+The protocol version (3) and the release version (in `VERSION`) are separate. Protocol version 3
+is served on its own paths (`/multipath/v3/...`), so a server of another protocol version can run
+beside it during a migration; new frame types can be added without a version change, because
+unknown ones are skipped. What changed in each release is in [`CHANGELOG.md`](./CHANGELOG.md).
 
 `scripts/version.sh` sets the version in `VERSION`, the Go and JavaScript implementation strings and
 `js/package.json`, and its header describes how a release is tagged. CI refuses a tag that disagrees
-with any of them, and publishes `@micro-teams/multipath` to GitHub Packages from the tag; nothing is
-published from a branch. The Go module needs no publishing:
-`go get github.com/micro-teams/multipath/go@go/v<version>` resolves the tag.
+with any of them and publishes the npm package from the tag; nothing is published from a branch. The
+Go module needs no publishing: `go get github.com/micro-teams/multipath/go@go/v<version>` resolves
+the tag.
 
 ## License
 
