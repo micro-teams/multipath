@@ -1,12 +1,15 @@
 // The session and its links (src/session.ts, src/link.ts) against an in-memory server half: the
 // replay on attach and its order, the reorder buffer and its bounds, ACKs only on change, the three
-// liveness rules, the bounded send queue, and the end of a session with its last link or the peer's
-// GOODBYE.
+// liveness rules, the bounded send queue, the end of a session with its last link or the peer's
+// GOODBYE, and the reason a link's socket failed.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Session } from '../src/session.js';
 import {
   FrameType,
+  IMPLEMENTATION,
   MIN_WINDOW,
+  Mode,
+  VERSION,
   decodeData,
   decodeU64,
   defaultLimits,
@@ -15,6 +18,7 @@ import {
   encodeGoodbye,
   type Limits,
 } from '../src/protocol.js';
+import { Link } from '../src/link.js';
 import { FakeWebSocket, dialFake, frames } from './fakes.js';
 
 const limits: Limits = { ...defaultLimits(), window: MIN_WINDOW };
@@ -200,3 +204,42 @@ async function dialFakeWithFakeTimers(index = 0) {
   await vi.advanceTimersByTimeAsync(0);
   return p;
 }
+
+describe('a failed socket', () => {
+  const hello = {
+    version: VERSION,
+    session: new Uint8Array(16),
+    link: 0,
+    mode: Mode.New,
+    impl: IMPLEMENTATION,
+  };
+
+  it('names what the platform said, when its error event says anything', async () => {
+    FakeWebSocket.answer = () => null;
+    const dialing = Link.dial('ws://fake/link', hello, FakeWebSocket, 1000);
+    await tick(); // open, and the HELLO sent
+    FakeWebSocket.all[FakeWebSocket.all.length - 1].onerror?.({
+      message: 'SSLHandshakeException: connection closed',
+    });
+    await expect(dialing).rejects.toThrow(
+      'connection failed: SSLHandshakeException: connection closed',
+    );
+  });
+
+  it('is only "connection failed" for a browser, whose error event says nothing', async () => {
+    FakeWebSocket.answer = () => null;
+    const dialing = Link.dial('ws://fake/link', hello, FakeWebSocket, 1000);
+    await tick(); // open, and the HELLO sent
+    FakeWebSocket.all[FakeWebSocket.all.length - 1].onerror?.({});
+    await expect(dialing).rejects.toThrow(/^connection failed$/);
+  });
+
+  it('names it for a live link too', async () => {
+    const { link, ws } = await dialFake(limits);
+    let why = '';
+    link.start({ onMessage: () => {}, onClose: (r) => (why = r) }, 1 << 20, () => 0);
+    await tick();
+    ws.onerror?.({ message: 'Software caused connection abort' });
+    expect(why).toBe('connection failed: Software caused connection abort');
+  });
+});
