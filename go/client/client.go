@@ -6,16 +6,24 @@
 // (directly or through the configured HTTP proxy), and keeps every line dialled for the life of the
 // session: a line that fails is retried with backoff, never given up. When the session ends (every
 // link dead, the server lost it, or the server said goodbye) its streams fail at once and the client
-// starts a new session with a freshly fetched line list. The list is also refreshed periodically and
-// replaces the old one; lines that left it are closed, new ones are dialled.
+// starts a new session. The list is also refreshed periodically and replaces the old one; lines that
+// left it are closed, new ones are dialled.
 //
-// This file: configuration, the session loop and the local port. lines.go fetches the line list;
-// session.go runs one session and its lines; status.go reports state.
+// The last list the entry served is kept (in memory, and in the Config.LinesCache file across
+// restarts). A new session starts from the kept list at once while the entry is asked again, so an
+// unreachable entry delays nothing when the lines themselves work; the entry is asked again with
+// backoff until it answers, and its answer replaces the kept list in that session. Only the first
+// session of a client that has never had a list waits for the entry.
 //
-//   - Config: the local listen address, the entry, the paths, proxy and TLS settings, timings, the
-//     log function. DefaultLinkPath and DefaultLinesPath are the server's default paths.
+// This file: configuration, the session loop and the local port. lines.go fetches, keeps and stores
+// the line list; session.go runs one session and its lines; status.go reports state.
 //
-//   - New(cfg) validates cfg and binds the local port (so Addr is known before Run).
+//   - Config: the local listen address, the entry, the paths, proxy and TLS settings, the line list
+//     cache file, timings, the log function. DefaultLinkPath and DefaultLinesPath are the server's
+//     default paths.
+//
+//   - New(cfg) validates cfg, loads the line list cache (an unusable one is logged and ignored), and
+//     binds the local port (so Addr is known before Run).
 //
 //   - (*Client).Addr() is the bound local address.
 //
@@ -26,8 +34,8 @@
 //
 //     c, err := client.New(client.Config{Listen: "127.0.0.1:7000", Entry: "https://example.app",
 //     LinkPath: client.DefaultLinkPath, LinesPath: client.DefaultLinesPath,
-//     Proxy: http.ProxyFromEnvironment, Refresh: 10 * time.Minute, Wait: 10 * time.Second,
-//     Logf: log.Printf})
+//     Proxy: http.ProxyFromEnvironment, LinesCache: "/var/lib/app/lines.json",
+//     Refresh: 10 * time.Minute, Wait: 10 * time.Second, Logf: log.Printf})
 //     err = c.Run(ctx)
 package client
 
@@ -46,6 +54,7 @@ import (
 	"time"
 
 	"github.com/micro-teams/multipath/go/mux"
+	"github.com/micro-teams/multipath/go/protocol"
 	"github.com/micro-teams/multipath/go/session"
 )
 
@@ -57,16 +66,17 @@ const (
 
 // Config configures a Client.
 type Config struct {
-	Listen    string                                // local address programs connect to
-	Entry     string                                // origin the line list is fetched from
-	LinkPath  string                                // appended to every line's URL
-	LinesPath string                                // appended to the entry
-	Proxy     func(*http.Request) (*url.URL, error) // nil means connect directly
-	TLSConfig *tls.Config                           // nil means the system roots
-	Refresh   time.Duration                         // how often the line list is re-fetched
-	Wait      time.Duration                         // how long a local connection waits for a live session
-	Logf      func(format string, args ...any)
-	Clock     *session.Clock // nil means session.DefaultClock()
+	Listen     string                                // local address programs connect to
+	Entry      string                                // origin the line list is fetched from
+	LinkPath   string                                // appended to every line's URL
+	LinesPath  string                                // appended to the entry
+	Proxy      func(*http.Request) (*url.URL, error) // nil means connect directly
+	TLSConfig  *tls.Config                           // nil means the system roots
+	LinesCache string                                // file keeping the last line list; "" keeps it in memory only
+	Refresh    time.Duration                         // how often the line list is re-fetched
+	Wait       time.Duration                         // how long a local connection waits for a live session
+	Logf       func(format string, args ...any)
+	Clock      *session.Clock // nil means session.DefaultClock()
 }
 
 // Client is a running client.
@@ -77,10 +87,12 @@ type Client struct {
 
 	mu       sync.Mutex
 	current  *clientSession
-	changed  chan struct{} // closed and replaced whenever current changes
-	sessions int           // sessions started
-	lastEnd  string        // why the previous session ended
-	conns    atomic.Int64  // local connections being served
+	changed  chan struct{}   // closed and replaced whenever current changes
+	sessions int             // sessions started
+	lastEnd  string          // why the previous session ended
+	known    []protocol.Line // the last list the entry served (or the cache file held); nil before any
+	knownAt  time.Time       // when the entry served it
+	conns    atomic.Int64    // local connections being served
 }
 
 // New validates cfg and binds the local port.
@@ -101,7 +113,15 @@ func New(cfg Config) (*Client, error) {
 		return nil, err
 	}
 	hc := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: cfg.Proxy, TLSClientConfig: cfg.TLSConfig}}
-	return &Client{cfg: cfg, ln: ln, http: hc, changed: make(chan struct{})}, nil
+	c := &Client{cfg: cfg, ln: ln, http: hc, changed: make(chan struct{})}
+	if cfg.LinesCache != "" {
+		if err := c.loadCache(); err != nil {
+			cfg.Logf("line list cache %s unusable, the first session waits for the entry: %v", cfg.LinesCache, err)
+		} else if c.known != nil {
+			cfg.Logf("line list cache %s: %d lines, fetched at %s", cfg.LinesCache, len(c.known), c.knownAt.Format(time.RFC3339))
+		}
+	}
+	return c, nil
 }
 
 // Addr returns the local address programs connect to.
@@ -128,16 +148,24 @@ func (c *Client) Run(ctx context.Context) error {
 func (c *Client) sessionLoop(ctx context.Context) {
 	retry := 250 * time.Millisecond
 	for ctx.Err() == nil {
-		lines, err := c.fetchLines(ctx)
-		if err != nil {
-			c.cfg.Logf("line list: %v; retrying in %v", err, retry)
-			sleep(ctx, retry)
-			retry = min(2*retry, 30*time.Second)
-			continue
+		lines, at := c.knownLines()
+		kept := lines != nil
+		if !kept {
+			var err error
+			if lines, err = c.updateLines(ctx); err != nil {
+				c.cfg.Logf("line list: %v; retrying in %v", err, retry)
+				sleep(ctx, retry)
+				retry = min(2*retry, 30*time.Second)
+				continue
+			}
+			retry = 250 * time.Millisecond
 		}
-		retry = 250 * time.Millisecond
 		cs := newClientSession(c, lines)
 		c.setCurrent(cs)
+		if kept {
+			c.cfg.Logf("session %s uses the line list fetched at %s while the entry is asked again", cs.id, at.Format(time.RFC3339))
+			go c.renewLines(cs)
+		}
 		select {
 		case <-ctx.Done():
 			cs.s.Goodbye("client shutting down")
@@ -154,6 +182,25 @@ func (c *Client) sessionLoop(ctx context.Context) {
 			c.cfg.Logf("starting a new session in %v", d.Round(time.Millisecond))
 			sleep(ctx, d)
 		}
+	}
+}
+
+// renewLines asks the entry for the list until it answers or the session ends, and applies the
+// answer to the session, which until then runs on the kept list.
+func (c *Client) renewLines(cs *clientSession) {
+	retry := time.Second
+	for {
+		lines, err := c.updateLines(cs.ctx)
+		if err == nil {
+			cs.applyLines(lines)
+			return
+		}
+		if cs.ctx.Err() != nil {
+			return
+		}
+		c.cfg.Logf("line list: %v; session %s stays on the kept list, asking again in %v", err, cs.id, retry)
+		sleep(cs.ctx, retry)
+		retry = min(2*retry, 30*time.Second)
 	}
 }
 
@@ -243,7 +290,7 @@ func (c *Client) refreshLoop(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		lines, err := c.fetchLines(ctx)
+		lines, err := c.updateLines(ctx)
 		if err != nil {
 			c.cfg.Logf("line list refresh: %v; keeping the current lines", err)
 			continue

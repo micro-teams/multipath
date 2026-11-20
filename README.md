@@ -96,6 +96,7 @@ curl -H 'Host: example.app' http://127.0.0.1:7000/
 | `-entry` | (required) | The origin the line list is fetched from. An `https` entry accepts only `https` lines. |
 | `-listen` | `127.0.0.1:7000` | Local address programs connect to. |
 | `-status` | off | Local address serving `GET /status` as JSON. |
+| `-lines-cache` | off | File keeping the last line list the entry served, so that after a restart a session starts from it while the entry is unreachable. |
 | `-proxy` | from the environment | `http://` proxy for lines and the line list. Without it, `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` apply. |
 | `-link-path`, `-lines-path` | the server's defaults | Paths on the lines and on the entry. |
 | `-refresh` | `10m` | Interval of line list refreshes; a refreshed list replaces the old one. |
@@ -106,6 +107,12 @@ whole session. Liveness timings come from the server: the client pings every 0.5
 link that is silent for 1 s, or whose acknowledgements stop for 3 s while it has data in flight.
 Each stream grants the server 1 MiB of credit, so one download moves up to 1 MiB per round trip.
 When the last link dies, every open stream fails at once and the client starts a new session.
+
+The client keeps the last line list its entry served, in memory and in the `-lines-cache` file. A
+new session dials the kept list at once while the entry is asked again, so an entry that is down
+or slow does not stop the lines from working; the client logs that it runs on the kept list and
+asks the entry again with backoff (1 s to 30 s) until it answers. The answer replaces the kept
+list. The file holds the entry it came from, and a client of another entry ignores it.
 
 ## The JavaScript client
 
@@ -131,7 +138,7 @@ await client.close(); // GOODBYE
 |---|---|---|
 | `entry` | (required) | Origin the line list is fetched from. An `https` entry accepts only `https` lines. |
 | `site` | the entry's host | Every line must be on this host or a subdomain of it; `null` allows any host. |
-| `store` | none | Keeps the last list across restarts; it is dialled at once while the fresh list is fetched. |
+| `store` | none | Keeps the last list and its entry across restarts; it is dialled at once while the fresh list is fetched, and ignored by a client of another entry. |
 | `linkPath`, `linesPath` | the server's defaults | Paths on the lines and on the entry. |
 | `refreshMs` | 10 minutes | Interval of line list refreshes. |
 | `waitMs` | 10 s | How long a request waits for a live session before it fails. |

@@ -25,7 +25,8 @@
 //     LineRouter: fetch(request) answers a request over the lines or the network, stats() is the
 //     client's ClientStats, close() closes the client.
 //   - cacheLineStore(cacheName, key, caches) is a LineStore in Cache Storage, the one store a service
-//     worker keeps across restarts: the list as JSON under key (a URL nothing serves) in cacheName.
+//     worker keeps across restarts: the StoredLines as JSON under key (a URL nothing serves) in
+//     cacheName. The client checks what it loads.
 //
 //     const router = createLineRouter({
 //       entry: self.location.origin,
@@ -33,9 +34,14 @@
 //       integrity: [{ pattern: /-([0-9a-f]{32})\.js$/, algorithm: 'MD5' }],
 //     });
 //     self.addEventListener('fetch', (e) => e.respondWith(router.fetch(e.request)));
-import { Client, type ClientOptions, type ClientStats, type LineStore } from './client.js';
+import {
+  Client,
+  type ClientOptions,
+  type ClientStats,
+  type LineStore,
+  type StoredLines,
+} from './client.js';
 import { hexDigest, type HashAlgorithm } from './hash.js';
-import { parseLines, type Line } from './lines.js';
 
 export interface IntegrityRule {
   pattern: RegExp;
@@ -77,12 +83,12 @@ export function cacheLineStore(
   caches: CachesLike = (globalThis as unknown as { caches: CachesLike }).caches,
 ): LineStore {
   return {
-    async load(): Promise<Line[]> {
+    async load(): Promise<StoredLines | null> {
       const held = await (await caches.open(cacheName)).match(key);
-      return held ? parseLines({ lines: await held.json() }) : [];
+      return held ? ((await held.json()) as StoredLines) : null;
     },
-    async save(lines) {
-      const body = JSON.stringify(lines);
+    async save(stored) {
+      const body = JSON.stringify(stored);
       const headers = { 'Content-Type': 'application/json' };
       await (await caches.open(cacheName)).put(key, new Response(body, { headers }));
     },

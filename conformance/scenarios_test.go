@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -320,5 +322,40 @@ func TestSlowLine(t *testing.T) {
 		strings.Join(loads, " and "), worst.Round(time.Millisecond), st.Lines[0].Reconnects, st.Lines[0].LastReason, st.SessionsStarted)
 	if st.SessionsStarted != 1 {
 		t.Fatalf("%d sessions started", st.SessionsStarted)
+	}
+}
+
+// The entry stops answering while every line works, and the client restarts meanwhile, as when the
+// origin that serves the line list is down for minutes and the machine reboots. A client that kept
+// the entry's list in its cache file must start a session from it and serve requests within a few
+// seconds, whether the entry refuses connections or swallows them until the fetch times out.
+func TestEntryUnreachable(t *testing.T) {
+	for name, mode := range map[string]faultproxy.Mode{"refused": faultproxy.Refuse, "silent": faultproxy.Blackhole} {
+		t.Run(name, func(t *testing.T) {
+			s := newServerOnly(t, 2)
+			entry, err := faultproxy.Listen(s.serverAddr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(entry.Close)
+			cache := filepath.Join(t.TempDir(), "lines.json")
+			s.startClient("http://"+entry.Addr(), "-lines-cache", cache)
+			s.waitLinesUp(2, 10*time.Second)
+			s.mustGet("/small")
+			s.waitFor("the line list cache", 5*time.Second, func() bool { _, err := os.Stat(cache); return err == nil })
+			s.client.stop(syscall.SIGTERM)
+			entry.Set(faultproxy.Fault{Mode: mode}, faultproxy.ScopeAll)
+			restarted := time.Now()
+			s.startClient("http://"+entry.Addr(), "-lines-cache", cache)
+			recovery, err := firstSuccess(s, restarted, 10*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.waitLinesUp(2, 5*time.Second)
+			measure(t, "entry %s: first request %v after the client restarted", name, recovery.Round(time.Millisecond))
+			if recovery > 3*time.Second {
+				t.Fatalf("the first request took %v with the entry %s", recovery, name)
+			}
+		})
 	}
 }

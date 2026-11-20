@@ -1,5 +1,6 @@
 // The client's session lifecycle (src/client.ts) against in-memory links: which lines it dials and
-// when, how a fetched list replaces the stored one, how a list breaking the policy is refused, and
+// when, how a fetched list replaces the stored one, how a stored list carries a session while the
+// entry is unreachable (and only for its own entry), how a list breaking the policy is refused, and
 // that a server which lost the session (REJECT, or a second "created") makes the client start a new
 // session. Data over a live session is proven by the conformance suite against the real server.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -81,7 +82,7 @@ describe('client', () => {
   it('dials the stored lines at once, and the fetched list replaces them', async () => {
     const saved: unknown[] = [];
     const store: LineStore = {
-      load: async () => lines('old.app.example').lines,
+      load: async () => ({ entry: 'https://app.example', lines: lines('old.app.example').lines }),
       save: async (l) => void saved.push(l),
     };
     let release: () => void = () => {};
@@ -99,7 +100,45 @@ describe('client', () => {
       expect(client.stats().lines.map((l) => l.url)).toEqual(['https://new.app.example']),
     );
     expect(FakeWebSocket.all[0].closed).toBe(true);
-    expect(saved).toEqual([lines('new.app.example').lines]);
+    expect(saved).toEqual([
+      { entry: 'https://app.example', lines: lines('new.app.example').lines },
+    ]);
+  });
+
+  it('runs on the stored lines while the entry is unreachable, and asks it until it answers', async () => {
+    const store: LineStore = {
+      load: async () => ({ entry: 'https://app.example', lines: lines('old.app.example').lines }),
+      save: async () => undefined,
+    };
+    let reachable = false;
+    const fetch = vi.fn(async () => {
+      if (!reachable) throw new TypeError('fetch failed: connect ECONNREFUSED');
+      return new Response(JSON.stringify(lines('new.app.example')));
+    });
+    const { client, log } = start(fetch as never, { store });
+    clients.push(client);
+    expect(await client.live(1000)).toBe(true);
+    expect(urls()).toEqual(['wss://old.app.example/multipath/v3/link']);
+    await vi.waitFor(() => expect(log.join('\n')).toMatch(/ECONNREFUSED/));
+    expect(log.join('\n')).toMatch(/stays on the kept line list, asking again in 1000 ms/);
+    reachable = true;
+    await vi.waitFor(
+      () => expect(client.stats().lines.map((l) => l.url)).toEqual(['https://new.app.example']),
+      { timeout: 3000 },
+    );
+    expect(client.stats().sessionsStarted).toBe(1);
+  });
+
+  it('ignores a stored list of another entry and waits for its own', async () => {
+    const store: LineStore = {
+      load: async () => ({ entry: 'https://other.example', lines: lines('a.app.example').lines }),
+      save: async () => undefined,
+    };
+    const { client, log } = start(listFetch(lines('b.app.example')), { store });
+    clients.push(client);
+    expect(await client.live(1000)).toBe(true);
+    expect(urls()).toEqual(['wss://b.app.example/multipath/v3/link']);
+    expect(log.join('\n')).toMatch(/holds the list of entry https:\/\/other.example/);
   });
 
   it('refuses a list with a line outside the site, or plain http under an https entry', async () => {

@@ -261,21 +261,27 @@ func newServerOnly(t *testing.T, n int) *stack {
 	return s
 }
 
-// newStack adds a client to newServerOnly and waits until all n lines are up.
+// newStack adds a client to newServerOnly, with the server as its entry, and waits until all n
+// lines are up.
 func newStack(t *testing.T, n int) *stack {
 	s := newServerOnly(t, n)
-	s.clientAddr, s.clientStatus = freeAddr(t), freeAddr(t)
-	args := []string{"-listen", s.clientAddr, "-entry", "http://" + s.serverAddr, "-status", s.clientStatus}
+	s.startClient("http://" + s.serverAddr)
+	s.waitLinesUp(n, 10*time.Second)
+	return s
+}
+
+// startClient starts a client of entry on fresh ports, with extra flags; it replaces s.client.
+func (s *stack) startClient(entry string, extra ...string) {
+	s.clientAddr, s.clientStatus = freeAddr(s.t), freeAddr(s.t)
+	args := append([]string{"-listen", s.clientAddr, "-entry", entry, "-status", s.clientStatus}, extra...)
 	if os.Getenv("MP_CLIENT") == "js" {
 		if w := os.Getenv("MP_RECV_WINDOW"); w != "" {
 			args = append(args, "-recv-window", w)
 		}
-		s.client = startProc(t, "client.log", "node", append([]string{jsClient}, args...)...)
+		s.client = startProc(s.t, "client.log", "node", append([]string{jsClient}, args...)...)
 	} else {
-		s.client = startProc(t, "client.log", bin(t, "multipath-client"), args...)
+		s.client = startProc(s.t, "client.log", bin(s.t, "multipath-client"), args...)
 	}
-	s.waitLinesUp(n, 10*time.Second)
-	return s
 }
 
 func (s *stack) startServer() {

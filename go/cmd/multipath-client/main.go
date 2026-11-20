@@ -3,10 +3,13 @@
 //
 // Configuration is by flags only (run with -h for the list):
 //
-//	multipath-client -listen 127.0.0.1:7000 -entry https://example.app -status 127.0.0.1:7001
+//	multipath-client -listen 127.0.0.1:7000 -entry https://example.app -status 127.0.0.1:7001 \
+//	  -lines-cache /var/lib/app/lines.json
 //
 // The proxy for lines and the line list comes from HTTPS_PROXY, HTTP_PROXY and NO_PROXY unless
 // -proxy names one. -status serves the client's state as JSON at /status on a local address.
+// -lines-cache keeps the last line list in a file, so that after a restart a session starts from it
+// while the entry is unreachable.
 // SIGINT or SIGTERM sends GOODBYE before exiting, so the server releases the session at once.
 package main
 
@@ -32,6 +35,7 @@ func main() {
 	linesPath := flag.String("lines-path", client.DefaultLinesPath, "path of the line list on the entry")
 	proxy := flag.String("proxy", "", "http:// proxy for lines and the line list (default: from HTTPS_PROXY and HTTP_PROXY)")
 	status := flag.String("status", "", "local address serving GET /status as JSON (off when empty)")
+	linesCache := flag.String("lines-cache", "", "file keeping the last line list across restarts (memory only when empty)")
 	refresh := flag.Duration("refresh", 10*time.Minute, "interval of line list refreshes")
 	wait := flag.Duration("wait", 10*time.Second, "how long a local connection waits for a live session")
 	flag.Parse()
@@ -45,7 +49,7 @@ func main() {
 		proxyFunc = http.ProxyURL(u)
 	}
 	c, err := client.New(client.Config{Listen: *listen, Entry: *entry, LinkPath: *linkPath, LinesPath: *linesPath,
-		Proxy: proxyFunc, Refresh: *refresh, Wait: *wait, Logf: log.Printf})
+		Proxy: proxyFunc, LinesCache: *linesCache, Refresh: *refresh, Wait: *wait, Logf: log.Printf})
 	if err != nil {
 		log.Fatalf("configuration: %v", err)
 	}
