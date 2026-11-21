@@ -1,5 +1,5 @@
 // Tests for the client against an in-process server: HTTP requests through the local port reach the
-// target, the status reports the session and its lines, a refreshed line list replaces the old one,
+// target, the status reports the session and its lines (each answering, with its round trip), a refreshed line list replaces the old one,
 // an https entry refuses plain lines, a local connection without a live session is refused after
 // the configured wait, the fetched list is stored in the cache file, and a stored list starts a
 // session while the entry is unreachable, but only for the entry that served it, and a line whose
@@ -145,11 +145,11 @@ func TestRequestsReachTheTarget(t *testing.T) {
 			t.Fatalf("answer %q", got)
 		}
 	}
-	waitFor(t, "all lines up", func() bool {
+	waitFor(t, "all lines up, answering and measured", func() bool {
 		st := f.client.Status()
 		up := 0
 		for _, l := range st.Lines {
-			if l.State == "up" {
+			if l.State == "up" && !l.Soft && l.RTTMs > 0 {
 				up++
 			}
 		}

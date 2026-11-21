@@ -52,7 +52,7 @@ type LineStatus struct {
 	URL           string `json:"url"`
 	State         string `json:"state"`           // "connecting", "up" or "down"
 	Soft          bool   `json:"soft,omitempty"`  // up, but silent since the due ping round: no new data on it
-	RTTMs         int64  `json:"rttMs,omitempty"` // smoothed ping round trip; absent before the first answer
+	RTTMs         int64  `json:"rttMs,omitempty"` // smoothed ping round trip, rounded up; absent before the first answer
 	LastByteAgoMs int64  `json:"lastByteAgoMs,omitempty"`
 	BytesIn       int64  `json:"bytesIn"`
 	BytesOut      int64  `json:"bytesOut"`
@@ -107,7 +107,8 @@ func (c *Client) Status() Status {
 			if l.Index == sl.index {
 				ls.LastByteAgoMs = time.Since(l.LastByte).Milliseconds()
 				ls.BytesIn, ls.BytesOut = l.BytesIn, l.BytesOut
-				ls.Soft, ls.RTTMs = l.Soft, l.RTT.Milliseconds()
+				// Rounded up, so that a measured round trip under a millisecond is not taken for none.
+				ls.Soft, ls.RTTMs = l.Soft, (l.RTT + time.Millisecond - 1).Milliseconds()
 			}
 		}
 		st.Lines = append(st.Lines, ls)

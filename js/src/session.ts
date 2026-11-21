@@ -440,8 +440,9 @@ export class Session {
   // onPong folds the round trip of a PING sent at `sent` (its nonce, in ms) into the link's smoothed
   // round trip, with the weight of RFC 6298.
   private onPong(a: Attached, sent: bigint): void {
-    const sample = Date.now() - Number(sent);
-    if (sample < 0 || sample > 60_000) return; // not a nonce this client sent; nothing to learn
+    const elapsed = Date.now() - Number(sent);
+    if (elapsed < 0 || elapsed > 60_000) return; // not a nonce this client sent; nothing to learn
+    const sample = Math.max(1, elapsed); // the clock counts whole ms; 0 would read as no measurement
     a.srtt = a.srtt === 0 ? sample : a.srtt + (sample - a.srtt) / 8;
   }
 
@@ -541,7 +542,7 @@ export class Session {
           bytesOut: a.link.bytesOut,
           queued: a.link.queued(),
           soft: a.soft,
-          rttMs: Math.round(a.srtt),
+          rttMs: Math.ceil(a.srtt),
         })),
     };
   }
