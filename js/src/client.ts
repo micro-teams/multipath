@@ -4,8 +4,12 @@
 //
 // The client runs one session at a time. It fetches the line list from its entry, dials every line,
 // and keeps every line dialled for the life of the session: a line that fails is retried with backoff
-// (200 ms to 5 s, with jitter), never given up. When the session ends (every link dead, the server
-// lost it, or the server said goodbye) its streams fail at once and the client starts a new session;
+// (200 ms to 5 s, with jitter), never given up. When no link answers the session's PING round, every
+// line is dialled again at once into the same session, so a short outage of every line (a network
+// handover, a lift) costs no stream: a line whose link is still attached dials a replacement while
+// the old link stays, and a line waiting out its backoff dials now. When the session ends (the server
+// lost it, the server said goodbye, or no line answered for the server's dead time) its streams fail
+// at once and the client starts a new session;
 // after the server lost the session or said goodbye it first waits a random 0 to 2 s, so the clients
 // of a restarted server do not all return in the same instant. The line list is fetched again for
 // every session and every refreshMs, and the fetched list replaces the old one: new lines are
@@ -48,8 +52,10 @@
 //   - client.live(timeoutMs) resolves true once a session is live (a link is attached), false if none
 //     is within timeoutMs.
 //   - client.stats() is a ClientStats snapshot: the session (id, state, age, server implementation,
-//     bytes sent, unacknowledged and received, reorder buffer), every line (state, milliseconds since
-//     its last byte, bytes in and out, reconnects, last reason), every open stream (bytes in and out,
+//     bytes sent, unacknowledged and received, reorder buffer), every line (state, whether it is soft
+//     down, its smoothed round trip, milliseconds since its last byte, bytes in and out, reconnects,
+//     last reason; the answering line with the smallest round trip is the quickest way to the
+//     server), every open stream (bytes in and out,
 //     buffered bytes, send credit), the number of sessions started and why the previous one ended.
 //     It has the shape of the Go client's /status.
 //   - client.close() says goodbye to the server and stops; later requests fail.
@@ -62,6 +68,7 @@ import { RejectedError, Link, type WebSocketConstructor } from './link.js';
 import { checkLines, linkUrl, parseLines, type Line } from './lines.js';
 import { Mux } from './mux.js';
 import {
+  CONNECT_TIMEOUT_MS,
   HANDSHAKE_TIMEOUT_MS,
   IMPLEMENTATION,
   MIN_WINDOW,
@@ -125,6 +132,8 @@ export interface ClientStats {
     id: string;
     url: string;
     state: 'connecting' | 'up' | 'down';
+    soft: boolean;
+    rttMs: number;
     lastByteAgoMs: number;
     bytesIn: number;
     bytesOut: number;
@@ -418,7 +427,8 @@ interface Slot {
   index: number;
   line: Line;
   stop: AbortController;
-  down: ((why: string) => void) | null;
+  wake: (() => void) | null; // ends the slot's current wait: its link went down, or a redial is due
+  redial: boolean; // the session fell silent: dial again even while a link is attached
   state: 'connecting' | 'up' | 'down';
   reconnects: number;
   reason: string;
@@ -426,9 +436,10 @@ interface Slot {
 
 class ServerLostError extends Error {}
 
-// ClientSession is one session and its lines (PROTOCOL.md sections 4.2 and 5.5). Every line has a
-// slot: a loop that dials the line, performs the handshake, attaches the link, waits for it to die
-// and dials again. A REJECT for an unknown session, or a second WELCOME that says it created the
+// ClientSession is one session and its lines (PROTOCOL.md sections 4.2, 5.4 and 5.5). Every line has
+// a slot: a loop that dials the line, performs the handshake, attaches the link, waits for it to die
+// or for the session to fall silent, and dials again. Connection setup has CONNECT_TIMEOUT_MS, and
+// the HELLO its own HANDSHAKE_TIMEOUT_MS from the moment the socket is open. A REJECT for an unknown session, or a second WELCOME that says it created the
 // session, means the server lost the session (it restarted): the session ends at once.
 class ClientSession {
   readonly key = crypto.getRandomValues(new Uint8Array(16));
@@ -461,8 +472,28 @@ class ClientSession {
       deliver: (p) => this.mux!.feed(p), // data flows only after the first WELCOME, which made the mux
       onLink: (index, up, why) => {
         const sl = this.slots.get(index);
-        if (!up && sl?.down) sl.down(why);
+        if (!up && sl) {
+          this.set(sl, 'down', why);
+          c.log(`session ${this.id} line ${sl.line.id} down: ${why}`);
+          sl.wake?.();
+        }
         c.notify();
+      },
+      onSoft: (index, soft) => {
+        const sl = this.slots.get(index);
+        if (!sl) return;
+        c.log(
+          soft
+            ? `session ${this.id} line ${sl.line.id} soft down: silent since the due ping round; no new data on it`
+            : `session ${this.id} line ${sl.line.id} answers again`,
+        );
+      },
+      onSilent: () => {
+        c.log(`session ${this.id} silent: no line answers; redialling every line into it`);
+        for (const sl of this.slots.values()) {
+          sl.redial = true;
+          sl.wake?.();
+        }
       },
       onEnd: (why) => {
         this.stop.abort();
@@ -516,7 +547,8 @@ class ClientSession {
         index,
         line,
         stop,
-        down: null,
+        wake: null,
+        redial: false,
         state: 'connecting',
         reconnects: 0,
         reason: '',
@@ -535,7 +567,7 @@ class ClientSession {
   }
 
   private set(sl: Slot, state: Slot['state'], reason: string): void {
-    if (state === 'up' && sl.state === 'down') sl.reconnects++;
+    if (state === 'up' && sl.state !== 'connecting') sl.reconnects++; // every attach after the first
     const was = sl.state;
     sl.state = state;
     if (reason) sl.reason = reason;
@@ -556,9 +588,6 @@ class ClientSession {
   // runSlot keeps one line linked for as long as the slot lasts.
   private async runSlot(sl: Slot): Promise<void> {
     const signal = sl.stop.signal;
-    const stopped = new Promise<string>((resolve) =>
-      signal.addEventListener('abort', () => resolve('')),
-    );
     let backoff = 200;
     while (!signal.aborted) {
       try {
@@ -567,16 +596,12 @@ class ClientSession {
           link.close(); // the slot ended while dialling; nothing is waiting for this link
           return;
         }
-        const down = new Promise<string>((resolve) => (sl.down = resolve));
         this.session.attach(sl.index, link);
+        sl.redial = false; // a silence reported while this link was dialled is answered by it
         this.set(sl, 'up', '');
         this.c.log(`session ${this.id} line ${sl.line.id} up`);
         backoff = 200;
-        const why = await Promise.race([down, stopped]);
-        sl.down = null;
-        if (signal.aborted) return;
-        this.set(sl, 'down', why);
-        this.c.log(`session ${this.id} line ${sl.line.id} down: ${why}`);
+        await this.waitLink(sl);
       } catch (err) {
         if (signal.aborted) return;
         if (err instanceof ServerLostError) {
@@ -585,14 +610,47 @@ class ClientSession {
           return;
         }
         const why = err instanceof Error ? err.message : String(err);
-        this.set(sl, 'down', why);
+        // A link this dial was to replace may still be attached; the line is up while it is.
+        if (this.session.linkState(sl.index).attached) sl.reason = why;
+        else this.set(sl, 'down', why);
         // Jitter keeps many clients, or many lines of one client, from retrying in lockstep.
         const wait = Math.floor(backoff / 2 + Math.random() * backoff);
         this.c.log(`session ${this.id} line ${sl.line.id}: ${why}; retrying in ${wait} ms`);
-        await sleep(wait, signal);
+        if (!sl.redial) await this.pause(sl, wait);
         backoff = Math.min(2 * backoff, 5000);
+        // An old link that answers again needs no replacement until it dies or the session is
+        // silent again.
+        if (sl.redial) sl.redial = false;
+        else if (this.session.linkState(sl.index).answering) await this.waitLink(sl);
       }
     }
+  }
+
+  // waitLink resolves once the slot's link is gone, the session asks for a redial, or the slot ends.
+  private async waitLink(sl: Slot): Promise<void> {
+    while (!sl.stop.signal.aborted && !sl.redial && this.session.linkState(sl.index).attached) {
+      await this.pause(sl, Infinity);
+    }
+    if (sl.redial && !sl.stop.signal.aborted) {
+      this.c.log(`session ${this.id} line ${sl.line.id}: redialling while its link stays attached`);
+    }
+    sl.redial = false;
+  }
+
+  // pause resolves after ms, or sooner when the slot is woken or ends.
+  private pause(sl: Slot, ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(t);
+        sl.wake = null;
+        sl.stop.signal.removeEventListener('abort', done);
+        resolve();
+      };
+      const t = Number.isFinite(ms) ? setTimeout(done, ms) : undefined;
+      sl.wake = done;
+      if (sl.stop.signal.aborted) return done();
+      sl.stop.signal.addEventListener('abort', done);
+    });
   }
 
   private async dial(sl: Slot): Promise<Link> {
@@ -611,6 +669,7 @@ class ClientSession {
         hello,
         cfg.WebSocket,
         HANDSHAKE_TIMEOUT_MS,
+        CONNECT_TIMEOUT_MS,
       );
     } catch (err) {
       if (err instanceof RejectedError && err.code === RejectCode.UnknownSession) {
@@ -678,6 +737,8 @@ class ClientSession {
           id: sl.line.id,
           url: sl.line.url,
           state: sl.state,
+          soft: l?.soft ?? false,
+          rttMs: l?.rttMs ?? 0,
           lastByteAgoMs: l ? now - l.lastIn : 0,
           bytesIn: l?.bytesIn ?? 0,
           bytesOut: l?.bytesOut ?? 0,

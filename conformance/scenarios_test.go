@@ -2,7 +2,8 @@
 // timeouts. Each scenario states what it reproduces and what it requires. The three stalls of the
 // version-2 implementation (a replay overtaken by a newer frame, a line whose reader stopped, a
 // server restart under a live session) must recover, either without the application noticing or
-// by ending the session within about two seconds and starting a new one.
+// by ending the session within about two seconds and starting a new one. A jittery line must keep
+// its link, and a switch of every line at once must not cost the session or its streams.
 package conformance
 
 import (
@@ -160,7 +161,7 @@ func TestReplayUnderManyReconnects(t *testing.T) {
 				return
 			case <-time.After(150 * time.Millisecond):
 			}
-			// Only cut a line while the other is up; losing both ends the session by design.
+			// Only cut a line while the other is up, so that every cut is one link's.
 			st := s.clientState()
 			if len(st.Lines) == 2 && st.Lines[0].State == "up" && st.Lines[1].State == "up" {
 				drops.Add(int64(s.lines[i%2].Drop()))
@@ -239,28 +240,64 @@ func TestServerRestart(t *testing.T) {
 	}
 }
 
-// Every line goes silent at once while new connections work, as when a laptop moves to another
-// network. The client must notice within its dead time, start a new session and serve requests
-// within about two seconds; the server must drop the old session within its own dead time (3 s of
-// silence, or 1 s when it was waiting for an acknowledgement).
+// Every line goes silent at once while new connections work, as when a phone moves from Wi-Fi to
+// cellular in the middle of a download. The client must notice within about a second and a half
+// that no line answers, dial every line again into the same session, and carry on: the download
+// keeps going after a pause, no session ends, and the server keeps one session.
 func TestNetworkSwitch(t *testing.T) {
 	s := newStack(t, 3)
 	s.mustGet("/small")
 	before := s.clientState().SessionsStarted
-	cut := time.Now()
-	for _, l := range s.lines {
-		l.Set(faultproxy.Fault{Mode: faultproxy.Blackhole}, faultproxy.ScopeExisting)
+	var cut time.Time
+	go func() {
+		time.Sleep(2 * time.Second)
+		cut = time.Now()
+		for _, l := range s.lines {
+			l.Set(faultproxy.Fault{Mode: faultproxy.Blackhole}, faultproxy.ScopeExisting)
+		}
+	}()
+	worst, total, err := streamGaps(s, 8*time.Second)
+	if err != nil {
+		t.Fatalf("the stream across the switch failed: %v", err)
 	}
-	recovery, err := firstSuccess(s, cut, 10*time.Second)
+	recovery, err := firstSuccess(s, time.Now(), 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	old := s.waitFor("the server to drop the old session", 10*time.Second, func() bool { return s.mustServer().Sessions == 1 })
 	st := s.clientState()
-	measure(t, "first request after the switch %v; server dropped the old session %v after the switch; sessions %d -> %d; last end %q",
-		recovery.Round(time.Millisecond), (recovery + old).Round(time.Millisecond), before, st.SessionsStarted, st.LastSessionEnd)
-	if recovery > 2500*time.Millisecond {
-		t.Fatalf("recovery took %v", recovery)
+	srv := s.mustServer()
+	measure(t, "longest pause of the stream across the switch %v over %d MiB; a new request after %v; sessions %d -> %d, server sessions %d; switched %v ago",
+		worst.Round(time.Millisecond), total>>20, recovery.Round(time.Millisecond), before, st.SessionsStarted, srv.Sessions, time.Since(cut).Round(time.Millisecond))
+	if st.SessionsStarted != before || srv.Sessions != 1 {
+		t.Fatalf("the switch cost the session: sessions %d -> %d, server sessions %d, last end %q", before, st.SessionsStarted, srv.Sessions, st.LastSessionEnd)
+	}
+	if worst > 4*time.Second {
+		t.Fatalf("the stream paused for %v", worst)
+	}
+}
+
+// One line pauses now and then for up to 1.5 s, as a mobile line does when TCP retransmits, while
+// another stays healthy. The jittery line must keep its link (it is only soft down while it is late),
+// and requests must not wait for it.
+func TestJitteryLine(t *testing.T) {
+	s := newStack(t, 2)
+	s.lines[0].Set(faultproxy.Fault{Mode: faultproxy.Loss, LossRate: 0.2, LossPause: 1500 * time.Millisecond}, faultproxy.ScopeAll)
+	var worst time.Duration
+	for end := time.Now().Add(15 * time.Second); time.Now().Before(end); time.Sleep(100 * time.Millisecond) {
+		t0 := time.Now()
+		if string(s.mustGet("/small")) != "ok" {
+			t.Fatal("wrong answer")
+		}
+		worst = max(worst, time.Since(t0))
+	}
+	st := s.clientState()
+	measure(t, "slowest of the small requests %v; jittery line: %d reconnects, last reason %q, rtt %d ms; sessions %d",
+		worst.Round(time.Millisecond), st.Lines[0].Reconnects, st.Lines[0].LastReason, st.Lines[0].RTTMs, st.SessionsStarted)
+	if st.Lines[0].Reconnects != 0 || st.SessionsStarted != 1 {
+		t.Fatalf("the jittery line lost its link: %+v, %d sessions", st.Lines[0], st.SessionsStarted)
+	}
+	if worst > time.Second {
+		t.Fatalf("a request took %v", worst)
 	}
 }
 

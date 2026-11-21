@@ -11,8 +11,8 @@
 //     (ModeNew, ModeJoin) and the REJECT codes (RejectVersion, RejectUnknownSession, RejectLimit,
 //     RejectMalformed) are the values of PROTOCOL.md section 4.
 //
-//   - HeaderLen, MaxData, DataOverhead, MaxReason, MaxImpl, ControlSlack and HandshakeTimeout are
-//     fixed by the protocol.
+//   - HeaderLen, MaxData, DataOverhead, MaxReason, MaxImpl, ControlSlack, HandshakeTimeout,
+//     ConnectTimeout, LinkDeadMin and LinkDeadRTTs are fixed by the protocol.
 //
 //   - Limits is what a server announces in WELCOME and both sides then enforce. DefaultLimits returns
 //     the defaults of PROTOCOL.md section 7; Validate checks a Limits against the protocol's bounds.
@@ -76,6 +76,14 @@ const (
 	// HandshakeTimeout bounds the WebSocket upgrade plus HELLO on the server, and HELLO to WELCOME
 	// on the client.
 	HandshakeTimeout = 5 * time.Second
+	// ConnectTimeout bounds the client's connection setup (DNS, TCP, proxy, TLS and the WebSocket
+	// upgrade) before HELLO is sent: through a distant CDN that alone can take several seconds.
+	ConnectTimeout = 10 * time.Second
+	// LinkDeadMin and LinkDeadRTTs give the client's silence limit for one link,
+	// max(LinkDeadMin, LinkDeadRTTs × smoothed round trip): a link is closed only after it has been
+	// silent for both, so jitter or one lost segment on a working line never costs a link.
+	LinkDeadMin  = 5 * time.Second
+	LinkDeadRTTs = 4
 )
 
 // Limits are the values a server announces in WELCOME. Both sides enforce them for the session.
@@ -85,8 +93,8 @@ type Limits struct {
 	StreamWindow int           // initial mux credit per stream and direction, in bytes
 	MaxStreams   int           // open streams per session
 	MaxLinks     int           // links per session; link indexes are 0 to MaxLinks-1
-	Ping         time.Duration // client PING interval
-	ClientDead   time.Duration // client: silence after which a link is dead
+	Ping         time.Duration // interval of the client's PING rounds
+	ClientDead   time.Duration // client: a link silent this long after a round's PING is soft down
 	ServerDead   time.Duration // server: silence after which a link is dead
 	Progress     time.Duration // longest wait for an ACK while data is outstanding on a link
 }
@@ -101,8 +109,8 @@ func DefaultLimits() Limits {
 		MaxLinks:     8,
 		Ping:         500 * time.Millisecond,
 		ClientDead:   time.Second,
-		ServerDead:   3 * time.Second,
-		Progress:     3 * time.Second,
+		ServerDead:   10 * time.Second,
+		Progress:     10 * time.Second,
 	}
 }
 

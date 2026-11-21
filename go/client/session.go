@@ -1,8 +1,16 @@
-// One client session and its lines (PROTOCOL.md sections 4.2 and 5.5). Every line has a slot: a
+// One client session and its lines (PROTOCOL.md sections 4.2, 5.4 and 5.5). Every line has a slot: a
 // goroutine that dials the line, performs the handshake, attaches the link, waits for it to die and
-// dials again, with backoff, for as long as the session lasts and the line is in the list. A
-// REJECT for an unknown session, or a second WELCOME that says it created the session, means the
-// server lost the session (it restarted): the session ends at once and the client starts a new one.
+// dials again, with backoff, for as long as the session lasts and the line is in the list. When no
+// link answers the session's PING round, every slot dials its line again at once into the same
+// session, so a short outage of every line (a network handover, a lift) costs no stream: a slot
+// waiting on its link dials a replacement while the old link stays attached, and a slot waiting out
+// its backoff dials now. A REJECT for an unknown session, or a second WELCOME that says it created
+// the session, means the server lost the session (it restarted): the session ends at once and the
+// client starts a new one.
+//
+// A dial has two deadlines: protocol.ConnectTimeout for the connection (DNS, TCP, proxy, TLS and the
+// WebSocket upgrade), then protocol.HandshakeTimeout from the sent HELLO to its answer, so a slow
+// setup through a distant CDN does not eat the server's time to answer.
 //
 // Nothing here is exported; the session loop creates sessions and the status page reads them.
 
@@ -55,7 +63,8 @@ type slot struct {
 	index  int
 	line   protocol.Line
 	cancel context.CancelFunc
-	down   chan string // the link's reason for going down
+	down   chan struct{} // the slot's link went down (or, late, a link it replaced)
+	redial chan struct{} // the session is silent: dial the line again now
 
 	mu         sync.Mutex
 	state      string // "connecting", "up" or "down"
@@ -84,15 +93,26 @@ func newClientSession(c *Client, lines []protocol.Line) *clientSession {
 				liveOnce.Do(func() { close(cs.live) })
 				return
 			}
-			cs.mu.Lock()
-			sl := cs.slots[i]
-			cs.mu.Unlock()
-			if sl != nil {
-				select {
-				case sl.down <- why:
-				default:
-				}
+			if sl := cs.slot(i); sl != nil {
+				sl.set("down", why)
+				cs.c.cfg.Logf("session %s line %s down: %s", cs.id, sl.line.ID, why)
+				poke(sl.down)
 			}
+		},
+		OnSoft: func(i int, soft bool) {
+			if sl := cs.slot(i); sl != nil && soft {
+				cs.c.cfg.Logf("session %s line %s soft down: silent since the due ping round; no new data on it", cs.id, sl.line.ID)
+			} else if sl != nil {
+				cs.c.cfg.Logf("session %s line %s answers again", cs.id, sl.line.ID)
+			}
+		},
+		OnSilent: func() {
+			cs.c.cfg.Logf("session %s silent: no line answers; redialling every line into it", cs.id)
+			cs.mu.Lock()
+			for _, sl := range cs.slots {
+				poke(sl.redial)
+			}
+			cs.mu.Unlock()
 		},
 		OnEnd: func(why string) {
 			cs.cancel()
@@ -108,6 +128,21 @@ func newClientSession(c *Client, lines []protocol.Line) *clientSession {
 	c.cfg.Logf("session %s start over %d lines", cs.id, len(lines))
 	cs.applyLines(lines)
 	return cs
+}
+
+// slot returns the slot of link index i, or nil.
+func (cs *clientSession) slot(i int) *slot {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.slots[i]
+}
+
+// poke leaves a token in a one-slot channel, unless one is waiting there already.
+func poke(c chan struct{}) {
+	select {
+	case c <- struct{}{}:
+	default:
+	}
 }
 
 // applyLines makes the session's lines match the list: lines that left it are closed, new lines
@@ -147,17 +182,24 @@ func (cs *clientSession) applyLines(lines []protocol.Line) {
 			continue
 		}
 		ctx, cancel := context.WithCancel(cs.ctx)
-		sl := &slot{index: index, line: l, cancel: cancel, down: make(chan string, 1), state: "connecting"}
+		sl := &slot{index: index, line: l, cancel: cancel, down: make(chan struct{}, 1), redial: make(chan struct{}, 1), state: "connecting"}
 		cs.slots[index] = sl
 		go cs.runSlot(ctx, sl)
 	}
 }
 
-func (sl *slot) set(state, reason string) {
+// up marks a link attached; every one after the slot's first counts as a reconnect.
+func (sl *slot) up() {
 	sl.mu.Lock()
-	if state == "up" && sl.state == "down" {
+	if sl.state != "connecting" {
 		sl.reconnects++
 	}
+	sl.state = "up"
+	sl.mu.Unlock()
+}
+
+func (sl *slot) set(state, reason string) {
+	sl.mu.Lock()
 	sl.state = state
 	if reason != "" {
 		sl.reason = reason
@@ -179,16 +221,15 @@ func (cs *clientSession) runSlot(ctx context.Context, sl *slot) {
 				_ = conn.Close() // the session ended meanwhile; nothing to report beyond its end
 				return
 			}
-			sl.set("up", "")
+			sl.up()
 			cs.c.cfg.Logf("session %s line %s up", cs.id, sl.line.ID)
 			backoff = 200 * time.Millisecond
+			// A silence reported while this link was being dialled is answered by this link.
 			select {
-			case why := <-sl.down:
-				sl.set("down", why)
-				cs.c.cfg.Logf("session %s line %s down: %s", cs.id, sl.line.ID, why)
-			case <-ctx.Done():
-				return
+			case <-sl.redial:
+			default:
 			}
+			cs.waitLink(ctx, sl)
 			continue
 		}
 		if ctx.Err() != nil {
@@ -199,24 +240,63 @@ func (cs *clientSession) runSlot(ctx context.Context, sl *slot) {
 			cs.s.End(err.Error()) // the server does not know the session, so there is no one to say goodbye to
 			return
 		}
-		sl.set("down", err.Error())
+		state := "down"
+		if attached, _ := cs.s.LinkState(sl.index); attached {
+			state = "up" // the link this dial was to replace is still attached
+		}
+		sl.set(state, err.Error())
 		// Jitter keeps many clients, or many lines of one client, from retrying in lockstep.
 		wait := backoff/2 + time.Duration(mathrand.Int64N(int64(backoff)))
 		cs.c.cfg.Logf("session %s line %s: %v; retrying in %v", cs.id, sl.line.ID, err, wait.Round(time.Millisecond))
-		sleep(ctx, wait)
+		t := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+		case <-sl.redial:
+		case <-t.C:
+		}
+		t.Stop()
 		backoff = min(2*backoff, 5*time.Second)
+		// An old link that answers again needs no replacement until it dies or the session is
+		// silent again.
+		if _, answering := cs.s.LinkState(sl.index); answering {
+			cs.waitLink(ctx, sl)
+		}
+	}
+}
+
+// waitLink returns once the slot's link has gone down, the session asks for a redial, or ctx ends.
+func (cs *clientSession) waitLink(ctx context.Context, sl *slot) {
+	for {
+		select {
+		case <-sl.down:
+			if attached, _ := cs.s.LinkState(sl.index); attached {
+				continue // the report of a link that was replaced by the one now attached
+			}
+			return
+		case <-sl.redial:
+			cs.c.cfg.Logf("session %s line %s: redialling while its link stays attached", cs.id, sl.line.ID)
+			return
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
 // dial opens a link over the slot's line and performs the handshake.
 func (cs *clientSession) dial(ctx context.Context, sl *slot) (*link.Conn, error) {
-	ctx, cancel := context.WithTimeout(ctx, protocol.HandshakeTimeout)
-	defer cancel()
-	conn, err := link.Dial(ctx, protocol.LinkURL(sl.line, cs.c.cfg.LinkPath), link.Options{Proxy: cs.c.cfg.Proxy, TLSConfig: cs.c.cfg.TLSConfig})
+	connectCtx, cancel := context.WithTimeout(ctx, protocol.ConnectTimeout)
+	conn, err := link.Dial(connectCtx, protocol.LinkURL(sl.line, cs.c.cfg.LinkPath), link.Options{Proxy: cs.c.cfg.Proxy, TLSConfig: cs.c.cfg.TLSConfig})
+	timedOut := connectCtx.Err() == context.DeadlineExceeded
+	cancel()
 	if err != nil {
+		if timedOut {
+			return nil, fmt.Errorf("no connection within %v: %w", protocol.ConnectTimeout, err)
+		}
 		return nil, err
 	}
-	w, err := cs.handshake(ctx, conn, sl)
+	helloCtx, cancel := context.WithTimeout(ctx, protocol.HandshakeTimeout)
+	defer cancel()
+	w, err := cs.handshake(helloCtx, conn, sl)
 	if err != nil {
 		_ = conn.Close() // the handshake error is what the caller reports
 		return nil, err

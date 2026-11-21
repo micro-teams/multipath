@@ -1,7 +1,8 @@
 // The session and its links (src/session.ts, src/link.ts) against an in-memory server half: the
-// replay on attach and its order, the reorder buffer and its bounds, ACKs only on change, the three
-// liveness rules, the bounded send queue, the end of a session with its last link or the peer's
-// GOODBYE, and the reason a link's socket failed.
+// replay on attach and its order, the reorder buffer and its bounds, ACKs only on change, the PING
+// rounds, soft down and its catch-up, the silent session, the lenient dead times, the bounded send
+// queue, the end of a session after the server's dead time or on the peer's GOODBYE, the two dial
+// deadlines, and the reason a link's socket failed.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Session } from '../src/session.js';
 import {
@@ -16,10 +17,11 @@ import {
   encodeAck,
   encodeData,
   encodeGoodbye,
+  encodePong,
   type Limits,
 } from '../src/protocol.js';
 import { Link } from '../src/link.js';
-import { FakeWebSocket, dialFake, frames } from './fakes.js';
+import { FakeWebSocket, dialFake, frames, welcomeFor } from './fakes.js';
 
 const limits: Limits = { ...defaultLimits(), window: MIN_WINDOW };
 const bytes = (n: number, seed = 0) =>
@@ -33,6 +35,8 @@ function newSession() {
     limits,
     deliver: (p) => delivered.push(...p),
     onLink: (i, up, why) => events.push(`${i} ${up ? 'up' : 'down'} ${why}`),
+    onSoft: (i, soft) => events.push(`${i} ${soft ? 'soft' : 'answers'}`),
+    onSilent: () => events.push('silent'),
     onEnd: (why) => (ended = why),
   });
   return { s, delivered, events, ended: () => ended };
@@ -42,6 +46,7 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
 
 beforeEach(() => {
   FakeWebSocket.all = [];
+  FakeWebSocket.openDelayMs = 0;
 });
 afterEach(() => {
   vi.useRealTimers();
@@ -108,17 +113,56 @@ describe('session', () => {
     s.end('test over');
   });
 
-  it('pings every pingMs and drops a silent link after clientDeadMs, ending the session', async () => {
+  it('pings in rounds; a silent link goes soft down, is closed after 5 s, and the session lasts 10 s', async () => {
     vi.useFakeTimers();
     const { s, events, ended } = newSession();
     const { link, ws } = await dialFakeWithFakeTimers();
     s.attach(0, link);
     await vi.advanceTimersByTimeAsync(900);
     expect(frames(ws, FrameType.Ping).length).toBe(2);
-    await vi.advanceTimersByTimeAsync(200);
-    expect(events.at(-1)).toBe('0 down no inbound byte for 1000 ms');
-    expect(ended()).toMatch(/^all links are dead, the last one: no inbound byte/);
-    expect(s.ended).toBe(true);
+    await vi.advanceTimersByTimeAsync(700);
+    expect(events).toEqual(['0 up ', '0 soft', 'silent']);
+    await vi.advanceTimersByTimeAsync(3500);
+    expect(events.at(-1)).toBe('0 down no inbound byte for 5000 ms');
+    expect(s.ended).toBe(false);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ended()).toBe('no line has answered for 10000 ms, so the server has ended the session');
+  });
+
+  it('keeps a jittery link: soft down while it is late, then caught up on what it missed', async () => {
+    vi.useFakeTimers();
+    const { s, events } = newSession();
+    const a = await dialFakeWithFakeTimers();
+    s.attach(0, a.link);
+    const b = await dialFakeWithFakeTimers(1);
+    s.attach(1, b.link);
+    const answer = (...links: (typeof a)[]) => {
+      for (const l of links) {
+        const pings = frames(l.ws, FrameType.Ping);
+        if (pings.length) l.ws.receive(encodePong(decodeU64(pings.at(-1)!)));
+      }
+    };
+    for (let t = 0; t < 1000; t += 100) {
+      answer(a, b);
+      await vi.advanceTimersByTimeAsync(100);
+    }
+    for (let t = 0; t < 2500; t += 100) {
+      answer(b); // a's answers are late by 2.5 s
+      await vi.advanceTimersByTimeAsync(100);
+    }
+    expect(events).toContain('0 soft');
+    s.send(bytes(100), false);
+    const data = (l: typeof a) => frames(l.ws, FrameType.Data).map((f) => decodeData(f).offset);
+    expect(data(a)).toEqual([]);
+    expect(data(b)).toEqual([0n]);
+    answer(a, b);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(events).toContain('0 answers');
+    expect(data(a)).toEqual([0n]);
+    expect(events.filter((e) => e.includes('down'))).toEqual([]);
+    expect(events).not.toContain('silent');
+    expect(s.stats().links.map((l) => l.rttMs > 0)).toEqual([true, true]);
+    s.end('test over');
   });
 
   it('drops a link whose acknowledgement does not advance while data is outstanding', async () => {
@@ -129,14 +173,14 @@ describe('session', () => {
     const b = await dialFakeWithFakeTimers(1);
     s.attach(1, b.link);
     s.send(bytes(100), false);
-    for (let t = 0; t < 3200; t += 100) {
+    for (let t = 0; t < 10_200; t += 100) {
       // Both links keep talking, but only b acknowledges.
       a.ws.receive(encodeData(0n, bytes(1)));
       b.ws.receive(encodeAck(100n));
       await vi.advanceTimersByTimeAsync(100);
     }
     expect(events).toContain(
-      '0 down acknowledgement stalled for 3000 ms with 100 bytes outstanding',
+      '0 down acknowledgement stalled for 10000 ms with 100 bytes outstanding',
     );
     expect(s.ended).toBe(false);
     s.end('test over');
@@ -153,12 +197,12 @@ describe('session', () => {
     s.attach(2, live.link);
     stuck.ws.stuck = true; // never drains
     full.ws.bufferedAmount = limits.window + 2 * 65536; // no room for one more frame
-    for (let t = 0; t < 1200; t += 100) {
+    for (let t = 0; t < 5200; t += 100) {
       for (const l of [stuck, full, live]) l.ws.receive(encodeAck(0n));
       await vi.advanceTimersByTimeAsync(100);
     }
     expect(events).toContain('1 down send queue full');
-    expect(events.some((e) => e.startsWith('0 down write stuck for 1000 ms'))).toBe(true);
+    expect(events.some((e) => e.startsWith('0 down write stuck for 5000 ms'))).toBe(true);
     expect(s.ended).toBe(false);
     s.end('test over');
   });
@@ -214,9 +258,32 @@ describe('a failed socket', () => {
     impl: IMPLEMENTATION,
   };
 
+  it('times the hello from the open socket, and the connection on its own', async () => {
+    vi.useFakeTimers();
+    FakeWebSocket.openDelayMs = 8000; // a slow DNS, TCP, TLS and upgrade through a distant CDN
+    FakeWebSocket.answer = () => null;
+    const silent = Link.dial('ws://fake/link', hello, FakeWebSocket, 5000, 10_000);
+    const late = expect(silent).rejects.toThrow('no answer to hello within 5000 ms');
+    await vi.advanceTimersByTimeAsync(12_900);
+    expect(FakeWebSocket.all[0].closed).toBe(false);
+    await vi.advanceTimersByTimeAsync(200);
+    await late;
+
+    FakeWebSocket.answer = () => welcomeFor(limits, true);
+    const slow = Link.dial('ws://fake/link', hello, FakeWebSocket, 5000, 10_000);
+    await vi.advanceTimersByTimeAsync(8000);
+    expect((await slow).welcome.created).toBe(true);
+
+    FakeWebSocket.openDelayMs = 20_000;
+    const never = Link.dial('ws://fake/link', hello, FakeWebSocket, 5000, 10_000);
+    const refused = expect(never).rejects.toThrow('no connection within 10000 ms');
+    await vi.advanceTimersByTimeAsync(10_100);
+    await refused;
+  });
+
   it('names what the platform said, when its error event says anything', async () => {
     FakeWebSocket.answer = () => null;
-    const dialing = Link.dial('ws://fake/link', hello, FakeWebSocket, 1000);
+    const dialing = Link.dial('ws://fake/link', hello, FakeWebSocket, 1000, 1000);
     await tick(); // open, and the HELLO sent
     FakeWebSocket.all[FakeWebSocket.all.length - 1].onerror?.({
       message: 'SSLHandshakeException: connection closed',
@@ -228,7 +295,7 @@ describe('a failed socket', () => {
 
   it('is only "connection failed" for a browser, whose error event says nothing', async () => {
     FakeWebSocket.answer = () => null;
-    const dialing = Link.dial('ws://fake/link', hello, FakeWebSocket, 1000);
+    const dialing = Link.dial('ws://fake/link', hello, FakeWebSocket, 1000, 1000);
     await tick(); // open, and the HELLO sent
     FakeWebSocket.all[FakeWebSocket.all.length - 1].onerror?.({});
     await expect(dialing).rejects.toThrow(/^connection failed$/);

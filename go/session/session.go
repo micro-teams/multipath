@@ -1,12 +1,15 @@
 // Package session is the redundant layer of MultiPath (PROTOCOL.md section 5): several links joined
 // into one reliable, ordered, duplex byte stream. Every byte is sent on every live link; the receiver
 // keeps the first copy of each byte, in order, and drops the rest. As long as one link works the
-// session works; when the last link dies the session ends for good, on both sides, and everything it
-// held is released at once.
+// session works. On the server a session ends for good when its last link dies; the client keeps it
+// through an outage of every link, redialling into it, until the server says it no longer holds it or
+// no line has answered for the server's dead time (link.go). When a session ends, everything it held
+// is released at once.
 //
 // The package does not dial, accept or handshake: its owner (the client or the server) brings each
 // link up to the point where frames flow and then attaches it. Both ends of a session run the same
-// code; Options.Client selects the client's liveness role (it pings, and uses the shorter dead time).
+// code; Options.Client selects the client's liveness role (it sends the PING rounds, judges the
+// links by them, and outlives its links).
 //
 // The work is split across files: this one holds the session's life (New, Attach, End, Goodbye,
 // Stats); sender.go the send window and replay; receiver.go reordering, delivery and ACKs; link.go a
@@ -15,10 +18,13 @@
 //   - Conn is what Attach takes: a link whose handshake is done, one message per frame; *link.Conn
 //     implements it. ErrEnded is what Send and Attach return once the session has ended.
 //
-//   - Options: the limits, the role, and three callbacks. Deliver receives the in-order bytes, one
+//   - Options: the limits, the role, and the callbacks. Deliver receives the in-order bytes, one
 //     call at a time; it must not block, and an error from it ends the session (the mux reports
-//     protocol violations this way). OnLink reports each link coming up or going down with a reason;
-//     OnEnd reports the end of the session once, with its reason. Callbacks run without locks held.
+//     protocol violations this way). OnLink reports each link coming up or going down with a reason
+//     (a link replaced by a new one at its index is not reported going down); OnEnd reports the end
+//     of the session once, with its reason. On the client, OnSoft reports a link going soft down or
+//     answering again, and OnSilent that no link answers any more, once each time the session falls
+//     silent. Callbacks run without locks held.
 //
 //   - New(opt) creates a session with no links. Bytes sent before the first Attach wait in the send
 //     buffer and are replayed onto the first link.
@@ -35,6 +41,9 @@
 //
 //   - (*Session).Detach(index, reason) closes one link, as if it had died.
 //
+//   - (*Session).LinkState(index) says whether a link is attached at index, and whether it answers
+//     (attached and not soft down).
+//
 //   - (*Session).End(reason) ends the session; (*Session).Goodbye(reason) first sends GOODBYE on
 //     every link, for up to half a second, so the peer ends it too.
 //
@@ -42,13 +51,15 @@
 //     ended by the peer's GOODBYE has a reason starting with PeerGoodbye.
 //
 //   - (*Session).Stats() is a snapshot of offsets and per-link counters (Stats, with one LinkStat per
-//     live link), for status pages.
+//     live link: its last byte, bytes in and out, queued bytes, soft state and smoothed round trip),
+//     for status pages.
 //
 //     var m *mux.Mux
 //     s := session.New(session.Options{Limits: protocol.DefaultLimits(), Client: true,
 //     Deliver: func(p []byte) error { return m.Feed(p) },
-//     OnLink:  func(i int, up bool, why string) { log.Print(i, up, why) },
-//     OnEnd:   func(why string) { log.Print("session ended: ", why) }})
+//     OnLink:   func(i int, up bool, why string) { log.Print(i, up, why) },
+//     OnSilent: func() { log.Print("no link answers: redial every line") },
+//     OnEnd:    func(why string) { log.Print("session ended: ", why) }})
 //     m = mux.New(s, true, ...)
 //     err := s.Attach(0, conn)
 package session
@@ -79,12 +90,16 @@ type Conn interface {
 
 // Options configures a session.
 type Options struct {
-	Limits  protocol.Limits
-	Client  bool                                 // the client pings and uses Limits.ClientDead
-	Deliver func(p []byte) error                 // in-order bytes; must not block
-	OnLink  func(index int, up bool, why string) // optional
-	OnEnd   func(why string)                     // optional
-	Clock   *Clock                               // nil means DefaultClock()
+	Limits   protocol.Limits
+	Client   bool                                 // the client sends PING rounds and outlives its links
+	Deliver  func(p []byte) error                 // in-order bytes; must not block
+	OnLink   func(index int, up bool, why string) // optional
+	OnSoft   func(index int, soft bool)           // optional; client only
+	OnSilent func()                               // optional; client only
+	OnEnd    func(why string)                     // optional
+	Clock    *Clock                               // nil means DefaultClock()
+
+	linkDeadMin time.Duration // protocol.LinkDeadMin; tests shorten it
 }
 
 // Session is one redundant byte stream over up to Limits.MaxLinks links.
@@ -96,13 +111,19 @@ type Session struct {
 	writable *sync.Cond
 	lim      protocol.Limits
 	links    []*link // by index; nil while that index has no live link
-	live     bool    // a link has been attached; from then on, losing the last one ends the session
+	live     bool    // a link has been attached; on the server, losing the last one then ends the session
 	closed   bool
 	reason   string
 	sendBase uint64 // the peer has acknowledged every byte below
 	sendNext uint64 // offset of the next byte sent
 	sendBuf  []byte // bytes [sendBase, sendNext)
 	lastAck  uint64 // the delivered offset last acknowledged to the peer
+
+	// The client's PING rounds (link.go).
+	rounds    []time.Time // send times of the rounds not yet older than the due one
+	nextRound time.Time
+	silent    bool      // no attached link answered the due round; OnSilent was called
+	heardAt   time.Time // the last inbound byte on any link
 
 	acked atomic.Uint64 // mirror of sendBase for link writers, which skip acknowledged DATA
 
@@ -116,6 +137,9 @@ type Session struct {
 func New(opt Options) *Session {
 	if opt.Clock == nil {
 		opt.Clock = DefaultClock()
+	}
+	if opt.linkDeadMin == 0 {
+		opt.linkDeadMin = protocol.LinkDeadMin
 	}
 	s := &Session{
 		opt:     opt,
@@ -172,6 +196,7 @@ func (s *Session) Attach(index int, c Conn) error {
 	old := s.links[index]
 	s.links[index] = l
 	s.live = true
+	s.heardAt = now
 	s.mu.Unlock()
 
 	go l.writeLoop()
@@ -198,7 +223,17 @@ func (s *Session) Detach(index int, why string) {
 	}
 }
 
-// drop closes one link and ends the session if it was the last.
+// LinkState says whether a link is attached at index and whether it answers.
+func (s *Session) LinkState(index int) (attached, answering bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if index < 0 || index >= len(s.links) || s.links[index] == nil {
+		return false, false
+	}
+	return true, !s.links[index].soft
+}
+
+// drop closes one link and, on the server, ends the session if it was the last.
 func (s *Session) drop(l *link, why string) {
 	if !l.close() {
 		return
@@ -208,10 +243,10 @@ func (s *Session) drop(l *link, why string) {
 	if removed {
 		s.links[l.index] = nil
 	}
-	last := removed && !s.closed && s.liveLinksLocked() == 0
-	ended := s.closed
+	last := removed && !s.closed && !s.opt.Client && s.liveLinksLocked() == 0
+	report := removed && !s.closed
 	s.mu.Unlock()
-	if !ended && s.opt.OnLink != nil {
+	if report && s.opt.OnLink != nil {
 		s.opt.OnLink(l.index, false, why)
 	}
 	if last {
@@ -292,7 +327,9 @@ type LinkStat struct {
 	LastByte time.Time // when the last message arrived
 	BytesIn  int64
 	BytesOut int64
-	Queued   int // bytes waiting in the link's send queue
+	Queued   int           // bytes waiting in the link's send queue
+	Soft     bool          // client: soft down, gets no new DATA until it answers
+	RTT      time.Duration // client: smoothed PING round trip, 0 before the first PONG
 }
 
 // Stats is a snapshot of a session.
@@ -311,7 +348,8 @@ func (s *Session) Stats() Stats {
 	for _, l := range s.links {
 		if l != nil {
 			st.Links = append(st.Links, LinkStat{Index: l.index, LastByte: time.Unix(0, l.lastIn.Load()),
-				BytesIn: l.bytesIn.Load(), BytesOut: l.bytesOut.Load(), Queued: l.q.size()})
+				BytesIn: l.bytesIn.Load(), BytesOut: l.bytesOut.Load(), Queued: l.q.size(),
+				Soft: l.soft, RTT: time.Duration(l.srtt.Load())})
 		}
 	}
 	s.mu.Unlock()

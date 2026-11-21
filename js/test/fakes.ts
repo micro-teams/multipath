@@ -2,7 +2,7 @@
 // memory, so links, sessions and clients can be driven frame by frame without any socket.
 //
 //   - FakeWebSocket: what Link.dial and Client take as their WebSocket. Each instance opens on the
-//     next microtask; FakeWebSocket.answer(hello, ws) decides how the "server" answers a HELLO (a
+//     next microtask, or FakeWebSocket.openDelayMs later when that is set (a slow connection setup); FakeWebSocket.answer(hello, ws) decides how the "server" answers a HELLO (a
 //     WELCOME frame, a REJECT frame, or null for silence); every frame the client sends after the
 //     HELLO is kept in `sent`, and receive(frame) delivers a frame to the client. bufferedAmount can
 //     be set, and stuck makes every send stay in it, to simulate a socket that does not drain. FakeWebSocket.all lists every instance.
@@ -31,6 +31,7 @@ export function welcomeFor(limits: Limits, created: boolean): Uint8Array {
 export class FakeWebSocket {
   static all: FakeWebSocket[] = [];
   static answer: (hello: HelloFrame, ws: FakeWebSocket) => Uint8Array | null = () => null;
+  static openDelayMs = 0;
 
   binaryType = '';
   bufferedAmount = 0;
@@ -45,7 +46,11 @@ export class FakeWebSocket {
 
   constructor(readonly url: string) {
     FakeWebSocket.all.push(this);
-    queueMicrotask(() => this.onopen?.({}));
+    const open = () => {
+      if (!this.closed) this.onopen?.({});
+    };
+    if (FakeWebSocket.openDelayMs > 0) setTimeout(open, FakeWebSocket.openDelayMs);
+    else queueMicrotask(open);
   }
 
   send(data: Uint8Array): void {
@@ -93,7 +98,7 @@ export async function dialFake(
     mode: Mode.New,
     impl: IMPLEMENTATION,
   };
-  const { link } = await Link.dial('ws://fake/link', hello, FakeWebSocket, 1000);
+  const { link } = await Link.dial('ws://fake/link', hello, FakeWebSocket, 1000, 1000);
   return { link, ws: FakeWebSocket.all[FakeWebSocket.all.length - 1] };
 }
 

@@ -161,8 +161,12 @@ The client:
   minimums of section 7 for its send window.
 
 Handshake timeouts: the server closes a connection that has not completed the WebSocket upgrade and
-sent HELLO within 5 seconds; the client gives up on a link that has not answered HELLO within 5
-seconds and retries it with backoff.
+sent HELLO within 5 seconds. The client gives up on a connection that is not open (DNS, TCP, proxy,
+TLS and the WebSocket upgrade) within 10 seconds, and on a link whose HELLO has not been answered
+within 5 seconds of being sent, and retries it with backoff. The two client deadlines are separate
+because a connection set up through a distant CDN can take several seconds by itself, which must
+not count against the server's time to answer; the server's own deadline starts only when the
+connection reaches it.
 
 ## 5. Session
 
@@ -206,16 +210,40 @@ The values are announced in WELCOME; the defaults are:
 
 | Rule | Default |
 |---|---|
-| The client sends PING on every link every `pingMs` | 500 ms |
+| The client sends a PING round, one PING on every link at once, every `pingMs` | 500 ms |
 | The server answers each PING with a PONG carrying the same nonce; it never sends PING itself | |
-| Client: a link with no inbound byte for `clientDeadMs` is dead | 1000 ms |
-| Server: a link with no inbound byte for `serverDeadMs` is dead | 3000 ms |
-| Progress: while a link carries sent-but-unacknowledged data, the ACK received on that link must advance within `progressMs`, else the link is dead | 3000 ms |
+| Client: a link that has not answered the round sent `clientDeadMs` ago is soft down | 1000 ms |
+| Client: when no link answers that round, the session is silent: every line is dialled again | 1000 ms |
+| Client: a link with no inbound byte for max(5 s, 4 x its smoothed round trip) is dead | 5 s |
+| Server: a link with no inbound byte for `serverDeadMs` is dead | 10000 ms |
+| Progress: while a link carries sent-but-unacknowledged data, the ACK received on that link must advance within `progressMs`, else the link is dead | 10000 ms |
 
 Only the client pings, because the client is the side that can act on a dead link (redial it), and
 one ping stream per link is enough to prove both directions: the client hears the PONG, the server
-hears the PING. The server allows three ping periods of silence before closing a link, so a single
-late ping does not cost a client a link.
+hears the PING.
+
+**Rounds and soft down.** Liveness is judged for the session, not link by link: a jittery line, or a
+line on which one TCP segment was retransmitted, must not lose its link. A link **answers** a round
+when any byte arrives on it after the round's PING was sent: the PONG itself waits behind every
+byte the server queued on that link before it, so on a slow line carrying a download the data
+arrives first. A link that has not answered the newest round sent at least `clientDeadMs` ago is
+**soft down**: the client puts no new DATA on it, but keeps it attached, keeps pinging it and keeps
+reading it. When it answers again, the client first queues on it every unacknowledged byte it was
+not given meanwhile (from the offset after the last DATA it carried), then uses it like any other
+link. Since every byte also goes out on every link that answers, and stays in the send buffer until
+acknowledged, no byte is stranded on a soft link.
+
+**A silent session.** When no attached link answers that round, the session is **silent**. The
+client then dials every line again at once, with mode `join`, into the same session; a link that is
+still attached stays until the new link with its index replaces it (section 4.2), and a line waiting
+out a retry backoff dials at once. The new links receive the ACK and the replay (section 5.3), so a
+short outage of every line (a network handover, a lift) costs no stream.
+
+**Dead links.** The client closes a link after max(5 s, 4 x its smoothed round trip) without an
+inbound byte. The round trip is measured from each PONG (its nonce is the time its PING was sent)
+and smoothed as in RFC 6298 (weight 1/8); before the first PONG the dead time is 5 s. The server
+closes a link after `serverDeadMs` without an inbound byte; that is long enough for a client to
+notice a silent session and redial into it while its old links still hold the session.
 
 The progress rule catches a link that carries bytes in one direction only, or whose data stopped
 moving while control frames still flow. Its deadline covers more than a round trip: an ACK waits in
@@ -223,25 +251,35 @@ the line behind every byte queued ahead of it in that direction, so on a line th
 slow an ACK can take well over a second while the line works. Measured with one line of 600 to
 900 ms round trip capped at 1 MB/s carrying a 2.6 MB download, a 1 s deadline ended the session
 within about a second in half of the runs, with the Go and the JavaScript client alike (and with 256
-KiB/s in every run); 3 s carried every run at 1 MB/s and 512 KB/s. The deadline must exceed the
-round trip plus the bytes in flight divided by the line's rate: in flight are at most the receive
-credit of the streams in use, and never more than `window` (2 MiB), so a line slower than about
-700 KB/s can still be dropped while several downloads fill the window at once (one stream with 2 MiB
-of credit over 512 KB/s was). Silence still kills a link after 1 s on the client, so a link that
-dies outright is noticed as fast as before. A line whose round trip itself exceeds
-`clientDeadMs` cannot hold a link: its first PONG comes too late.
+KiB/s in every run); 3 s carried every run at 1 MB/s and 512 KB/s. The deadline must also be no
+shorter than `serverDeadMs`: during an outage of every line the server's ACKs stop moving too, and
+a shorter deadline would end the session on the server before the client has redialled into it.
+
+A line whose round trip itself exceeds `clientDeadMs` is soft down for good: it carries data only
+when no other line answers.
 
 A dead link is closed. Each link has its own writer with a bounded send queue of `window + 131072`
-bytes (enough for a full replay with its frame headers); a full queue, or a single write blocked for longer than the side's dead time, closes only
-that link. A slow link never blocks the session or the other links. A link's writer MAY skip DATA
-frames that have been acknowledged meanwhile, and SHOULD drop them from a full queue before
-declaring it full, so that a slow link only carries bytes the peer still lacks.
+bytes (enough for a full replay with its frame headers); a full queue, or a single write blocked for
+longer than the side's dead time, closes only that link. A slow link never blocks the session or the
+other links. A link's writer MAY skip DATA frames that have been acknowledged meanwhile, and SHOULD
+drop them from a full queue before declaring it full, so that a slow link only carries bytes the
+peer still lacks.
+
+**Compatibility.** The wire is unchanged; only the default timings and the client's rules are. A
+client that treats `clientDeadMs` as the silence after which a link is dead still works with these
+defaults; it merely closes links sooner. A client following this section against a server that
+announces shorter `serverDeadMs` and `progressMs` survives an outage of every line only as long as
+that server keeps the session.
 
 ### 5.5 Lifecycle
 
-- A session exists only while at least one of its links is alive. When the last link dies, the
-  session **ends for good** on that side: every stream fails at once, and all of its state is
-  released. There is no detached or orphaned session and no grace period.
+- On the server, a session exists only while at least one of its links is alive. When the last link
+  dies, the session **ends for good** there: every stream fails at once, and all of its state is
+  released. There is no detached or orphaned session on the server and no grace period.
+- The client keeps a session after its last link died, dialling every line into it, and ends it
+  when the server shows it has lost the session (section 4.2), on GOODBYE, or when no link has
+  received a byte for `serverDeadMs`: by then the server has ended it too. Its streams then fail at
+  once.
 - The client then starts a **new** session with a new id, over the line list it fetches again
   (section 2), or the list it kept while that fetch runs.
 - GOODBYE ends a session explicitly. The client sends it on every link when it shuts down; the server
@@ -299,6 +337,7 @@ type: u8 | length: u16 | stream: u32 | body: length - 4 bytes
 | `maxStreams` per session | 256 | 1 to 65535 | server resets the stream |
 | `maxLinks` per session | 8 | 1 to 255 | server REJECTs |
 | handshake | 5 s | | both close the link |
+| client connection setup | 10 s | | client closes the connection |
 | WebSocket message | `maxPayload` + 3 | | both close the link |
 
 ## 8. Resource principle

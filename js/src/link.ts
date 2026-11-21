@@ -1,8 +1,10 @@
 // One link (PROTOCOL.md sections 3, 4.2 and 5.4): a WebSocket over one line, one binary message per
 // frame. A browser cannot open a raw socket, so every link is a WebSocket on every platform.
 //
-// Link.dial opens the socket, sends HELLO and waits for WELCOME or REJECT, at most the handshake
-// timeout. From then on the session owns the link: it queues frames with send() and receives every
+// Link.dial opens the socket, sends HELLO and waits for WELCOME or REJECT. It has two deadlines: one
+// for the connection (DNS, TCP, TLS and the upgrade, until the socket opens), then the handshake
+// timeout from the sent HELLO, so a slow setup through a distant CDN does not eat the server's time to
+// answer. From then on the session owns the link: it queues frames with send() and receives every
 // message through start()'s handlers.
 //
 // A WebSocket's send() never blocks; the platform buffers whatever it is given, and its
@@ -16,14 +18,15 @@
 //
 // React Native's WebSocket keeps no reliable bufferedAmount. Where it is missing, the link counts it
 // as zero: frames go to the socket at once, the bound covers only this queue, and a link that stops
-// writing is caught by the liveness rules instead (no inbound byte, or no ACK progress, for 1 s),
-// which the stuck check would otherwise catch first.
+// writing is caught by the liveness rules instead (soft down once it misses a ping round, closed
+// without an inbound byte or ACK progress), which the stuck check would otherwise catch first.
 //
 //   - WebSocketLike / WebSocketConstructor: the part of the WebSocket API a link uses; the browser's,
 //     Node's and React Native's all fit.
 //   - RejectedError: the server refused the link; code is the REJECT code.
-//   - Link.dial(url, hello, WebSocket, timeoutMs) resolves with the link and the WELCOME, or rejects
-//     with a RejectedError or the reason the handshake failed. A socket error is "connection failed",
+//   - Link.dial(url, hello, WebSocket, helloMs, connectMs) resolves with the link and the WELCOME, or
+//     rejects with a RejectedError or the reason the handshake failed: no open socket within
+//     connectMs, or no answer within helloMs of the HELLO. A socket error is "connection failed",
 //     followed by the platform's message when the error event has one (React Native's does: a TLS
 //     or DNS failure names itself there; a browser's error event says nothing).
 //   - link.start(handlers, limit, acked): sets the queue's bound (limit) and the peer's acknowledged
@@ -36,7 +39,8 @@
 //   - link.queued() is the bytes waiting (queue plus bufferedAmount); link.close() closes the socket
 //     and returns whether this call closed it. bytesIn, bytesOut and lastIn are counters for status.
 //
-//     const { link, welcome } = await Link.dial(url, hello, WebSocket, HANDSHAKE_TIMEOUT_MS);
+//     const { link, welcome } = await Link.dial(url, hello, WebSocket, HANDSHAKE_TIMEOUT_MS,
+//       CONNECT_TIMEOUT_MS);
 //     link.start({ onMessage: (m) => handle(m), onClose: (why) => drop(why) }, limit, () => acked);
 //     if (!link.send(encodePing(1n), 0)) drop('send queue full');
 import {
@@ -134,7 +138,8 @@ export class Link {
     url: string,
     hello: HelloFrame,
     WebSocket: WebSocketConstructor,
-    timeoutMs: number,
+    helloMs: number,
+    connectMs: number,
   ): Promise<{ link: Link; welcome: WelcomeFrame }> {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(url);
@@ -147,11 +152,18 @@ export class Link {
         ws.close();
         reject(err);
       };
-      const timer = setTimeout(
-        () => fail(new Error(`no answer to hello within ${timeoutMs} ms`)),
-        timeoutMs,
+      let timer = setTimeout(
+        () => fail(new Error(`no connection within ${connectMs} ms`)),
+        connectMs,
       );
-      ws.onopen = () => ws.send(encodeHello(hello));
+      ws.onopen = () => {
+        clearTimeout(timer);
+        timer = setTimeout(
+          () => fail(new Error(`no answer to hello within ${helloMs} ms`)),
+          helloMs,
+        );
+        ws.send(encodeHello(hello));
+      };
       // A browser's error event carries no detail; the close event that follows has the code.
       ws.onerror = (ev) => fail(new Error(failed(ev)));
       ws.onclose = (ev) => fail(new Error(`connection closed (code ${ev.code ?? 'none'})`));

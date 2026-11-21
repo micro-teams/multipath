@@ -1,22 +1,34 @@
 // The session (PROTOCOL.md section 5): several links joined into one reliable, ordered, duplex byte
 // stream, the client's half of what the Go package `session` does on both ends. Every byte is sent on
-// every live link; the receiver keeps the first copy of each byte, in order, and drops the rest. As
-// long as one link works the session works; when the last link dies the session ends for good and
+// every live link that answers; the receiver keeps the first copy of each byte, in order, and drops
+// the rest. As long as one link works the session works, and the session outlives its links: through
+// an outage of every link its owner redials into it, until the server says it no longer holds it or
+// no link has answered for serverDeadMs (by then the server has ended it too). When it ends,
 // everything it held is released at once.
 //
 // The session does not dial or handshake: the client brings each link up to its WELCOME and then
 // attaches it. On attach the link first gets the current ACK and the replay of every unacknowledged
 // byte, queued before the link is published, so no newer frame can overtake the replay. Frames ahead
 // of a gap wait in a bounded reorder buffer. ACKs go out only when the delivered offset has changed:
-// on the next tick, or at once when a quarter of the window is unacknowledged. A tick every 50 ms
-// sends the pings and applies the liveness rules: a link is dead after clientDeadMs without an inbound
-// byte, after progressMs without ACK progress while it carries unacknowledged data, or when its
-// writes are stuck for clientDeadMs; a full send queue closes it too.
+// on the next tick, or at once when a quarter of the window is unacknowledged.
+//
+// Liveness is judged for the session as a whole. A tick every 50 ms flushes ACKs, and every pingMs
+// sends one PING round on all links at once. A link answers a round with any inbound byte after its
+// PING (the PONG itself may wait behind data the server queued earlier). A link that has not answered
+// the round sent clientDeadMs ago is soft down: it gets no new DATA but stays attached, and when it
+// answers again it first receives the DATA it missed, so no byte is stranded on it. When no link
+// answers, the session is silent and onSilent is called once, for the owner to redial every line
+// into this session. A link is closed after max(LINK_DEAD_MIN_MS, LINK_DEAD_RTTS x its smoothed PONG
+// round trip) without an inbound byte or with its writes stuck, after progressMs without ACK
+// progress while it carries unacknowledged data, or when its send queue is full.
 //
 //   - SessionOptions: the limits, and the callbacks. deliver(bytes) receives the in-order bytes; if it
 //     throws, the session ends with a GOODBYE naming the violation (the mux reports violations this
-//     way). onLink(index, up, why) reports each link coming up or going down; onEnd(why) reports the
-//     end once. PEER_GOODBYE starts the reason of a session the server said goodbye to.
+//     way). onLink(index, up, why) reports each link coming up or going down (a link replaced by a
+//     new one at its index is not reported going down); onSoft(index, soft) a link going soft down or
+//     answering again; onSilent() that no link answers, once each time the session falls silent;
+//     onEnd(why) the end, once. PEER_GOODBYE starts the reason of a session the server said goodbye
+//     to.
 //
 //   - new Session(opt) creates a session with no links. Bytes sent before the first attach wait in
 //     the send buffer and are replayed onto the first link.
@@ -37,12 +49,16 @@
 //
 //   - session.detach(index, why) closes one link as if it had died.
 //
+//   - session.linkState(index) says whether a link is attached at index and whether it answers
+//     (attached and not soft down).
+//
 //   - session.end(why) ends the session at once; session.goodbye(why) first sends GOODBYE on every
 //     link and resolves once it has left, or after half a second.
 //
 //   - session.ended and session.reason say whether and why the session ended.
 //
-//   - session.stats() is a snapshot of the offsets and of every live link, for status views.
+//   - session.stats() is a snapshot of the offsets and of every live link (its last byte, bytes in
+//     and out, queued bytes, soft state and smoothed round trip), for status views.
 //
 //     const s = new Session({ limits, deliver: (b) => mux.feed(b), onEnd: (why) => mux.close(why) });
 //     s.attach(0, link);
@@ -52,6 +68,8 @@ import {
   CONTROL_SLACK,
   DATA_OVERHEAD,
   FrameType,
+  LINK_DEAD_MIN_MS,
+  LINK_DEAD_RTTS,
   MAX_DATA,
   decodeData,
   decodeReason,
@@ -77,6 +95,8 @@ export interface SessionOptions {
   limits: Limits;
   deliver(bytes: Uint8Array): void;
   onLink?(index: number, up: boolean, why: string): void;
+  onSoft?(index: number, soft: boolean): void;
+  onSilent?(): void;
   onEnd?(why: string): void;
 }
 
@@ -85,7 +105,15 @@ export interface SessionStats {
   sendBase: number;
   deliverNext: number;
   reorder: number;
-  links: { index: number; lastIn: number; bytesIn: number; bytesOut: number; queued: number }[];
+  links: {
+    index: number;
+    lastIn: number;
+    bytesIn: number;
+    bytesOut: number;
+    queued: number;
+    soft: boolean;
+    rttMs: number;
+  }[];
 }
 
 interface Attached {
@@ -94,7 +122,8 @@ interface Attached {
   ackSeen: number; // highest ACK received on this link
   sentEnd: number; // offset after the last DATA queued on it
   progressAt: number; // when ackSeen last advanced, or data became outstanding
-  nextPing: number;
+  soft: boolean; // missed the due round; gets no new DATA until it answers
+  srtt: number; // smoothed PONG round trip in ms, 0 before the first
 }
 
 const TICK_MS = 50;
@@ -118,6 +147,10 @@ export class Session {
   private reorderBytes = 0;
   private waiters: (() => void)[] = [];
   private timer: ReturnType<typeof setInterval>;
+  private rounds: number[] = []; // send times of the PING rounds not older than the due one
+  private nextRound = 0;
+  private silent = false; // no attached link answered the due round; onSilent was called
+  private heardAt = 0; // the last inbound byte on any link
 
   constructor(private opt: SessionOptions) {
     this.limits = opt.limits;
@@ -148,7 +181,8 @@ export class Session {
       ackSeen: this.sendBase,
       sentEnd: this.sendNext,
       progressAt: now,
-      nextPing: now,
+      soft: false,
+      srtt: 0,
     };
     link.start(
       { onMessage: (m) => this.handle(a, m), onClose: (why) => this.drop(a, why) },
@@ -169,6 +203,7 @@ export class Session {
     const old = this.links[index];
     this.links[index] = a;
     this.live = true;
+    this.heardAt = now;
     if (old) this.drop(old, 'replaced by a new link');
     this.opt.onLink?.(index, true, '');
   }
@@ -178,15 +213,16 @@ export class Session {
     if (a) this.drop(a, why);
   }
 
+  linkState(index: number): { attached: boolean; answering: boolean } {
+    const a = this.links[index] ?? null;
+    return { attached: a !== null, answering: a !== null && !a.soft };
+  }
+
   private drop(a: Attached, why: string): void {
     if (!a.link.close()) return;
-    const removed = this.links[a.index] === a;
-    if (removed) this.links[a.index] = null;
-    if (this.ended) return;
+    if (this.links[a.index] !== a || this.ended) return;
+    this.links[a.index] = null;
     this.opt.onLink?.(a.index, false, why);
-    if (removed && this.links.every((l) => l === null)) {
-      this.end(`all links are dead, the last one: ${why}`);
-    }
   }
 
   end(why: string): void {
@@ -249,11 +285,12 @@ export class Session {
     this.fanout(encodeData(BigInt(off), p), this.sendNext);
   }
 
-  // fanout queues f on every live link; end is the offset after f when f is DATA, else 0.
+  // fanout queues f on every live link; end is the offset after f when f is DATA, else 0. DATA skips
+  // links that are soft down.
   private fanout(f: Uint8Array<ArrayBuffer>, end: number): void {
     const now = Date.now();
     for (const a of this.links) {
-      if (a === null) continue;
+      if (a === null || (end > 0 && a.soft)) continue;
       if (!a.link.send(f, end)) {
         this.drop(a, 'send queue full');
         continue;
@@ -283,7 +320,7 @@ export class Session {
         case FrameType.Ping:
           return a.link.send(encodePong(decodeU64(payload)), 0) ? null : 'send queue full';
         case FrameType.Pong:
-          decodeU64(payload);
+          this.onPong(a, decodeU64(payload));
           return null;
         case FrameType.Goodbye:
           this.end(PEER_GOODBYE + decodeReason(payload));
@@ -400,24 +437,92 @@ export class Session {
     this.fanout(encodeAck(BigInt(this.deliverNext)), 0);
   }
 
+  // onPong folds the round trip of a PING sent at `sent` (its nonce, in ms) into the link's smoothed
+  // round trip, with the weight of RFC 6298.
+  private onPong(a: Attached, sent: bigint): void {
+    const sample = Date.now() - Number(sent);
+    if (sample < 0 || sample > 60_000) return; // not a nonce this client sent; nothing to learn
+    a.srtt = a.srtt === 0 ? sample : a.srtt + (sample - a.srtt) / 8;
+  }
+
+  // catchUp queues on a, which answers again after being soft down, the unacknowledged bytes it was
+  // not given meanwhile; it returns false when they do not fit its queue.
+  private catchUp(a: Attached, now: number): boolean {
+    const from = Math.max(a.sentEnd, this.sendBase);
+    if (from >= this.sendNext) return true;
+    if (a.ackSeen >= a.sentEnd) a.progressAt = now; // the progress clock starts with outstanding data
+    for (let i = this.unackedHead; i < this.unacked.length; i++) {
+      const { off, data } = this.unacked[i];
+      if (off + data.length <= from) continue;
+      const skip = Math.max(0, from - off);
+      if (!a.link.send(encodeData(BigInt(off + skip), data.subarray(skip)), off + data.length)) {
+        return false;
+      }
+    }
+    a.sentEnd = this.sendNext;
+    return true;
+  }
+
+  // dueRound returns when the newest PING round at least clientDeadMs old was sent, or 0, and forgets
+  // the older rounds.
+  private dueRound(now: number): number {
+    let n = -1;
+    while (n + 1 < this.rounds.length && now - this.rounds[n + 1] >= this.limits.clientDeadMs) n++;
+    if (n < 0) return 0;
+    this.rounds.splice(0, n);
+    return this.rounds[0];
+  }
+
   private tick(now: number): void {
     this.flushAck();
+    if (this.ended) return;
     const l = this.limits;
+    const due = this.dueRound(now);
+    const round = now >= this.nextRound;
+    if (round) {
+      this.nextRound = now + l.pingMs;
+      this.rounds.push(now);
+    }
+    let attached = 0;
+    let answering = 0;
     for (const a of this.links) {
       if (a === null) continue;
+      attached++;
+      this.heardAt = Math.max(this.heardAt, a.link.lastIn);
+      const deadMs = Math.max(LINK_DEAD_MIN_MS, LINK_DEAD_RTTS * a.srtt);
       let why: string | null = null;
-      if (now - a.link.lastIn > l.clientDeadMs) {
-        why = `no inbound byte for ${l.clientDeadMs} ms`;
+      if (now - a.link.lastIn > deadMs) {
+        why = `no inbound byte for ${Math.round(deadMs)} ms`;
       } else if (a.ackSeen < a.sentEnd && now - a.progressAt > l.progressMs) {
         why = `acknowledgement stalled for ${l.progressMs} ms with ${a.sentEnd - a.ackSeen} bytes outstanding`;
       } else {
-        why = a.link.check(now, l.clientDeadMs);
+        why = a.link.check(now, Math.round(deadMs));
       }
-      if (why === null && now >= a.nextPing) {
-        a.nextPing = now + l.pingMs;
-        if (!a.link.send(encodePing(BigInt(now)), 0)) why = 'send queue full';
+      if (why === null) {
+        const soft = a.link.lastIn < due;
+        if (soft !== a.soft) {
+          a.soft = soft;
+          if (!soft && !this.catchUp(a, now)) why = 'send queue full';
+          this.opt.onSoft?.(a.index, soft);
+        }
+      }
+      if (why === null && round && !a.link.send(encodePing(BigInt(now)), 0)) {
+        why = 'send queue full';
       }
       if (why !== null) this.drop(a, why);
+      else if (!a.soft) answering++;
+      if (this.ended) return;
+    }
+    const silent = attached > 0 && answering === 0;
+    const tell = silent && !this.silent;
+    this.silent = silent;
+    if (tell) this.opt.onSilent?.();
+    if (this.live && !this.ended && now - this.heardAt > l.serverDeadMs) {
+      // The server ends a session whose links were all silent for its dead time; holding it longer
+      // would only keep streams waiting for nothing.
+      this.end(
+        `no line has answered for ${l.serverDeadMs} ms, so the server has ended the session`,
+      );
     }
   }
 
@@ -435,6 +540,8 @@ export class Session {
           bytesIn: a.link.bytesIn,
           bytesOut: a.link.bytesOut,
           queued: a.link.queued(),
+          soft: a.soft,
+          rttMs: Math.round(a.srtt),
         })),
     };
   }

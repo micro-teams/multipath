@@ -1,7 +1,7 @@
 // Tests for the redundant session over an in-memory fault-injecting link fabric. A fabric link is a
-// pair of message pipes with a policy that can, while set, swallow every message (black-hole), stall
-// writes like a peer that stopped reading, corrupt one DATA frame, or drop only the ACKs flowing to
-// the client. A harness redials a link whenever the client side reports it down, so replay on
+// pair of message pipes with a policy that can, while set, swallow every message (black-hole), hold
+// every message back and deliver it later (a jittery line), stall writes like a peer that stopped
+// reading, corrupt one DATA frame, or drop only the ACKs flowing to the client. A harness redials a link whenever the client side reports it down, so replay on
 // reconnect is exercised for real. Timings are about a quarter of production, with room for the
 // race detector on a small machine.
 package session
@@ -22,6 +22,7 @@ import (
 
 type policy struct {
 	blackhole atomic.Bool
+	hold      atomic.Bool // readers wait: messages arrive late, none is lost
 	stall     atomic.Bool // writes block until their deadline
 	corrupt   atomic.Bool // corrupt the next DATA frame, once
 	dropAcks  atomic.Bool // swallow ACKs written by the server side
@@ -81,6 +82,9 @@ func (c *memConn) WriteMessage(p []byte) error {
 }
 
 func (c *memConn) ReadMessage(max int) ([]byte, error) {
+	for c.pol.hold.Load() {
+		time.Sleep(time.Millisecond)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for len(c.msgs) == 0 && !c.closed {
@@ -148,10 +152,13 @@ func testLimits() protocol.Limits {
 	l.Window = 1 << 20
 	l.Ping = 25 * time.Millisecond
 	l.ClientDead = 150 * time.Millisecond
-	l.ServerDead = 400 * time.Millisecond
-	l.Progress = 250 * time.Millisecond
+	l.ServerDead = 1500 * time.Millisecond
+	l.Progress = 1500 * time.Millisecond
 	return l
 }
+
+// testLinkDead stands for protocol.LinkDeadMin in these tests.
+const testLinkDead = time.Second
 
 type harness struct {
 	t        *testing.T
@@ -161,6 +168,9 @@ type harness struct {
 	cin, sin *sink
 	ended    chan string
 	redial   atomic.Bool
+	downs    atomic.Int64 // client links reported down
+	silences atomic.Int64 // OnSilent calls
+	onSilent func()       // set before the links can fall silent
 }
 
 // newHarness connects a client and a server session over n fabric links.
@@ -171,10 +181,19 @@ func newHarness(t *testing.T, n int, lim protocol.Limits) *harness {
 	for range n {
 		h.pol = append(h.pol, &policy{})
 	}
-	h.cli = New(Options{Limits: lim, Client: true, Clock: h.clock, Deliver: h.cin.deliver,
+	h.cli = New(Options{Limits: lim, Client: true, Clock: h.clock, Deliver: h.cin.deliver, linkDeadMin: testLinkDead,
 		OnLink: func(i int, up bool, _ string) {
+			if !up {
+				h.downs.Add(1)
+			}
 			if !up && h.redial.Load() {
 				go func() { time.Sleep(5 * time.Millisecond); h.connect(i) }()
+			}
+		},
+		OnSilent: func() {
+			h.silences.Add(1)
+			if h.onSilent != nil {
+				h.onSilent()
 			}
 		},
 		OnEnd: func(why string) { h.ended <- "client: " + why }})
@@ -391,7 +410,8 @@ func TestSendWaitsForWindowAndEndReleasesIt(t *testing.T) {
 	}
 }
 
-// When every link dies at once, both sides end the session within their dead times.
+// When every link goes silent for good, the server ends the session after its dead time, and the
+// client, which outlives its links, after the same time without a byte.
 func TestAllLinksDeadEndsBothSides(t *testing.T) {
 	h := newHarness(t, 2, testLimits())
 	h.redial.Store(false)
@@ -402,7 +422,7 @@ func TestAllLinksDeadEndsBothSides(t *testing.T) {
 		select {
 		case why := <-h.ended:
 			t.Log(why)
-		case <-time.After(2 * time.Second):
+		case <-time.After(4 * time.Second):
 			t.Fatal("a side did not end the session")
 		}
 	}
@@ -436,10 +456,10 @@ func TestProgressRuleDropsALinkWithoutAcks(t *testing.T) {
 	}
 	select {
 	case why := <-h.ended:
-		if d := time.Since(start); d > 1500*time.Millisecond {
+		if d := time.Since(start); d > 3*time.Second {
 			t.Fatalf("ended after %v: %s", d, why)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(4 * time.Second):
 		t.Fatal("link without acks survived")
 	}
 }
@@ -464,4 +484,89 @@ func TestStatsCountsLinksAndBytes(t *testing.T) {
 	if out < int64(len(msg)) {
 		t.Fatalf("links wrote %d bytes for %d delivered", out, len(msg))
 	}
+}
+
+// A link that goes quiet for several ping rounds, as a jittery line does, is soft down meanwhile but
+// is not closed, and is used again once its messages flow.
+func TestJitteryLinkIsSoftDownNotClosed(t *testing.T) {
+	h := newHarness(t, 2, testLimits())
+	h.pol[0].hold.Store(true)
+	waitState(t, h.cli, 0, true, false)
+	msg := randBytes(512 << 10)
+	go func() { _ = send(h.cli, msg) }() // the receiving side checks what arrived
+	expect(t, h.sin, msg)
+	time.Sleep(testLinkDead / 2)
+	h.pol[0].hold.Store(false)
+	waitState(t, h.cli, 0, true, true)
+	if n := h.downs.Load(); n != 0 {
+		t.Fatalf("%d links went down", n)
+	}
+	if st := h.cli.Stats(); len(st.Links) != 2 || st.Links[0].RTT == 0 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+// Bytes sent while the only link is soft down are not stranded: they reach the peer once it answers.
+func TestSoftDownLinkCatchesUp(t *testing.T) {
+	h := newHarness(t, 1, testLimits())
+	h.pol[0].hold.Store(true)
+	waitState(t, h.cli, 0, true, false)
+	msg := randBytes(256 << 10)
+	if err := send(h.cli, msg); err != nil {
+		t.Fatal(err)
+	}
+	h.pol[0].hold.Store(false)
+	expect(t, h.sin, msg)
+	if h.silences.Load() != 1 || h.downs.Load() != 0 {
+		t.Fatalf("%d silences, %d links down", h.silences.Load(), h.downs.Load())
+	}
+}
+
+// A link silent past the lenient dead time is closed, and not before.
+func TestSilentLinkClosedAfterLinkDead(t *testing.T) {
+	h := newHarness(t, 2, testLimits())
+	h.redial.Store(false)
+	start := time.Now()
+	h.pol[0].blackhole.Store(true)
+	waitState(t, h.cli, 0, false, false)
+	if d := time.Since(start); d < testLinkDead {
+		t.Fatalf("closed after %v, before %v", d, testLinkDead)
+	}
+}
+
+// When every link falls silent at once, the client is told once; dialling every line again into the
+// same session carries on what was in flight, in both directions, with no session ending.
+func TestSilentSessionRedialsIntoItself(t *testing.T) {
+	h := newHarness(t, 3, testLimits())
+	h.redial.Store(false)
+	h.onSilent = func() {
+		go func() {
+			for i := range h.pol {
+				h.pol[i] = &policy{} // the new links take another, working path
+				h.connect(i)
+			}
+		}()
+	}
+	a, b := randBytes(2<<20), randBytes(2<<20)
+	for _, p := range h.pol {
+		p.blackhole.Store(true)
+	}
+	go func() { _ = send(h.cli, a) }() // the receiving side checks what arrived
+	go func() { _ = send(h.srv, b) }() // the receiving side checks what arrived
+	expect(t, h.sin, a)
+	expect(t, h.cin, b)
+	if h.silences.Load() != 1 || h.cli.Reason() != "" || h.srv.Reason() != "" {
+		t.Fatalf("%d silences; client ended %q, server ended %q", h.silences.Load(), h.cli.Reason(), h.srv.Reason())
+	}
+}
+
+// waitState waits until link index of s is attached and answering as wanted.
+func waitState(t *testing.T, s *Session, index int, attached, answering bool) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if a, b := s.LinkState(index); a == attached && b == answering {
+			return
+		}
+	}
+	t.Fatalf("link %d never became attached=%v answering=%v", index, attached, answering)
 }
