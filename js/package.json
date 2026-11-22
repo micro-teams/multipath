@@ -1,6 +1,6 @@
 {
   "name": "@micro-teams/multipath",
-  "version": "0.3.0-rc.2",
+  "version": "0.3.0-rc.3",
   "description": "MultiPath client for browsers, service workers, React Native and Node: one session over every line of an entry, with HTTP exchanges and WebSockets as streams (protocol version 3).",
   "license": "MIT",
   "type": "module",
