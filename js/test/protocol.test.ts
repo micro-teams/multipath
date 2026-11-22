@@ -201,6 +201,8 @@ describe('line list', () => {
       lines: [
         { id: 'v4', url: 'https://r.example.app:8443', address: '203.0.113.7:8443' },
         { id: 'v6', url: 'https://v6.example.app', address: '[2001:db8::7]:443' },
+        { id: 'v6b', url: 'https://v6.example.app', address: '[2001:db8:0:1:2:3:4:5]:443' },
+        { id: 'v6c', url: 'https://v6.example.app', address: '[::1]:443' },
       ],
     });
     expect(lines[0]).toEqual({
@@ -226,6 +228,9 @@ describe('line list', () => {
       '2001:db8::7:443',
       '[2001:DB8::7]:443',
       '[fe80::1%eth0]:443',
+      '[2001:db8::7::1]:443',
+      '[2001:db8:1:2:3:4:5:6:7]:443',
+      '[2001:db8:00007::1]:443',
       '203.0.113.7:443/x',
       443,
     ]) {

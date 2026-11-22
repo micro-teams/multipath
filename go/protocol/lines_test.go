@@ -29,7 +29,8 @@ func TestParseLinesIgnoresUnknownMembers(t *testing.T) {
 func TestParseLinesKeepsAnAddress(t *testing.T) {
 	list, err := ParseLines([]byte(`{"lines":[
 		{"id":"v4","url":"https://relay.example.app:8443","address":"203.0.113.7:8443"},
-		{"id":"v6","url":"https://v6.example.app","address":"[2001:db8::7]:443"}
+		{"id":"v6","url":"https://v6.example.app","address":"[2001:db8::7]:443"},
+		{"id":"v6b","url":"https://v6.example.app","address":"[2001:db8:0:1:2:3:4:5]:443"}
 	]}`))
 	if err != nil {
 		t.Fatalf("expected the document to parse, got %v", err)
@@ -58,6 +59,8 @@ func TestParseLinesRejects(t *testing.T) {
 		"address port zero":      `{"lines":[{"id":"cf","url":"https://a.example.app","address":"203.0.113.7:0"}]}`,
 		"address v6 unbracketed": `{"lines":[{"id":"cf","url":"https://a.example.app","address":"2001:db8::7:443"}]}`,
 		"address has a zone":     `{"lines":[{"id":"cf","url":"https://a.example.app","address":"[fe80::1%eth0]:443"}]}`,
+		"address v6 uppercase":   `{"lines":[{"id":"cf","url":"https://a.example.app","address":"[2001:DB8::7]:443"}]}`,
+		"address port padded":    `{"lines":[{"id":"cf","url":"https://a.example.app","address":"203.0.113.7:0443"}]}`,
 		"address not canonical":  `{"lines":[{"id":"cf","url":"https://a.example.app","address":"203.0.113.07:443"}]}`,
 		"address is a number":    `{"lines":[{"id":"cf","url":"https://a.example.app","address":443}]}`,
 	} {

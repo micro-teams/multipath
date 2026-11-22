@@ -45,9 +45,9 @@ its configuration:
 - `id` MUST be non-empty and unique within the document.
 - `url` MUST be an absolute origin with scheme `https` or `http`, a host, an optional port, and no
   path, query, fragment or credentials.
-- `address` is OPTIONAL. When present it MUST be an IP literal and a port, written as a URL writes
-  them (`203.0.113.7:8443`, `[2001:db8::7]:8443`: no leading zeros, IPv6 in brackets, lowercase and
-  compressed, no zone), with a port from 1 to 65535.
+- `address` is OPTIONAL. When present it MUST be an IP literal in its canonical form (dotted
+  decimal without leading zeros, or RFC 5952 in brackets, with no zone) and a port from 1 to 65535,
+  such as `203.0.113.7:8443` or `[2001:db8::7]:8443`.
 - Other members are ignored, so a server may carry extra fields for other consumers.
 
 A client is configured with one **entry** (an origin such as `https://example.app`). It fetches the

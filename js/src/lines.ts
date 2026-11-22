@@ -11,7 +11,7 @@
 //
 //   - parseLines(doc) validates a parsed JSON document ({"lines": [...]}) and returns its lines;
 //     no lines or more than 255, an empty or duplicate id, a URL that is not a bare http(s) origin,
-//     or an address that is not an IP literal and a port in canonical form throws. Members other
+//     or an address that is not an IP literal and a port throws. Members other
 //     than id, url and address are ignored.
 //
 //   - checkLines(lines, entry, site) applies the client's policy and throws if the list breaks it: an
@@ -38,21 +38,20 @@ export interface Line {
 // the link path is appended.
 const ORIGIN = /^https?:\/\/[^/@?#]+$/;
 
-// An IP literal and a port, as "203.0.113.7:8443" or "[2001:db8::7]:8443", written as the URL
-// parser writes it, so that one address has one spelling. A host name is refused: it would be
-// resolved and sent as the server name, which is what the address exists to avoid.
-const ADDRESS = /^(\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-f:.]+\]):(\d{1,5})$/;
+// An IP literal and a port, as "203.0.113.7:8443" or "[2001:db8::7]:8443". A host name is refused:
+// it would be resolved and sent as the server name, which is what the address exists to avoid. The
+// check is written out rather than left to URL, whose React Native version does not parse IPv6.
+const ADDRESS = /^(?:(\d{1,3}(?:\.\d{1,3}){3})|\[([0-9a-f:]+)\]):([1-9]\d{0,4})$/;
 
 function isAddress(address: string): boolean {
   const m = ADDRESS.exec(address);
-  if (!m) return false;
-  const port = Number(m[2]);
-  if (port < 1 || port > 65535 || String(port) !== m[2]) return false;
-  try {
-    return new URL(`http://${m[1]}`).hostname === m[1];
-  } catch {
-    return false; // not an IP literal the URL parser accepts
-  }
+  if (!m || Number(m[3]) > 65535) return false;
+  if (m[1] !== undefined) return m[1].split('.').every((b) => /^(0|[1-9]\d*)$/.test(b) && +b < 256);
+  const halves = m[2].split('::');
+  const groups = halves.flatMap((h) => (h === '' ? [] : h.split(':')));
+  if (halves.length > 2 || !groups.every((g) => /^(0|[1-9a-f][0-9a-f]{0,3})$/.test(g)))
+    return false;
+  return halves.length === 2 ? groups.length < 8 : groups.length === 8;
 }
 
 export function parseLines(doc: unknown): Line[] {
