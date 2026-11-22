@@ -5,4 +5,4 @@
 package protocol
 
 // ImplVersion is the release version of this implementation.
-const ImplVersion = "0.3.0-rc.3"
+const ImplVersion = "0.3.0-rc.4"
