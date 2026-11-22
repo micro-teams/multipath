@@ -1,9 +1,10 @@
 // Tests for the client against an in-process server: HTTP requests through the local port reach the
-// target, the status reports the session and its lines, a refreshed line list replaces the old one,
+// target, the status reports the session and its lines (each answering, with its round trip), a refreshed line list replaces the old one,
 // an https entry refuses plain lines, a local connection without a live session is refused after
 // the configured wait, the fetched list is stored in the cache file, and a stored list starts a
-// session while the entry is unreachable, but only for the entry that served it. Behaviour under
-// faults is the conformance suite's job.
+// session while the entry is unreachable, but only for the entry that served it, and a line whose
+// connection setup alone takes longer than the handshake timeout still links, since the HELLO timer
+// starts once the connection is up. Behaviour under faults is the conformance suite's job.
 package client
 
 import (
@@ -47,6 +48,12 @@ type fixture struct {
 // start runs a target, a server and a client whose entry lists the server n times as lines.
 func start(t *testing.T, n int) *fixture {
 	t.Helper()
+	return startWith(t, n, func(h http.Handler) http.Handler { return h })
+}
+
+// startWith is start with the server's handler wrapped.
+func startWith(t *testing.T, n int, wrap func(http.Handler) http.Handler) *fixture {
+	t.Helper()
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "target saw %s", r.URL.Path)
 	}))
@@ -60,7 +67,7 @@ func start(t *testing.T, n int) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hs.Config.Handler = srv.Handler()
+	hs.Config.Handler = wrap(srv.Handler())
 	hs.Start()
 	t.Cleanup(hs.Close)
 	f.client = run(t, Config{Listen: "127.0.0.1:0", Entry: f.entry, LinkPath: DefaultLinkPath, LinesPath: DefaultLinesPath,
@@ -138,11 +145,11 @@ func TestRequestsReachTheTarget(t *testing.T) {
 			t.Fatalf("answer %q", got)
 		}
 	}
-	waitFor(t, "all lines up", func() bool {
+	waitFor(t, "all lines up, answering and measured", func() bool {
 		st := f.client.Status()
 		up := 0
 		for _, l := range st.Lines {
-			if l.State == "up" {
+			if l.State == "up" && !l.Soft && l.RTTMs > 0 {
 				up++
 			}
 		}
@@ -251,5 +258,31 @@ func TestCachedLineListOfAnotherEntryIsIgnored(t *testing.T) {
 	}
 	if err := c.loadCache(); err == nil || !strings.Contains(err.Error(), "other.example") {
 		t.Fatalf("want a refusal naming the other entry, got %v", err)
+	}
+}
+
+// A line whose WebSocket upgrade takes longer than protocol.HandshakeTimeout, as through a distant
+// CDN, links all the same: the setup has protocol.ConnectTimeout, and the HELLO its own timeout.
+func TestSlowConnectionSetupStillLinks(t *testing.T) {
+	setup := protocol.HandshakeTimeout + time.Second
+	f := startWith(t, 1, func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == DefaultLinkPath {
+				time.Sleep(setup)
+			}
+			h.ServeHTTP(w, r)
+		})
+	})
+	for deadline := time.Now().Add(setup + 5*time.Second); ; time.Sleep(50 * time.Millisecond) {
+		st := f.client.Status()
+		if len(st.Lines) == 1 && st.Lines[0].State == "up" {
+			if st.Lines[0].LastReason != "" {
+				t.Fatalf("the line failed first: %q", st.Lines[0].LastReason)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the line never came up: %+v", st.Lines)
+		}
 	}
 }

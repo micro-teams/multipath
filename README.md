@@ -141,13 +141,20 @@ sequenceDiagram
   S-->>C: [A] and [B] DATA: response bytes
   C-->>P: response
 
-  Note over C: line A silent for 1 s: link A is dead
+  Note over C: line A misses a ping round: soft down, no new data on it
   Note over C,S: line B alone carries everything, the program notices nothing
+  Note over C: line A answers again: it is sent what it missed, and used again
+  Note over C: line A silent for 5 s: link A is closed
   C->>S: [A] HELLO session X, link 0, join (redialled with backoff)
   S-->>C: [A] WELCOME, ACK, then a replay of every unacknowledged byte
 
-  Note over C,S: lines A and B both die
-  Note over C,S: session X ends on both sides, every open stream fails, P sees its connection close
+  Note over C,S: lines A and B both fall silent (the network changes)
+  Note over C: no line answers a ping round within 1 s
+  C->>S: [A] and [B] HELLO session X, join, all at once over the new network
+  S-->>C: [A] and [B] WELCOME, ACK, replay: the streams carry on
+
+  Note over C,S: the server restarted and lost session X
+  S-->>C: [A] REJECT unknown session
   C->>S: [A] and [B] HELLO session Y, new
   Note over C: Y starts from the kept line list while the entry is asked again
 ```
@@ -168,14 +175,19 @@ What happens, in words:
 4. **Acknowledgements.** The receiver acknowledges the offset up to which it has everything. The
    sender keeps every byte until it is acknowledged, and never has more than the session window
    (2 MiB) unacknowledged.
-5. **A line dies.** The client pings on every link twice a second. A link that stays silent too
-   long, or whose acknowledgements stop moving, is closed and redialled with backoff (200 ms up to
-   5 s, with jitter) for as long as the session lasts. When it joins again, it first receives
-   every byte that is still unacknowledged (the replay), so it catches up before carrying new data.
-6. **All lines die.** A session lives only while it has a live link. When the last one dies, the
-   session ends on both sides, every open stream fails at once, and the client starts a new
-   session. Programs see their connections close and reconnect the way they would after any network
-   error.
+5. **A line is late or dies.** Twice a second the client sends a ping round on all links at once. A
+   link that has not answered within 1 s is soft down: no new data goes on it, but it stays
+   connected, and when it answers again it is sent what it missed and used again. A link that stays
+   silent for 5 s (or four of its round trips, if longer), or whose acknowledgements stop moving, is
+   closed and redialled with backoff (200 ms up to 5 s, with jitter) for as long as the session
+   lasts. When it joins again, it first receives every byte that is still unacknowledged (the
+   replay), so it catches up before carrying new data.
+6. **All lines fall silent.** When no link answers a ping round within 1 s, the client dials every
+   line again at once into the same session; the old links stay until the new ones replace them.
+   The server keeps the session while any of its links is alive (10 s of silence each), so a
+   network handover or a short outage costs nothing: the streams resume where they were. Only when
+   the server has lost the session (it rejects the join) or no line has answered for the server's
+   10 s does the session end, every open stream fail at once, and the client start a new one.
 7. **The server goes away.** When the server shuts down it says GOODBYE on every session; when it
    restarted without saying so, it rejects the old session id. Either way the client waits a random
    0 to 2 s before its new session, so the clients of a restarted server do not all return in the
@@ -187,24 +199,27 @@ What happens, in words:
 a CRC-32), as long as at least one line works. Lines can come and go any number of times during a
 session; a replaced line list adds and removes lines in a running session.
 
-**What does not survive.** All lines failing at once: a laptop changing networks, a server restart.
-The session ends within about a second and open connections fail. A new session starts
-immediately, but MultiPath does not resend application requests; retrying is the application's
-business, exactly as with TCP.
+All lines failing at once for less than 10 s, as when a laptop or a phone changes networks: the
+client redials every line into the same session and the streams carry on after a pause.
+
+**What does not survive.** A server restart, or every line failing for longer than the server's
+10 s. The session ends and open connections fail. A new session starts immediately, but MultiPath
+does not resend application requests; retrying is the application's business, exactly as with TCP.
 
 **How fast a dead line is noticed.** The server announces the timings in WELCOME; the defaults are:
 
 | Rule | Default |
 |---|---|
-| The client pings every link | every 0.5 s |
-| Client: a link with no incoming byte is dead after | 1 s |
-| Server: a link with no incoming byte is dead after | 3 s |
-| A link carrying unacknowledged data must see its acknowledgement advance within | 3 s |
+| The client sends a ping round on all links | every 0.5 s |
+| Client: a link that has not answered a round is soft down (no new data) after | 1 s |
+| Client: no link answers a round: every line is redialled into the session after | 1 s |
+| Client: a link with no incoming byte is closed after | 5 s, or 4 round trips if longer |
+| Server: a link with no incoming byte is closed after | 10 s |
+| A link carrying unacknowledged data must see its acknowledgement advance within | 10 s |
 
-The progress deadline is longer than the silence deadline on purpose: on a distant, slow line an
-acknowledgement waits behind the bytes queued ahead of it, so it can take well over a second while
-the line works (PROTOCOL.md section 5.4 has the measurements). A line whose round trip itself
-exceeds 1 s cannot hold a link.
+A line with jitter, or one TCP retransmission, is only soft down for a moment: its link is kept. A
+line whose round trip itself exceeds 1 s is soft down for good and carries data only when no other
+line answers.
 
 **What it costs.** Every byte is sent on every line, so with three lines the server sends and
 receives up to three times the traffic. A slow line costs less than that: each link writes from its
@@ -476,7 +491,7 @@ integrity: [{ pattern: /\/static\/js\/[^/]+-([0-9a-f]{32})\.js$/, algorithm: 'MD
 **Platforms.**
 
 - Browsers and service workers need nothing special. Browsers throttle timers in background tabs; a
-  session that misses its pings there ends and is replaced, as after a network change.
+  session that misses its pings there redials its lines into itself, as after a network change.
 - React Native: pass `compression: false` and `buffered: true` (there is no `DecompressionStream`,
   and its `Response` cannot take a stream); the constructor refuses the defaults there rather than
   degrade quietly.
@@ -504,15 +519,18 @@ entry's host (or `site` is set to a parent domain).
 
 Both processes log one line per event, naming the session by the first 8 hex digits of its id:
 session start (with the peer's implementation and the client address), every link up and down with
-the reason, every REJECT with the reason, stream failures, session end with the reason, and every
+the reason, every link going soft down and answering again, every silent session and its redial, every REJECT with the reason, stream failures, session end with the reason, and every
 limit violation. Nothing is retried or given up silently.
 
 - The server: the `-status` counters and the periodic `status:` log line (sessions, links, streams,
   target connections, goroutines).
 - The client: `GET /status` on its `-status` address (or `client.stats()` in JavaScript) gives the
-  session (id, state, age, bytes sent, unacknowledged and received), every line (state, milliseconds
-  since its last byte, bytes in and out, reconnects, last reason), every open stream (bytes in and
-  out, buffered bytes, send credit), the number of sessions started and why the previous one ended.
+  session (id, state, age, bytes sent, unacknowledged and received), every line (state, whether it
+  is soft down, its smoothed round trip `rttMs`, milliseconds since its last byte, bytes in and out,
+  reconnects, last reason), every open stream (bytes in and out, buffered bytes, send credit), the
+  number of sessions started and why the previous one ended. The line that is up, not soft down, and
+  has the smallest `rttMs` is the quickest way to the server at the moment, for a program that wants
+  to fetch something large over one line instead of over all of them.
 
 ## The repository
 

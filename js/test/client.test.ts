@@ -2,7 +2,8 @@
 // when, how a fetched list replaces the stored one, how a stored list carries a session while the
 // entry is unreachable (and only for its own entry), how a list breaking the policy is refused, and
 // that a server which lost the session (REJECT, or a second "created") makes the client start a new
-// session. Data over a live session is proven by the conformance suite against the real server.
+// session, and that a session whose every line falls silent is redialled into itself, line by line,
+// with its streams kept and replayed onto the new links. Data over a live session is proven by the conformance suite against the real server.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Client, type ClientEvent, type LineStore } from '../src/client.js';
 import { Mode, RejectCode, defaultLimits, encodeReject, type HelloFrame } from '../src/protocol.js';
@@ -183,6 +184,30 @@ describe('client', () => {
     expect(client.stats().lastSessionEnd).toBe(
       'the server lost the session: it created the session a second time',
     );
+  });
+
+  it('redials every line into the same session when no line answers, and keeps its streams', async () => {
+    const { client, log } = start(listFetch(lines('a.app.example', 'b.app.example')));
+    clients.push(client);
+    expect(await client.live(1000)).toBe(true);
+    const id = client.stats().session!.id;
+    void client.fetch('/held').catch(() => undefined); // answered by nobody; it must not fail
+    await vi.waitFor(() => expect(client.stats().streams).toHaveLength(1));
+    // The fake server never answers a PING: within 1.5 s the session is silent.
+    await vi.waitFor(() => expect(FakeWebSocket.all).toHaveLength(4), { timeout: 3000 });
+    expect(log.join('\n')).toMatch(/silent: no line answers; redialling every line into it/);
+    const [, , c, d] = FakeWebSocket.all;
+    expect([c.hello!.mode, d.hello!.mode]).toEqual([Mode.Join, Mode.Join]);
+    expect(c.hello!.session).toEqual(FakeWebSocket.all[0].hello!.session);
+    await vi.waitFor(() => expect(c.sent.some((f) => f[0] === 0x04)).toBe(true)); // the replay
+    const st = client.stats();
+    expect(st.session!.id).toBe(id);
+    expect(st.sessionsStarted).toBe(1);
+    expect(st.streams).toHaveLength(1);
+    expect(st.lines.map((l) => [l.state, l.reconnects])).toEqual([
+      ['up', 1],
+      ['up', 1],
+    ]);
   });
 
   it('refuses a platform it cannot serve as configured', () => {

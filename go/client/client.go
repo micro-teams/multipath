@@ -4,9 +4,10 @@
 //
 // The client runs one session at a time. It fetches the line list from its entry, dials every line
 // (directly or through the configured HTTP proxy), and keeps every line dialled for the life of the
-// session: a line that fails is retried with backoff, never given up. When the session ends (every
-// link dead, the server lost it, or the server said goodbye) its streams fail at once and the client
-// starts a new session. The list is also refreshed periodically and replaces the old one; lines that
+// session: a line that fails is retried with backoff, never given up. When no line answers, every
+// line is dialled again at once into the same session, so its streams survive a network handover.
+// When the session ends (the server lost it, the server said goodbye, or no line answered for the
+// server's dead time) its streams fail at once and the client starts a new session. The list is also refreshed periodically and replaces the old one; lines that
 // left it are closed, new ones are dialled.
 //
 // The last list the entry served is kept (in memory, and in the Config.LinesCache file across

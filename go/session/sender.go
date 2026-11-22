@@ -1,5 +1,8 @@
-// The send side of a session (PROTOCOL.md sections 5.1 to 5.3): a send buffer of unacknowledged
-// bytes bounded by the window, fanned out to every live link, released as ACKs arrive.
+// The send side of a session (PROTOCOL.md sections 5.1 to 5.4): a send buffer of unacknowledged
+// bytes bounded by the window, fanned out to every live link that answers, released as ACKs arrive.
+// A client link that is soft down gets no new DATA; when it answers again it is caught up from its
+// own sent offset, so no byte is stranded on it, and while it is down every byte still goes out on
+// the links that answer (or, when none does, waits in the buffer for the replay of a redialled one).
 //
 //   - (*Session).Send(p, control) appends p (1 to protocol.MaxData bytes) to the stream as one DATA
 //     frame queued on every live link. A data send waits while the window is full; a control send
@@ -48,12 +51,12 @@ func (s *Session) Send(p []byte, control bool) error {
 }
 
 // fanoutLocked queues f on every live link and returns the links whose queue had no room. end is
-// the stream offset after f when f is DATA, else 0.
+// the stream offset after f when f is DATA, else 0; DATA skips links that are soft down.
 func (s *Session) fanoutLocked(f []byte, end uint64) []*link {
 	var full []*link
 	now := time.Now()
 	for _, l := range s.links {
-		if l == nil {
+		if l == nil || (end > 0 && l.soft) {
 			continue
 		}
 		if !l.q.push(f) {
@@ -68,6 +71,26 @@ func (s *Session) fanoutLocked(f []byte, end uint64) []*link {
 		}
 	}
 	return full
+}
+
+// catchUpLocked queues on l, which answers again after being soft down, the unacknowledged bytes it
+// was not given meanwhile. It reports false when they do not fit its queue.
+func (s *Session) catchUpLocked(l *link, now time.Time) bool {
+	from := max(l.sentEnd, s.sendBase)
+	if from >= s.sendNext {
+		return true
+	}
+	if l.ackSeen >= l.sentEnd {
+		l.progressAt = now // the progress clock starts when data becomes outstanding
+	}
+	for off := from; off < s.sendNext; off += protocol.MaxData {
+		end := min(off+protocol.MaxData, s.sendNext)
+		if !l.q.push(protocol.EncodeData(off, s.sendBuf[off-s.sendBase:end-s.sendBase])) {
+			return false
+		}
+	}
+	l.sentEnd = s.sendNext
+	return true
 }
 
 // onAck handles an ACK received on link l.

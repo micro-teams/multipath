@@ -11,8 +11,11 @@
 //
 //   - VERSION (3) and IMPLEMENTATION ("multipath-js/<version>", sent in HELLO).
 //   - FrameType, Mode and RejectCode: the codes of section 4.
-//   - HEADER_LEN, MAX_DATA, DATA_OVERHEAD, MAX_REASON, MAX_IMPL, CONTROL_SLACK, HANDSHAKE_TIMEOUT_MS
-//     and MIN_WINDOW: the protocol's fixed bounds.
+//   - HEADER_LEN, MAX_DATA, DATA_OVERHEAD, MAX_REASON, MAX_IMPL, CONTROL_SLACK, HANDSHAKE_TIMEOUT_MS,
+//     CONNECT_TIMEOUT_MS, LINK_DEAD_MIN_MS, LINK_DEAD_RTTS and MIN_WINDOW: the protocol's fixed
+//     bounds. HANDSHAKE_TIMEOUT_MS runs from the sent HELLO, CONNECT_TIMEOUT_MS bounds the connection
+//     before it; a client link is closed after max(LINK_DEAD_MIN_MS, LINK_DEAD_RTTS x its smoothed
+//     round trip) without an inbound byte.
 //   - Limits: what a server announces in WELCOME. defaultLimits() returns section 7's defaults;
 //     limitsError(l) names the first limit outside the protocol's bounds, or returns null.
 //   - ProtocolError: kind "corrupt" (wrong size, bad CRC) or "too large" (above maxPayload).
@@ -56,6 +59,11 @@ export const MAX_REASON = 256;
 export const MAX_IMPL = 64;
 export const CONTROL_SLACK = 65536;
 export const HANDSHAKE_TIMEOUT_MS = 5000;
+// Through a distant CDN, DNS, TCP, TLS and the upgrade alone can take several seconds.
+export const CONNECT_TIMEOUT_MS = 10_000;
+// Jitter or one lost segment on a working line must never cost a link.
+export const LINK_DEAD_MIN_MS = 5000;
+export const LINK_DEAD_RTTS = 4;
 export const MIN_WINDOW = 256 << 10;
 
 export interface Limits {
@@ -79,8 +87,8 @@ export function defaultLimits(): Limits {
     maxLinks: 8,
     pingMs: 500,
     clientDeadMs: 1000,
-    serverDeadMs: 3000,
-    progressMs: 3000,
+    serverDeadMs: 10_000,
+    progressMs: 10_000,
   };
 }
 

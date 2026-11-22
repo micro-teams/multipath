@@ -19,10 +19,18 @@ compatible with 0.2 on the wire and is served on its own path, so a 0.2 origin c
 - Session: a reattached link receives its replay before any newer frame; frames ahead of a gap are
   kept in a bounded reorder buffer; each link writes from its own bounded queue; ACKs only when the
   acknowledged offset changes; a session ends on both sides when its last link dies.
-- Liveness: the client pings every 0.5 s; a link is dead after 1 s of silence (3 s on the server)
-  or 3 s without acknowledgement progress while data is outstanding. With 1 s for progress, a line
-  of 600 to 900 ms round trip capped at 1 MB/s ended the session in half of the measured runs: an
-  ACK waits behind the bytes queued ahead of it.
+- Liveness is judged for the session: the client sends a ping round on all links every 0.5 s; a
+  link that has not answered a round within 1 s is soft down (no new data on it, kept connected,
+  caught up on what it missed when it answers again); when no link answers, every line is dialled
+  again at once into the same session, so a network handover keeps the session and its streams. A
+  client link is closed after max(5 s, 4 round trips) of silence, a server link after 10 s, and a
+  link without acknowledgement progress while data is outstanding after 10 s (with 1 s, a line of
+  600 to 900 ms round trip capped at 1 MB/s ended the session in half of the measured runs: an ACK
+  waits behind the bytes queued ahead of it). The client keeps a session through an outage of every
+  line until the server shows it lost it or no line has answered for the server's 10 s. Client
+  status reports each line's soft state and smoothed round trip (`soft`, `rttMs`).
+- Dialling a link: the connection (DNS, TCP, proxy, TLS, upgrade) has 10 s, and the HELLO its own 5 s
+  from the moment the connection is open. A failed JavaScript link says what the platform reported.
 - Stream credit: both clients grant every stream 1 MiB of receive credit right after its SYN, so a
   2.6 MB download over a line of 600 to 900 ms round trip takes about 2.7 s instead of 9 s; the
   server's own credit, which bounds what it buffers, stays 256 KiB.
