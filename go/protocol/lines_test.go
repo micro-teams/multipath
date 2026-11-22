@@ -1,5 +1,6 @@
 // Tests for the line list parser: a well-formed document parses in order, every malformed document
-// named in PROTOCOL.md section 2 is refused, extra members are ignored, and LinkURL maps schemes.
+// named in PROTOCOL.md section 2 is refused, extra members are ignored, an address is kept, and
+// LinkURL maps schemes.
 package protocol
 
 import "testing"
@@ -25,20 +26,43 @@ func TestParseLinesIgnoresUnknownMembers(t *testing.T) {
 	}
 }
 
+func TestParseLinesKeepsAnAddress(t *testing.T) {
+	list, err := ParseLines([]byte(`{"lines":[
+		{"id":"v4","url":"https://relay.example.app:8443","address":"203.0.113.7:8443"},
+		{"id":"v6","url":"https://v6.example.app","address":"[2001:db8::7]:443"},
+		{"id":"v6b","url":"https://v6.example.app","address":"[2001:db8:0:1:2:3:4:5]:443"}
+	]}`))
+	if err != nil {
+		t.Fatalf("expected the document to parse, got %v", err)
+	}
+	if list.Lines[0].Address != "203.0.113.7:8443" || list.Lines[1].Address != "[2001:db8::7]:443" {
+		t.Fatalf("addresses not kept: %+v", list.Lines)
+	}
+}
+
 func TestParseLinesRejects(t *testing.T) {
 	for name, document := range map[string]string{
-		"not json":             `nonsense`,
-		"lines missing":        `{}`,
-		"lines empty":          `{"lines":[]}`,
-		"id missing":           `{"lines":[{"url":"https://a.example.app"}]}`,
-		"duplicate id":         `{"lines":[{"id":"cf","url":"https://a.example.app"},{"id":"cf","url":"https://b.example.app"}]}`,
-		"url empty":            `{"lines":[{"id":"cf","url":""}]}`,
-		"url relative":         `{"lines":[{"id":"cf","url":"/mt"}]}`,
-		"url has a path":       `{"lines":[{"id":"cf","url":"https://cf.example.app/mt"}]}`,
-		"url trailing slash":   `{"lines":[{"id":"cf","url":"https://cf.example.app/"}]}`,
-		"url is not http(s)":   `{"lines":[{"id":"cf","url":"ws://cf.example.app"}]}`,
-		"url with credentials": `{"lines":[{"id":"cf","url":"https://a@b.example.app"}]}`,
-		"url with a query":     `{"lines":[{"id":"cf","url":"https://b.example.app?x"}]}`,
+		"not json":               `nonsense`,
+		"lines missing":          `{}`,
+		"lines empty":            `{"lines":[]}`,
+		"id missing":             `{"lines":[{"url":"https://a.example.app"}]}`,
+		"duplicate id":           `{"lines":[{"id":"cf","url":"https://a.example.app"},{"id":"cf","url":"https://b.example.app"}]}`,
+		"url empty":              `{"lines":[{"id":"cf","url":""}]}`,
+		"url relative":           `{"lines":[{"id":"cf","url":"/mt"}]}`,
+		"url has a path":         `{"lines":[{"id":"cf","url":"https://cf.example.app/mt"}]}`,
+		"url trailing slash":     `{"lines":[{"id":"cf","url":"https://cf.example.app/"}]}`,
+		"url is not http(s)":     `{"lines":[{"id":"cf","url":"ws://cf.example.app"}]}`,
+		"url with credentials":   `{"lines":[{"id":"cf","url":"https://a@b.example.app"}]}`,
+		"url with a query":       `{"lines":[{"id":"cf","url":"https://b.example.app?x"}]}`,
+		"address is a name":      `{"lines":[{"id":"cf","url":"https://a.example.app","address":"a.example.app:443"}]}`,
+		"address has no port":    `{"lines":[{"id":"cf","url":"https://a.example.app","address":"203.0.113.7"}]}`,
+		"address port zero":      `{"lines":[{"id":"cf","url":"https://a.example.app","address":"203.0.113.7:0"}]}`,
+		"address v6 unbracketed": `{"lines":[{"id":"cf","url":"https://a.example.app","address":"2001:db8::7:443"}]}`,
+		"address has a zone":     `{"lines":[{"id":"cf","url":"https://a.example.app","address":"[fe80::1%eth0]:443"}]}`,
+		"address v6 uppercase":   `{"lines":[{"id":"cf","url":"https://a.example.app","address":"[2001:DB8::7]:443"}]}`,
+		"address port padded":    `{"lines":[{"id":"cf","url":"https://a.example.app","address":"203.0.113.7:0443"}]}`,
+		"address not canonical":  `{"lines":[{"id":"cf","url":"https://a.example.app","address":"203.0.113.07:443"}]}`,
+		"address is a number":    `{"lines":[{"id":"cf","url":"https://a.example.app","address":443}]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := ParseLines([]byte(document)); err == nil {

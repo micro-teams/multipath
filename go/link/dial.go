@@ -3,9 +3,13 @@
 // a proxy must still connect, so the proxy decision is made here, for every link, the same way
 // net/http makes it for a request.
 //
-//   - Options carries the TLS configuration for wss lines and the proxy function. Proxy has the
-//     signature of http.Transport.Proxy, so http.ProxyFromEnvironment (HTTPS_PROXY, HTTP_PROXY,
-//     NO_PROXY) and http.ProxyURL(u) both fit; nil means a direct connection.
+//   - Options carries the TLS configuration for wss lines, the proxy function and the line's
+//     address. Proxy has the signature of http.Transport.Proxy, so http.ProxyFromEnvironment
+//     (HTTPS_PROXY, HTTP_PROXY, NO_PROXY) and http.ProxyURL(u) both fit; nil means a direct
+//     connection. Address, when set, is the IP:port connected to instead of the URL's host: the TLS
+//     handshake then sends no server name, and the certificate is verified as fully as always (the
+//     chain to TLSConfig's roots, or the system's, and the name) against the URL's host, which the
+//     upgrade request also names in Host. A network that filters TLS by server name sees none.
 //
 //   - Dial(ctx, rawURL, opt) returns a client-side *Conn for "ws://host[:port]/path" or
 //     "wss://host[:port]/path". ctx bounds the whole setup, proxy and handshake included. An http://
@@ -14,6 +18,8 @@
 //
 //     c, err := link.Dial(ctx, "wss://cf.example.app/multipath/v3/link",
 //     link.Options{Proxy: http.ProxyFromEnvironment})
+//     c, err := link.Dial(ctx, "wss://relay.example.app:8443/multipath/v3/link",
+//     link.Options{Address: "203.0.113.7:8443"}) // no server name; certificate for relay.example.app
 package link
 
 import (
@@ -21,7 +27,9 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -35,6 +43,7 @@ import (
 type Options struct {
 	TLSConfig *tls.Config                           // for wss; nil means the system roots and the URL's host
 	Proxy     func(*http.Request) (*url.URL, error) // nil means connect directly
+	Address   string                                // IP:port to connect to; "" means the URL's host
 }
 
 // Dial opens one link to a ws:// or wss:// URL.
@@ -52,6 +61,9 @@ func Dial(ctx context.Context, rawURL string, opt Options) (*Conn, error) {
 		port = map[bool]string{true: "443", false: "80"}[secure]
 	}
 	address := net.JoinHostPort(u.Hostname(), port)
+	if opt.Address != "" {
+		address = opt.Address
+	}
 
 	raw, err := dialTCP(ctx, u, address, opt.Proxy)
 	if err != nil {
@@ -70,7 +82,9 @@ func Dial(ctx context.Context, rawURL string, opt Options) (*Conn, error) {
 		if opt.TLSConfig != nil {
 			cfg = opt.TLSConfig.Clone()
 		}
-		if cfg.ServerName == "" {
+		if opt.Address != "" {
+			withoutServerName(cfg, u.Hostname())
+		} else if cfg.ServerName == "" {
 			cfg.ServerName = u.Hostname()
 		}
 		conn := tls.Client(raw, cfg)
@@ -90,6 +104,27 @@ func Dial(ctx context.Context, rawURL string, opt Options) (*Conn, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// withoutServerName makes cfg send no server name and verify the peer's certificate against name.
+// Go sends no server name only when ServerName is empty, and then cannot verify a name by itself,
+// so its own verification is turned off and VerifyConnection does the same checks instead: the
+// chain to cfg.RootCAs (nil: the system roots) through the certificates the peer sent, and name.
+func withoutServerName(cfg *tls.Config, name string) {
+	roots := cfg.RootCAs
+	cfg.ServerName = ""
+	cfg.InsecureSkipVerify = true // VerifyConnection below verifies the chain and the name
+	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+		if len(cs.PeerCertificates) == 0 {
+			return errors.New("multipath: the server sent no certificate")
+		}
+		intermediates := x509.NewCertPool()
+		for _, c := range cs.PeerCertificates[1:] {
+			intermediates.AddCert(c)
+		}
+		_, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{Roots: roots, Intermediates: intermediates, DNSName: name})
+		return err
+	}
 }
 
 // dialTCP connects to address, directly or through the proxy the proxy function picks for u.

@@ -45,11 +45,23 @@ its configuration:
 - `id` MUST be non-empty and unique within the document.
 - `url` MUST be an absolute origin with scheme `https` or `http`, a host, an optional port, and no
   path, query, fragment or credentials.
+- `address` is OPTIONAL. When present it MUST be an IP literal in its canonical form (dotted
+  decimal without leading zeros, or RFC 5952 in brackets, with no zone) and a port from 1 to 65535,
+  such as `203.0.113.7:8443` or `[2001:db8::7]:8443`.
 - Other members are ignored, so a server may carry extra fields for other consumers.
 
 A client is configured with one **entry** (an origin such as `https://example.app`). It fetches the
 line list from the entry, and links each line by issuing a WebSocket upgrade to
 `<line url><linkPath>` (default `/multipath/v3/link`); `https` lines use `wss`, `http` lines use `ws`.
+
+A line with an `address` is for a network that resets TLS connections by the server name in their
+ClientHello. A client that honours the address connects to it instead of resolving the URL's host,
+sends no server name indication (RFC 6066 has none for an IP address), verifies the server's
+certificate exactly as it would for the URL (the chain to its trusted roots, and the URL's host as
+the name), and sends the URL's host and port in the upgrade's `Host` header. A client MUST NOT
+honour an address unless it can verify the certificate against the URL's host; it then dials the
+URL and ignores the address (a browser does). The front of such a line answers a handshake without
+a server name with the line's certificate.
 
 Rules for the client:
 
@@ -379,6 +391,9 @@ number of live TCP connections times a constant**.
   (TLS-protected on `https` lines).
 - **Line lists are replaced, not merged**, and come only from the configured entry; an `https`
   entry accepts only `https` lines (section 2).
+- **An address does not widen where a line leads.** A line dialled at its `address` is still
+  verified against its URL's host, which every policy on lines (the `https` rule, a browser's site)
+  applies to, so a list cannot send a link to a server that does not hold that host's certificate.
 - **Denial of service.** Every server resource is bounded per TCP connection (section 8); a
   connection that does not complete its handshake in 5 seconds, a link whose peer stops reading, and
   a link that exceeds any limit are all closed. Limiting the number of connections per address is

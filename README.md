@@ -273,7 +273,21 @@ Write the line list: every public way to reach this server, each an origin with 
 
 `id` is a short unique name used in logs and status; `url` is `https://` or `http://`, a host and
 an optional port, nothing else. A list has 1 to 255 lines (a client uses at most 8, the
-`-max-links`); members other than `id` and `url` are ignored. The server refuses to start with an
+`-max-links`); members other than `id`, `url` and `address` are ignored.
+
+`address` is optional: an IP literal and a port, such as `"203.0.113.7:8443"` or
+`"[2001:db8::7]:443"`. A client that honours it connects there instead of resolving the `url`'s
+host, sends no TLS server name (there is none for an IP address) and verifies the certificate,
+chain and name, against the `url`'s host, which the upgrade also names in `Host`. It is for a line
+whose network resets TLS connections by the server name they carry: without a name there is
+nothing to match. The front must then answer a handshake without a server name with the line's
+certificate. `multipath-client` always honours it; the JavaScript client only with
+`dialAddresses` (a browser cannot verify a certificate against another name than the one it
+connects to, so in a browser the line is dialled at its `url`).
+
+```json
+{"id": "relay", "url": "https://relay.example.app:8443", "address": "203.0.113.7:8443"}
+``` The server refuses to start with an
 invalid file, and reads it again on every request, so lines can be added and removed without a
 restart (while the file is invalid, the list answers 500 and the reason is logged).
 
@@ -459,6 +473,7 @@ what the browser fetches, the page what it fetches itself.
 | `buffered` | `false` | Read each response whole before returning it, for platforms whose `Response` cannot stream. |
 | `onEvent` | none | Told about every line up or down, session start or end, and router fallback. |
 | `log` | `console.info` | One line per event. |
+| `dialAddresses` | `false` | Dial a line that has an `address` there, with its host in a `Host` header passed as React Native's WebSocket options. Only for a WebSocket that then verifies the certificate against that host: in React Native, the app installs a hostname verifier that does. |
 
 `Client` methods: `fetch(input, init)` resolves when the response head arrives and streams the body;
 the stream is released as soon as the body is complete or abandoned, and an abort signal resets it.

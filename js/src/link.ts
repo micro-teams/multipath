@@ -22,13 +22,17 @@
 // without an inbound byte or ACK progress), which the stuck check would otherwise catch first.
 //
 //   - WebSocketLike / WebSocketConstructor: the part of the WebSocket API a link uses; the browser's,
-//     Node's and React Native's all fit.
+//     Node's and React Native's all fit. The third constructor argument is React Native's options,
+//     whose headers a link uses only when it is given a host.
 //   - RejectedError: the server refused the link; code is the REJECT code.
-//   - Link.dial(url, hello, WebSocket, helloMs, connectMs) resolves with the link and the WELCOME, or
+//   - Link.dial(url, hello, WebSocket, helloMs, connectMs, host) resolves with the link and the
+//     WELCOME, or
 //     rejects with a RejectedError or the reason the handshake failed: no open socket within
 //     connectMs, or no answer within helloMs of the HELLO. A socket error is "connection failed",
 //     followed by the platform's message when the error event has one (React Native's does: a TLS
-//     or DNS failure names itself there; a browser's error event says nothing).
+//     or DNS failure names itself there; a browser's error event says nothing). host, when given,
+//     is sent as the upgrade's Host header (through the options argument), for a url that names the
+//     line's address rather than its host.
 //   - link.start(handlers, limit, acked): sets the queue's bound (limit) and the peer's acknowledged
 //     offset (acked()), and from the next microtask on delivers messages to handlers.onMessage, those
 //     that arrived since the WELCOME first; handlers.onClose(reason) is called when the socket closes
@@ -65,7 +69,11 @@ export interface WebSocketLike {
   onclose: ((ev: { code?: number; reason?: string }) => void) | null;
 }
 
-export type WebSocketConstructor = new (url: string) => WebSocketLike;
+export type WebSocketConstructor = new (
+  url: string,
+  protocols?: string[],
+  options?: { headers: Record<string, string> },
+) => WebSocketLike;
 
 export class RejectedError extends Error {
   constructor(
@@ -140,9 +148,10 @@ export class Link {
     WebSocket: WebSocketConstructor,
     helloMs: number,
     connectMs: number,
+    host?: string,
   ): Promise<{ link: Link; welcome: WelcomeFrame }> {
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(url);
+      const ws = host ? new WebSocket(url, [], { headers: { Host: host } }) : new WebSocket(url);
       ws.binaryType = 'arraybuffer';
       let settled = false;
       const fail = (err: Error) => {

@@ -285,7 +285,7 @@ func (cs *clientSession) waitLink(ctx context.Context, sl *slot) {
 // dial opens a link over the slot's line and performs the handshake.
 func (cs *clientSession) dial(ctx context.Context, sl *slot) (*link.Conn, error) {
 	connectCtx, cancel := context.WithTimeout(ctx, protocol.ConnectTimeout)
-	conn, err := link.Dial(connectCtx, protocol.LinkURL(sl.line, cs.c.cfg.LinkPath), link.Options{Proxy: cs.c.cfg.Proxy, TLSConfig: cs.c.cfg.TLSConfig})
+	conn, err := link.Dial(connectCtx, protocol.LinkURL(sl.line, cs.c.cfg.LinkPath), link.Options{Proxy: cs.c.cfg.Proxy, TLSConfig: cs.c.cfg.TLSConfig, Address: sl.line.Address})
 	timedOut := connectCtx.Err() == context.DeadlineExceeded
 	cancel()
 	if err != nil {

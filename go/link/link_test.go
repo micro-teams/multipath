@@ -1,10 +1,14 @@
 // Tests for links: a message round trip through Accept and Dial (directly and through an HTTP CONNECT
-// proxy), the message size limit, and a Close that does not wait for a stuck write.
+// proxy), a TLS link to an address that sends no server name and verifies the certificate against
+// the URL's host (and fails against a wrong one), the message size limit, and a Close that does not
+// wait for a stuck write.
 package link
 
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
 	"net"
@@ -20,7 +24,14 @@ import (
 // echoServer accepts links and echoes every message back.
 func echoServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(echo(t))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// echo is echoServer's handler.
+func echo(t *testing.T) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := Accept(w, r)
 		if err != nil {
 			t.Logf("accept: %v", err)
@@ -36,9 +47,7 @@ func echoServer(t *testing.T) *httptest.Server {
 				return
 			}
 		}
-	}))
-	t.Cleanup(srv.Close)
-	return srv
+	})
 }
 
 func wsURL(srv *httptest.Server) string { return "ws" + strings.TrimPrefix(srv.URL, "http") + "/link" }
@@ -113,6 +122,80 @@ func TestDialThroughProxy(t *testing.T) {
 	roundTrip(t, c)
 	if tunnels.Load() != 1 {
 		t.Fatalf("proxy opened %d tunnels, want 1", tunnels.Load())
+	}
+}
+
+// tlsEchoServer is echoServer over TLS with httptest's certificate, which names example.com. It
+// records the server name of every ClientHello and the Host of every upgrade request.
+func tlsEchoServer(t *testing.T, names, hosts chan string) (*httptest.Server, *x509.CertPool) {
+	t.Helper()
+	handler := echo(t)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hosts <- r.Host
+		handler.ServeHTTP(w, r)
+	}))
+	srv.TLS = &tls.Config{GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+		names <- hello.ServerName
+		return nil, nil
+	}}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	roots := x509.NewCertPool()
+	roots.AddCert(srv.Certificate())
+	return srv, roots
+}
+
+// A line with an address: the link connects to the address, sends no server name, verifies the
+// certificate against the URL's host and names that host in the upgrade.
+func TestDialAddressSendsNoServerNameAndVerifiesTheURLHost(t *testing.T) {
+	names, hosts := make(chan string, 1), make(chan string, 1)
+	srv, roots := tlsEchoServer(t, names, hosts)
+	address := srv.Listener.Addr().String()
+	_, port, _ := net.SplitHostPort(address)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := Dial(ctx, "wss://example.com:"+port+"/link", Options{Address: address, TLSConfig: &tls.Config{RootCAs: roots}})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	roundTrip(t, c)
+	if name := <-names; name != "" {
+		t.Errorf("the ClientHello named %q, want no server name", name)
+	}
+	if host := <-hosts; host != "example.com:"+port {
+		t.Errorf("the upgrade's Host is %q, want example.com:%s", host, port)
+	}
+}
+
+// The certificate is still checked: a URL whose host the certificate does not name, or roots that
+// do not sign it, fail the handshake.
+func TestDialAddressRefusesACertificateThatDoesNotVerify(t *testing.T) {
+	names, hosts := make(chan string, 2), make(chan string, 2)
+	srv, roots := tlsEchoServer(t, names, hosts)
+	address := srv.Listener.Addr().String()
+	_, port, _ := net.SplitHostPort(address)
+	for name, tc := range map[string]struct {
+		url   string
+		roots *x509.CertPool
+	}{
+		"wrong name":    {"wss://other.example:" + port + "/link", roots},
+		"unknown roots": {"wss://example.com:" + port + "/link", x509.NewCertPool()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			c, err := Dial(ctx, tc.url, Options{Address: address, TLSConfig: &tls.Config{RootCAs: tc.roots}})
+			if err == nil {
+				c.Close()
+				t.Fatal("dial succeeded, want a certificate error")
+			}
+			var invalid x509.HostnameError
+			var unknown x509.UnknownAuthorityError
+			if !errors.As(err, &invalid) && !errors.As(err, &unknown) {
+				t.Fatalf("dial failed with %v, want a certificate error", err)
+			}
+		})
 	}
 }
 
