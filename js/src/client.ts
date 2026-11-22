@@ -39,6 +39,11 @@
 //   onEvent      told about every ClientEvent: a line up or down, a session start or end (and, from
 //                the router, every fallback)
 //   log          one line per event; default console.info
+//   dialAddresses  dial a line that has an address (lines.ts) at that address, with the line's host
+//                in the upgrade's Host header, given as React Native's WebSocket options ({headers});
+//                default false. Only for a WebSocket that then verifies the certificate against
+//                that host, not the address: React Native's does once the app installs a hostname
+//                verifier for it. A browser can do neither, and dials every line at its url.
 //   WebSocket, fetch  the platform's, unless given (tests)
 //
 // API:
@@ -52,7 +57,8 @@
 //   - client.live(timeoutMs) resolves true once a session is live (a link is attached), false if none
 //     is within timeoutMs.
 //   - client.stats() is a ClientStats snapshot: the session (id, state, age, server implementation,
-//     bytes sent, unacknowledged and received, reorder buffer), every line (state, whether it is soft
+//     bytes sent, unacknowledged and received, reorder buffer), every line (url, address when it is
+//     dialled, state, whether it is soft
 //     down, its smoothed round trip, milliseconds since its last byte, bytes in and out, reconnects,
 //     last reason; the answering line with the smallest round trip is the quickest way to the
 //     server), every open stream (bytes in and out,
@@ -112,6 +118,7 @@ export interface ClientOptions {
   buffered?: boolean;
   onEvent?: (e: ClientEvent) => void;
   log?: (message: string) => void;
+  dialAddresses?: boolean;
   WebSocket?: WebSocketConstructor;
   fetch?: typeof fetch;
 }
@@ -131,6 +138,7 @@ export interface ClientStats {
     index: number;
     id: string;
     url: string;
+    address?: string;
     state: 'connecting' | 'up' | 'down';
     soft: boolean;
     rttMs: number;
@@ -227,6 +235,7 @@ export class Client {
       emit: (e) => opts.onEvent?.(e),
       notify: () => this.notify(),
       WebSocket: this.WebSocket,
+      dialAddresses: opts.dialAddresses ?? false,
       linkPath: this.linkPath,
       recvWindow: this.recvWindow,
     };
@@ -419,6 +428,7 @@ interface SessionContext {
   emit(e: ClientEvent): void;
   notify(): void;
   WebSocket: WebSocketConstructor;
+  dialAddresses: boolean;
   linkPath: string;
   recvWindow: number;
 }
@@ -521,7 +531,7 @@ class ClientSession {
   // take a free link index and are dialled.
   applyLines(lines: Line[]): void {
     if (this.session.ended) return;
-    const key = (l: Line) => `${l.id} ${l.url}`;
+    const key = (l: Line) => `${l.id} ${l.url} ${l.address ?? ''}`;
     const keep = new Set(lines.map(key));
     for (const [i, sl] of this.slots) {
       if (keep.delete(key(sl.line))) continue;
@@ -662,14 +672,16 @@ class ClientSession {
       mode: this.welcomed ? Mode.Join : Mode.New,
       impl: IMPLEMENTATION,
     };
+    const address = cfg.dialAddresses && sl.line.address !== undefined;
     let dialled: { link: Link; welcome: WelcomeFrame };
     try {
       dialled = await Link.dial(
-        linkUrl(sl.line, cfg.linkPath),
+        linkUrl(sl.line, cfg.linkPath, address),
         hello,
         cfg.WebSocket,
         HANDSHAKE_TIMEOUT_MS,
         CONNECT_TIMEOUT_MS,
+        address ? new URL(sl.line.url).host : undefined,
       );
     } catch (err) {
       if (err instanceof RejectedError && err.code === RejectCode.UnknownSession) {
@@ -736,6 +748,7 @@ class ClientSession {
           index: sl.index,
           id: sl.line.id,
           url: sl.line.url,
+          ...(this.c.dialAddresses && sl.line.address ? { address: sl.line.address } : {}),
           state: sl.state,
           soft: l?.soft ?? false,
           rttMs: l?.rttMs ?? 0,

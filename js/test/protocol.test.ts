@@ -196,6 +196,45 @@ describe('line list', () => {
     expect(linkUrl({ id: 'l', url: 'http://127.0.0.1:8080' }, '/l')).toBe('ws://127.0.0.1:8080/l');
   });
 
+  it('keeps an address and names the link URL at it', () => {
+    const lines = parseLines({
+      lines: [
+        { id: 'v4', url: 'https://r.example.app:8443', address: '203.0.113.7:8443' },
+        { id: 'v6', url: 'https://v6.example.app', address: '[2001:db8::7]:443' },
+      ],
+    });
+    expect(lines[0]).toEqual({
+      id: 'v4',
+      url: 'https://r.example.app:8443',
+      address: '203.0.113.7:8443',
+    });
+    expect(linkUrl(lines[0], '/l')).toBe('wss://r.example.app:8443/l');
+    expect(linkUrl(lines[0], '/l', true)).toBe('wss://203.0.113.7:8443/l');
+    expect(linkUrl(lines[1], '/l', true)).toBe('wss://[2001:db8::7]:443/l');
+    expect(() => linkUrl(doc.lines[0], '/l', true)).toThrow(/no address/);
+  });
+
+  it('refuses an address that is not an IP literal and a port', () => {
+    for (const address of [
+      'r.example.app:443',
+      '203.0.113.7',
+      '203.0.113.7:0',
+      '203.0.113.7:65536',
+      '203.0.113.7:0443',
+      '203.0.113.07:443',
+      '256.0.113.7:443',
+      '2001:db8::7:443',
+      '[2001:DB8::7]:443',
+      '[fe80::1%eth0]:443',
+      '203.0.113.7:443/x',
+      443,
+    ]) {
+      expect(() => parseLines({ lines: [{ id: 'a', url: 'https://a.app', address }] })).toThrow(
+        /address/,
+      );
+    }
+  });
+
   it('refuses empty lists, bad or duplicate ids and URLs that are not bare origins', () => {
     expect(() => parseLines({ lines: [] })).toThrow(/1 to 255/);
     expect(() => parseLines({})).toThrow(/1 to 255/);

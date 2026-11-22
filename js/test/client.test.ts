@@ -2,8 +2,9 @@
 // when, how a fetched list replaces the stored one, how a stored list carries a session while the
 // entry is unreachable (and only for its own entry), how a list breaking the policy is refused, and
 // that a server which lost the session (REJECT, or a second "created") makes the client start a new
-// session, and that a session whose every line falls silent is redialled into itself, line by line,
-// with its streams kept and replayed onto the new links. Data over a live session is proven by the conformance suite against the real server.
+// session, that a line's address is dialled only by a client asked to, and that a session whose
+// every line falls silent is redialled into itself, line by line, with its streams kept and replayed
+// onto the new links. Data over a live session is proven by the conformance suite against the real server.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Client, type ClientEvent, type LineStore } from '../src/client.js';
 import { Mode, RejectCode, defaultLimits, encodeReject, type HelloFrame } from '../src/protocol.js';
@@ -78,6 +79,41 @@ describe('client', () => {
     const st = client.stats();
     expect(st.session).toMatchObject({ state: 'live', server: 'fake-server/1' });
     expect(st.sessionsStarted).toBe(1);
+  });
+
+  it('dials a line at its address, naming its host, only when asked to', async () => {
+    const doc = {
+      lines: [
+        { id: 'r', url: 'https://r.app.example:8443', address: '203.0.113.7:8443' },
+        { id: 'o', url: 'https://app.example' },
+      ],
+    };
+    const plain = start(listFetch(doc));
+    clients.push(plain.client);
+    expect(await plain.client.live(1000)).toBe(true);
+    expect(urls()).toEqual([
+      'wss://r.app.example:8443/multipath/v3/link',
+      'wss://app.example/multipath/v3/link',
+    ]);
+    expect(FakeWebSocket.all.map((w) => w.options)).toEqual([undefined, undefined]);
+    await plain.client.close();
+
+    FakeWebSocket.all = [];
+    const addressed = start(listFetch(doc), { dialAddresses: true });
+    clients.push(addressed.client);
+    expect(await addressed.client.live(1000)).toBe(true);
+    expect(urls()).toEqual([
+      'wss://203.0.113.7:8443/multipath/v3/link',
+      'wss://app.example/multipath/v3/link',
+    ]);
+    expect(FakeWebSocket.all.map((w) => w.options)).toEqual([
+      { headers: { Host: 'r.app.example:8443' } },
+      undefined,
+    ]);
+    expect(addressed.client.stats().lines.map((l) => l.address)).toEqual([
+      '203.0.113.7:8443',
+      undefined,
+    ]);
   });
 
   it('dials the stored lines at once, and the fetched list replaces them', async () => {

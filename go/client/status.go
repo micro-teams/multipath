@@ -2,7 +2,7 @@
 // wedged one, without reading logs. MicroTeams shows it in `microteams status`.
 //
 //   - Status is the snapshot: the current session (SessionStatus: id, state, age, offsets,
-//     unacknowledged bytes), every line of it (LineStatus: state, whether it is soft down, its
+//     unacknowledged bytes), every line of it (LineStatus: its url and address, state, whether it is soft down, its
 //     smoothed round trip, time since its last byte, bytes in and out, reconnects, last reason;
 //     the answering line with the smallest round trip is the quickest way to the server), every open
 //     stream (StreamStatus: bytes in and out, buffered
@@ -50,9 +50,10 @@ type LineStatus struct {
 	Index         int    `json:"index"`
 	ID            string `json:"id"`
 	URL           string `json:"url"`
-	State         string `json:"state"`           // "connecting", "up" or "down"
-	Soft          bool   `json:"soft,omitempty"`  // up, but silent since the due ping round: no new data on it
-	RTTMs         int64  `json:"rttMs,omitempty"` // smoothed ping round trip, rounded up; absent before the first answer
+	Address       string `json:"address,omitempty"` // the IP:port dialled instead of the URL's host
+	State         string `json:"state"`             // "connecting", "up" or "down"
+	Soft          bool   `json:"soft,omitempty"`    // up, but silent since the due ping round: no new data on it
+	RTTMs         int64  `json:"rttMs,omitempty"`   // smoothed ping round trip, rounded up; absent before the first answer
 	LastByteAgoMs int64  `json:"lastByteAgoMs,omitempty"`
 	BytesIn       int64  `json:"bytesIn"`
 	BytesOut      int64  `json:"bytesOut"`
@@ -101,7 +102,7 @@ func (c *Client) Status() Status {
 	sort.Slice(slots, func(i, j int) bool { return slots[i].index < slots[j].index })
 	for _, sl := range slots {
 		sl.mu.Lock()
-		ls := LineStatus{Index: sl.index, ID: sl.line.ID, URL: sl.line.URL, State: sl.state, Reconnects: sl.reconnects, LastReason: sl.reason}
+		ls := LineStatus{Index: sl.index, ID: sl.line.ID, URL: sl.line.URL, Address: sl.line.Address, State: sl.state, Reconnects: sl.reconnects, LastReason: sl.reason}
 		sl.mu.Unlock()
 		for _, l := range ss.Links {
 			if l.Index == sl.index {

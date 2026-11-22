@@ -29,6 +29,10 @@ compatible with 0.2 on the wire and is served on its own path, so a 0.2 origin c
   waits behind the bytes queued ahead of it). The client keeps a session through an outage of every
   line until the server shows it lost it or no line has answered for the server's 10 s. Client
   status reports each line's soft state and smoothed round trip (`soft`, `rttMs`).
+- Line list: a line may carry an `address` (an IP literal and a port). The Go client, and the
+  JavaScript client created with `dialAddresses`, connect to it with no TLS server name and verify
+  the certificate against the line's URL host, so a network that resets TLS by server name sees
+  none; a browser ignores it. Status shows the address dialled.
 - Dialling a link: the connection (DNS, TCP, proxy, TLS, upgrade) has 10 s, and the HELLO its own 5 s
   from the moment the connection is open. A failed JavaScript link says what the platform reported.
 - Stream credit: both clients grant every stream 1 MiB of receive credit right after its SYN, so a

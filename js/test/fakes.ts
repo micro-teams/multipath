@@ -1,7 +1,8 @@
 // Test doubles shared by the unit tests: a WebSocket that plays the server's half of a link in
 // memory, so links, sessions and clients can be driven frame by frame without any socket.
 //
-//   - FakeWebSocket: what Link.dial and Client take as their WebSocket. Each instance opens on the
+//   - FakeWebSocket: what Link.dial and Client take as their WebSocket; it keeps the url and the
+//     options it was constructed with. Each instance opens on the
 //     next microtask, or FakeWebSocket.openDelayMs later when that is set (a slow connection setup); FakeWebSocket.answer(hello, ws) decides how the "server" answers a HELLO (a
 //     WELCOME frame, a REJECT frame, or null for silence); every frame the client sends after the
 //     HELLO is kept in `sent`, and receive(frame) delivers a frame to the client. bufferedAmount can
@@ -44,7 +45,11 @@ export class FakeWebSocket {
   onerror: ((ev: unknown) => void) | null = null;
   onclose: ((ev: { code?: number }) => void) | null = null;
 
-  constructor(readonly url: string) {
+  constructor(
+    readonly url: string,
+    readonly protocols?: string[],
+    readonly options?: { headers: Record<string, string> },
+  ) {
     FakeWebSocket.all.push(this);
     const open = () => {
       if (!this.closed) this.onopen?.({});
